@@ -288,7 +288,6 @@ class TrainConfig:
     gate_ratio_target: float = 0.3
     gate_mode: str = "sigmoid"
     gate_budget_dim: str = "freq"
-    gate_budget_ratio: float = 0.0
     pred_input: str = "n_tf"
     gate_lr: float = 0.0
     predictor_lr: float = 0.0
@@ -321,7 +320,6 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             gate_ratio_target=cfg.gate_ratio_target,
             gate_mode=cfg.gate_mode,
             gate_budget_dim=cfg.gate_budget_dim,
-            gate_budget_ratio=cfg.gate_budget_ratio,
             pred_input=cfg.pred_input,
         )
     label_len = cfg.label_len or (cfg.window // 2)
@@ -360,6 +358,8 @@ def _build_optimizer(model: nn.Module, cfg: TrainConfig) -> Adam:
     base_lr = float(cfg.lr)
     gate_wd = float(cfg.gate_weight_decay)
     pred_wd = float(cfg.predictor_weight_decay)
+    
+    # Separate learning rates (0 means use base_lr)
     gate_lr = float(cfg.gate_lr) if cfg.gate_lr > 0 else base_lr
     predictor_lr = float(cfg.predictor_lr) if cfg.predictor_lr > 0 else base_lr
 
@@ -437,14 +437,14 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
             pbar.update(batch_x.size(0))
             pbar.set_postfix(loss=loss.item())
     
-    # Get gate statistics from last state
+    # Get gate statistics from model
     gate_stats_str = ""
     if hasattr(model, "nm") and model.nm is not None and hasattr(model.nm, "get_last_gate_stats"):
         stats = model.nm.get_last_gate_stats()
         gate_stats_str = (
-            f" | gate_stats: mean={stats['gate_mean']:.4f}, "
-            f"sum_f={stats['gate_sum_f']:.4f}, max_f={stats['gate_max_f']:.4f}, "
-            f"ent_f={stats['gate_ent_f']:.4f}"
+            f" | gate: mean={stats['gate_mean']:.4f}, "
+            f"sumF={stats['gate_sum_f']:.4f}, maxF={stats['gate_max_f']:.4f}, "
+            f"entF={stats['gate_ent_f']:.4f}"
         )
     
     return float(np.mean(losses)) if losses else 0.0, gate_stats_str

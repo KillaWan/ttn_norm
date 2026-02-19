@@ -14,7 +14,7 @@ class LocalTFGate(nn.Module):
         temperature: float = 1.0,
         gate_mode: str = "sigmoid",
         gate_budget_dim: str = "freq",
-        gate_budget_ratio: float = 0.0,
+        gate_ratio_target: float = 0.3,
     ):
         super().__init__()
         if gate_type == "depthwise":
@@ -29,7 +29,7 @@ class LocalTFGate(nn.Module):
         self.temperature = float(temperature)
         self.gate_mode = gate_mode
         self.gate_budget_dim = gate_budget_dim
-        self.gate_budget_ratio = float(gate_budget_ratio)
+        self.gate_ratio_target = float(gate_ratio_target)
         if use_threshold:
             self.threshold = nn.Parameter(torch.full((channels, 1, 1), init_threshold))
         else:
@@ -46,41 +46,28 @@ class LocalTFGate(nn.Module):
             return torch.sigmoid(logits / temperature)
         
         elif self.gate_mode == "softmax_budget":
-            # Soft top-k gate with budget scaling
-            # dim=2 for freq, dim=3 for time
+            # Soft top-k: softmax along budget_dim, scale by target_sum
             axis = 2 if self.gate_budget_dim == "freq" else 3
             bins = logits.shape[axis]
             
-            # Get probability distribution via softmax
             probs = torch.softmax(logits / temperature, dim=axis)
-            
-            # Scale by budget: target activation sum along axis
-            if self.gate_budget_ratio > 0:
-                target_sum = self.gate_budget_ratio * bins
-            else:
-                target_sum = bins  # No budget constraint
-            
+            target_sum = self.gate_ratio_target * bins
             g = probs * target_sum
             return torch.clamp(g, 0.0, 1.0)
         
         elif self.gate_mode == "sigmoid_budget":
-            # Sigmoid + budget scaling: scale raw sigmoid to match target sum
+            # Sigmoid + budget scaling
             axis = 2 if self.gate_budget_dim == "freq" else 3
             bins = logits.shape[axis]
             
             raw = torch.sigmoid(logits / temperature)
-            
-            if self.gate_budget_ratio > 0:
-                target_sum = self.gate_budget_ratio * bins
-                raw_sum = raw.sum(dim=axis, keepdim=True)
-                # Avoid division by zero
-                scale = target_sum / (raw_sum + 1e-10)
-                g = raw * scale
-            else:
-                g = raw
-            
+            raw_sum = raw.sum(dim=axis, keepdim=True)
+            target_sum = self.gate_ratio_target * bins
+            scale = target_sum / (raw_sum + 1e-10)
+            g = raw * scale
             return torch.clamp(g, 0.0, 1.0)
         
         else:
             raise ValueError(f"Unsupported gate_mode: {self.gate_mode}")
+
 
