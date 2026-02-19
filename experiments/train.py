@@ -288,6 +288,7 @@ class TrainConfig:
     gate_ratio_target: float = 0.3
     gate_mode: str = "sigmoid"
     gate_budget_dim: str = "freq"
+    gate_budget_ratio: float = 0.0
     pred_input: str = "n_tf"
     gate_lr: float = 0.0
     predictor_lr: float = 0.0
@@ -320,6 +321,7 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             gate_ratio_target=cfg.gate_ratio_target,
             gate_mode=cfg.gate_mode,
             gate_budget_dim=cfg.gate_budget_dim,
+            gate_budget_ratio=cfg.gate_budget_ratio,
             pred_input=cfg.pred_input,
         )
     label_len = cfg.label_len or (cfg.window // 2)

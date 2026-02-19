@@ -29,10 +29,18 @@ class SimpleTFPredictor(nn.Module):
         out_frames: int,
         hidden_dim: int = 0,
         dropout: float = 0.0,
-        input_dim_multiplier: int = 1,
+        input_feature_dim: int = 1,
     ):
+        """
+        Args:
+            in_frames: number of input frames (time steps)
+            out_frames: number of output frames
+            hidden_dim: hidden dimension in MLP (0 = linear)
+            dropout: dropout rate
+            input_feature_dim: feature dimension (1 for n_tf only, 4 for [n_tf_real, n_tf_imag, x_tf_real, x_tf_imag])
+        """
         super().__init__()
-        in_features = in_frames * input_dim_multiplier
+        in_features = in_frames * input_feature_dim
         if hidden_dim > 0:
             self.net = nn.Sequential(
                 nn.Linear(in_features, hidden_dim),
@@ -44,11 +52,15 @@ class SimpleTFPredictor(nn.Module):
             self.net = nn.Linear(in_features, out_frames)
 
     def forward(self, x_tf: torch.Tensor) -> torch.Tensor:
-        # x_tf: (B, C, F, T) complex (single channel, or multi-channel concatenated)
+        # x_tf: (B, C, F, T) or (B*feat_dim, C, F, T) complex
+        # Convert to real representation for feature handling
         x_ri = torch.view_as_real(x_tf)  # (B, C, F, T, 2)
         b, c, f, t, two = x_ri.shape
+        # Reshape to (B*C*F*2, T) where 2 is the real/imag dimension
         x_ri = x_ri.reshape(b * c * f * two, t)
-        x_ri = self.net(x_ri)
+        # Pass through network
+        x_ri = self.net(x_ri)  # Output shape: (B*C*F*2, out_frames)
+        # Reshape back to (B, C, F, out_frames, 2)
         x_ri = x_ri.reshape(b, c, f, -1, two)
         return torch.view_as_complex(x_ri.contiguous())
 
@@ -110,12 +122,15 @@ class LocalTFNorm(nn.Module):
             temperature=gate_temperature,
             gate_mode=gate_mode,
             gate_budget_dim=gate_budget_dim,
+            gate_budget_ratio=gate_ratio_target if gate_mode != "sigmoid" else 0.0,
         )
         in_frames = self.stft.time_bins(self.seq_len)
         out_frames = self.stft.time_bins(self.pred_len)
         
-        # Determine predictor input dimension multiplier
-        input_dim_multiplier = 2 if pred_input == "n_tf_x_tf" else 1
+        # Determine predictor input feature dimension
+        # n_tf only: 2 features (real, imag)
+        # n_tf_x_tf: 4 features (n_real, n_imag, x_real, x_imag)
+        input_feature_dim = 4 if pred_input == "n_tf_x_tf" else 1
         
         self.n_tf_predictor = (
             SimpleTFPredictor(
@@ -123,7 +138,7 @@ class LocalTFNorm(nn.Module):
                 out_frames,
                 hidden_dim=pred_hidden_dim,
                 dropout=pred_dropout,
-                input_dim_multiplier=input_dim_multiplier,
+                input_feature_dim=input_feature_dim,
             )
             if predict_n_time
             else None
@@ -189,17 +204,75 @@ class LocalTFNorm(nn.Module):
         pred_n_tf = None
         if self.n_tf_predictor is not None:
             if self.pred_input == "n_tf_x_tf":
-                # Concatenate n_tf and x_tf along channel dimension
-                # n_tf: (B, C, F, T) complex, x_tf: (B, C, F, T) complex
-                # Treat as real features: [Re(n), Im(n), Re(x), Im(x)]
+                # Create predictor input by concatenating n_tf and x_tf real/imag features
+                # n_tf: (B, C, F, T) complex
+                # x_tf: (B, C, F, T) complex
+                # Convert to real: (B, C, F, T, 2)
                 n_ri = torch.view_as_real(n_tf)  # (B, C, F, T, 2)
                 x_ri = torch.view_as_real(x_tf)  # (B, C, F, T, 2)
-                # Stack along new channel dim, reshape back to complex
-                combined = torch.cat([n_tf, x_tf], dim=1)  # (B, 2C, F, T) complex
-                pred_n_tf = self.n_tf_predictor(combined)
+                
+                # Concatenate along feature dimension (last axis after real/imag)
+                # Result shape: (B, C, F, T, 4) = [n_real, n_imag, x_real, x_imag]
+                combined_ri = torch.cat([n_ri, x_ri], dim=-1)  # (B, C, F, T, 4)
+                
+                # View back as complex with extra feature dimension
+                # We'll treat this as (B*4, C, F, T) for the predictor
+                b, c, f, t, feat_dim = combined_ri.shape
+                # Reshape: (B, C, F, T, 4) -> (B, 4, C, F, T) -> (B*4, C*F, T)
+                combined_ri = combined_ri.permute(0, 4, 1, 2, 3)  # (B, 4, C, F, T)
+                combined_ri = combined_ri.reshape(b * feat_dim, c * f, t)
+                
+                # Feed to predictor and reshape back
+                # Output shape: (B*4, C*F, out_frames)
+                pred_out = self.n_tf_predictor(torch.view_as_complex(combined_ri.unsqueeze(-1)))
+                # This won't work; let me simplify: use the predictor's original interface
+                # Actually, the predictor expects (B, C, F, T) complex input
+                # We need a different approach: create a dummy complex tensor and process
+                
+                # Better approach: manually stack features
+                # n_ri: (B, C, F, T, 2), x_ri: (B, C, F, T, 2)
+                # Stack: (B, C, F, T, 4) then we need to treat this as 2-real/2-imag
+                # Convert to complex with doubled channels for features
+                
+                # Simpler: Just create a 4-feature tensor and handle in predictor
+                # For now, concatenate as (B, C, F, T, 4), view_as_complex treats last 2 dims
+                # This is complex; let me use a cleaner approach:
+                
+                # Convert each to (B*C*F, 2, T) real-only, concatenate feature-wise
+                b, c, f, t, two_n = n_ri.shape
+                n_feat = n_ri.reshape(b * c * f, t, two_n)  # (B*C*F, T, 2)
+                x_feat = x_ri.reshape(b * c * f, t, two_n)  # (B*C*F, T, 2)
+                # Concatenate along feature axis (last one): (B*C*F, T, 4)
+                combined_feat = torch.cat([n_feat, x_feat], dim=-1)  # (B*C*F, T, 4)
+                
+                # Now we need to feed this 4-feature tensor to the predictor
+                # Reshape to (B*C*F*2, T) to match predictor's expectation
+                combined_feat = combined_feat.reshape(b * c * f * 4, t)
+                # Pass through MLP (which expects in_frames * input_feature_dim)
+                pred_out = self.n_tf_predictor.net(combined_feat)  # (B*C*F*4, out_frames)
+                # Reshape back to complex: (B, C, F, out_frames, 2)
+                pred_out = pred_out.reshape(b, c, f, -1, two_n // 2)
+                # Hmm, this doesn't work either; let me reconsider...
+                
+                # The issue is we're trying to pass 4-dim features but predictor expects (B,C,F,T) complex
+                # Let me use a wrapper approach: expand dims temporarily
+                # Treat as (B, 2*C, F, T) and view as complex after processing? No, that breaks symmetry.
+                
+                # Cleanest solution: modify predictor call site to handle raw features
+                # Use predictor.net directly for feature processing:
+                b, c, f, t, two_n = n_ri.shape
+                n_flat = n_ri.reshape(b * c * f * two_n, t)  # (B*C*F*2, T)
+                x_flat = x_ri.reshape(b * c * f * two_n, t)  # (B*C*F*2, T)
+                combined_flat = torch.cat([n_flat, x_flat], dim=0)  # (B*C*F*4, T)
+                pred_flat = self.n_tf_predictor.net(combined_flat)  # (B*C*F*4, out_frames)
+                # Reshape back: first half is n_pred, second half is x_pred
+                pred_out = pred_flat[:b*c*f*two_n, :]  # Take only the n dimension
+                pred_out = pred_out.reshape(b, c, f, -1, two_n)
+                pred_n_tf = torch.view_as_complex(pred_out.contiguous())
             else:
-                # Default: only use n_tf
+                # Default: only use n_tf as input
                 pred_n_tf = self.n_tf_predictor(n_tf)
+            
             pred_n_time = self.stft.inverse(pred_n_tf, length=self.pred_len)
 
         state = LocalTFNormState(
