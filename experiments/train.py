@@ -284,6 +284,7 @@ class TrainConfig:
     gate_threshold: float = 0.0
     gate_temperature: float = 1.0
     gate_smooth_weight: float = 0.0
+    gate_temporal_smooth_weight: float = 0.0
     gate_ratio_weight: float = 0.0
     gate_ratio_target: float = 0.3
     gate_mode: str = "sigmoid"
@@ -316,6 +317,7 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             gate_threshold=cfg.gate_threshold,
             gate_temperature=cfg.gate_temperature,
             gate_smooth_weight=cfg.gate_smooth_weight,
+            gate_temporal_smooth_weight=cfg.gate_temporal_smooth_weight,
             gate_ratio_weight=cfg.gate_ratio_weight,
             gate_ratio_target=cfg.gate_ratio_target,
             gate_mode=cfg.gate_mode,

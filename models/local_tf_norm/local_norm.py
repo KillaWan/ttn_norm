@@ -39,7 +39,7 @@ class SimpleTFPredictor(nn.Module):
         out_frames: int,
         hidden_dim: int = 0,
         dropout: float = 0.0,
-        input_feature_dim: int = 1,
+        input_feature_dim: int = 2,
     ):
         """
         Args:
@@ -47,7 +47,7 @@ class SimpleTFPredictor(nn.Module):
             out_frames: number of output frames
             hidden_dim: hidden dimension in MLP (0 = linear)
             dropout: dropout rate
-            input_feature_dim: feature dimension (1 for n_tf only, 4 for n_tf_x_tf context)
+            input_feature_dim: feature dimension (2 for n_tf real+imag, 4 for n_tf_x_tf context)
         """
         super().__init__()
         # Input: T * feat_dim; Output: out_T * 2 (always real+imag)
@@ -114,6 +114,7 @@ class LocalTFNorm(nn.Module):
         gate_mode: str = "sigmoid",
         gate_budget_dim: str = "freq",
         pred_input: str = "n_tf",
+        gate_temporal_smooth_weight: float = 0.0,
         **kwargs,
     ):
         super().__init__()
@@ -127,8 +128,10 @@ class LocalTFNorm(nn.Module):
         self.predict_n_time = predict_n_time
         self.pred_loss_weight = pred_loss_weight
         self.gate_smooth_weight = gate_smooth_weight
+        self.gate_temporal_smooth_weight = gate_temporal_smooth_weight
         self.gate_ratio_weight = gate_ratio_weight
         self.gate_ratio_target = gate_ratio_target
+        self.gate_mode = gate_mode
         self.pred_input = pred_input
 
         if n_fft is None:
@@ -153,7 +156,7 @@ class LocalTFNorm(nn.Module):
         # Determine predictor input feature dimension
         # n_tf only: 2 features (real, imag)
         # n_tf_x_tf: 4 features (n_real, n_imag, x_real, x_imag)
-        input_feature_dim = 4 if pred_input == "n_tf_x_tf" else 1
+        input_feature_dim = 4 if pred_input == "n_tf_x_tf" else 2
         
         self.n_tf_predictor = (
             SimpleTFPredictor(
@@ -307,9 +310,18 @@ class LocalTFNorm(nn.Module):
         if self._last_state is not None:
             g = self._last_state.g_local
             if self.gate_smooth_weight > 0:
+                # Frequency-axis smoothness: penalise adjacent-freq differences
                 smooth = torch.mean(torch.abs(g[:, :, 1:, :] - g[:, :, :-1, :]))
                 loss = loss + smooth * self.gate_smooth_weight
-            if self.gate_ratio_weight > 0:
+            if self.gate_temporal_smooth_weight > 0:
+                # Time-axis smoothness: penalise adjacent-time differences
+                t_smooth = torch.mean(torch.abs(g[:, :, :, 1:] - g[:, :, :, :-1]))
+                loss = loss + t_smooth * self.gate_temporal_smooth_weight
+            # Ratio regularisation is meaningless when the gate already enforces a
+            # hard budget via softmax/sigmoid_budget; skip it to avoid conflicting
+            # gradients.
+            budget_modes = {"softmax_budget", "sigmoid_budget"}
+            if self.gate_ratio_weight > 0 and self.gate_mode not in budget_modes:
                 ratio = g.mean()
                 ratio_loss = (ratio - self.gate_ratio_target) ** 2
                 loss = loss + ratio_loss * self.gate_ratio_weight
