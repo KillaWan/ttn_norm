@@ -48,7 +48,11 @@ class LocalTFGate(nn.Module):
         self.gate_ratio_target = float(gate_ratio_target)
         self.gate_threshold_mode = gate_threshold_mode
         if use_threshold:
-            self.threshold = nn.Parameter(torch.full((channels, 1, 1), init_threshold))
+            # If mask mode requested, keep threshold as a buffer (non-trainable)
+            if gate_threshold_mode == "mask":
+                self.register_buffer("threshold", torch.full((channels, 1, 1), init_threshold))
+            else:
+                self.threshold = nn.Parameter(torch.full((channels, 1, 1), init_threshold))
         else:
             self.register_parameter("threshold", None)
 
@@ -61,9 +65,20 @@ class LocalTFGate(nn.Module):
                 logits = logits - self.threshold
             elif self.gate_threshold_mode == "mask":
                 # mask low logits by setting them to a large negative value
+                # but protect against masking all frequencies for a given (B,C,T)
                 thr = self.threshold
-                mask = logits < thr
-                logits = logits.masked_fill(mask, float(-1e9))
+                orig = logits
+                mask = orig < thr
+                masked = orig.masked_fill(mask, float(-1e9))
+                # detect positions where all frequencies are masked
+                # mask shape: (B, C, F, T) -> all_masked: (B, C, T)
+                all_masked = mask.all(dim=2)
+                if all_masked.any():
+                    # expand selector to frequency dim and restore original logits there
+                    sel = all_masked.unsqueeze(2)  # (B, C, 1, T)
+                    logits = torch.where(sel, orig, masked)
+                else:
+                    logits = masked
             else:
                 logits = logits - self.threshold
         temperature = max(self.temperature, 1e-3)

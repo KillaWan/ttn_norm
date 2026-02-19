@@ -296,6 +296,7 @@ class TrainConfig:
     pred_input: str = "n_tf"
     gate_lr: float = 0.0
     predictor_lr: float = 0.0
+    use_instance_norm: bool = True
 
 
 def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
@@ -331,6 +332,7 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             gate_mode=cfg.gate_mode,
             gate_budget_dim=cfg.gate_budget_dim,
             pred_input=cfg.pred_input,
+            use_instance_norm=cfg.use_instance_norm,
         )
     label_len = cfg.label_len or (cfg.window // 2)
     label_len = min(label_len, cfg.window)

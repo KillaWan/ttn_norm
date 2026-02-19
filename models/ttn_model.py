@@ -37,6 +37,10 @@ class TTNModel(nn.Module):
         if isinstance(self.nm, LocalTFNorm):
             batch_x, state = self.nm.normalize(batch_x, return_state=True)
             self._last_state = state
+            # Keep dec_inp in the same domain as batch_x: apply the same
+            # instance-norm statistics so transformer decoder sees consistent scale.
+            if dec_inp is not None and state.mean is not None and state.std is not None:
+                dec_inp = (dec_inp - state.mean) / state.std
         else:
             batch_x = self.nm(batch_x)
         return batch_x, dec_inp
