@@ -29,20 +29,22 @@ class SimpleTFPredictor(nn.Module):
         out_frames: int,
         hidden_dim: int = 0,
         dropout: float = 0.0,
+        input_dim_multiplier: int = 1,
     ):
         super().__init__()
+        in_features = in_frames * input_dim_multiplier
         if hidden_dim > 0:
             self.net = nn.Sequential(
-                nn.Linear(in_frames, hidden_dim),
+                nn.Linear(in_features, hidden_dim),
                 nn.ReLU(),
                 nn.Dropout(dropout),
                 nn.Linear(hidden_dim, out_frames),
             )
         else:
-            self.net = nn.Linear(in_frames, out_frames)
+            self.net = nn.Linear(in_features, out_frames)
 
     def forward(self, x_tf: torch.Tensor) -> torch.Tensor:
-        # x_tf: (B, C, F, T) complex
+        # x_tf: (B, C, F, T) complex (single channel, or multi-channel concatenated)
         x_ri = torch.view_as_real(x_tf)  # (B, C, F, T, 2)
         b, c, f, t, two = x_ri.shape
         x_ri = x_ri.reshape(b * c * f * two, t)
@@ -74,6 +76,9 @@ class LocalTFNorm(nn.Module):
         gate_smooth_weight: float = 0.0,
         gate_ratio_weight: float = 0.0,
         gate_ratio_target: float = 0.3,
+        gate_mode: str = "sigmoid",
+        gate_budget_dim: str = "freq",
+        pred_input: str = "n_tf",
         **kwargs,
     ):
         super().__init__()
@@ -89,6 +94,7 @@ class LocalTFNorm(nn.Module):
         self.gate_smooth_weight = gate_smooth_weight
         self.gate_ratio_weight = gate_ratio_weight
         self.gate_ratio_target = gate_ratio_target
+        self.pred_input = pred_input
 
         if n_fft is None:
             n_fft = min(64, max(16, seq_len // 4))
@@ -102,19 +108,32 @@ class LocalTFNorm(nn.Module):
             use_threshold=True,
             init_threshold=gate_threshold,
             temperature=gate_temperature,
+            gate_mode=gate_mode,
+            gate_budget_dim=gate_budget_dim,
         )
         in_frames = self.stft.time_bins(self.seq_len)
         out_frames = self.stft.time_bins(self.pred_len)
+        
+        # Determine predictor input dimension multiplier
+        input_dim_multiplier = 2 if pred_input == "n_tf_x_tf" else 1
+        
         self.n_tf_predictor = (
             SimpleTFPredictor(
                 in_frames,
                 out_frames,
                 hidden_dim=pred_hidden_dim,
                 dropout=pred_dropout,
+                input_dim_multiplier=input_dim_multiplier,
             )
             if predict_n_time
             else None
         )
+        
+        # Store last gate stats for monitoring
+        self._last_gate_mean = 0.0
+        self._last_gate_sum_f = 0.0
+        self._last_gate_max_f = 0.0
+        self._last_gate_ent_f = 0.0
 
         self._last_state: Optional[LocalTFNormState] = None
         self._last_residual: Optional[torch.Tensor] = None
@@ -124,6 +143,33 @@ class LocalTFNorm(nn.Module):
         if self.gate_log_mag:
             magnitude = torch.log1p(magnitude)
         return self.gate(magnitude)
+
+    def _compute_gate_stats(self, g_local: torch.Tensor) -> None:
+        """Compute gate statistics: mean, freq sum, freq max, freq entropy."""
+        # g_local: (B, C, F, TT)
+        self._last_gate_mean = float(g_local.mean().detach().cpu().item())
+        
+        # Sum over time dimension to get per-freq activation
+        g_freq = g_local.mean(dim=(0, 1, 3))  # (F,)
+        self._last_gate_sum_f = float(g_freq.sum().detach().cpu().item())
+        self._last_gate_max_f = float(g_freq.max().detach().cpu().item())
+        
+        # Entropy over frequency (normalized by log(F))
+        # Use softmax to get probability distribution
+        g_freq_norm = torch.softmax(g_freq.unsqueeze(0), dim=1).squeeze(0)
+        eps = 1e-10
+        entropy = -(g_freq_norm * torch.log(g_freq_norm + eps)).sum()
+        max_entropy = torch.log(torch.tensor(g_freq.shape[0], dtype=g_freq.dtype, device=g_freq.device))
+        self._last_gate_ent_f = float((entropy / max_entropy).detach().cpu().item())
+
+    def get_last_gate_stats(self) -> dict[str, float]:
+        """Return last computed gate statistics for monitoring."""
+        return {
+            "gate_mean": self._last_gate_mean,
+            "gate_sum_f": self._last_gate_sum_f,
+            "gate_max_f": self._last_gate_max_f,
+            "gate_ent_f": self._last_gate_ent_f,
+        }
 
     def normalize(
         self, batch_x: torch.Tensor, return_state: bool = False
@@ -136,10 +182,24 @@ class LocalTFNorm(nn.Module):
         residual = self.stft.inverse(r_tf, length=length)
         n_time = self.stft.inverse(n_tf, length=length)
 
+        # Compute gate statistics
+        self._compute_gate_stats(g_local)
+
         pred_n_time = None
         pred_n_tf = None
         if self.n_tf_predictor is not None:
-            pred_n_tf = self.n_tf_predictor(n_tf)
+            if self.pred_input == "n_tf_x_tf":
+                # Concatenate n_tf and x_tf along channel dimension
+                # n_tf: (B, C, F, T) complex, x_tf: (B, C, F, T) complex
+                # Treat as real features: [Re(n), Im(n), Re(x), Im(x)]
+                n_ri = torch.view_as_real(n_tf)  # (B, C, F, T, 2)
+                x_ri = torch.view_as_real(x_tf)  # (B, C, F, T, 2)
+                # Stack along new channel dim, reshape back to complex
+                combined = torch.cat([n_tf, x_tf], dim=1)  # (B, 2C, F, T) complex
+                pred_n_tf = self.n_tf_predictor(combined)
+            else:
+                # Default: only use n_tf
+                pred_n_tf = self.n_tf_predictor(n_tf)
             pred_n_time = self.stft.inverse(pred_n_tf, length=self.pred_len)
 
         state = LocalTFNormState(
