@@ -274,6 +274,10 @@ class TrainConfig:
     win_length: int | None = None
     gate_type: str = "depthwise"
     gate_log_mag: bool = True
+    gate_arch: str = "pointwise"
+    gate_threshold_mode: str = "shift"
+    gate_entropy_weight: float = 0.0
+    gate_use_log_mag: bool = True
     stationarity_loss_weight: float = 0.0
     stationarity_chunks: int = 4
     future_mode: str = "repeat_last"
@@ -307,6 +311,10 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             win_length=cfg.win_length,
             gate_type=cfg.gate_type,
             gate_log_mag=cfg.gate_log_mag,
+            gate_arch=cfg.gate_arch,
+            gate_threshold_mode=cfg.gate_threshold_mode,
+            gate_entropy_weight=cfg.gate_entropy_weight,
+            gate_use_log_mag=cfg.gate_use_log_mag,
             stationarity_loss_weight=cfg.stationarity_loss_weight,
             stationarity_chunks=cfg.stationarity_chunks,
             future_mode=cfg.future_mode,

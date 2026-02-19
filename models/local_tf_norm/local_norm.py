@@ -6,6 +6,7 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import math
 
 from .stft import STFT
 from .gate import LocalTFGate
@@ -73,7 +74,9 @@ class SimpleTFPredictor(nn.Module):
             output: (B, C, F, out_T, 2) as real tensor, will be converted to complex outside
         """
         b, c, f, t, feat_dim = features.shape
-        
+        # sanity: feature dim should be 2 (real+imag) for n_tf, or 4 for n_tf_x_tf
+        assert feat_dim in (2, 4), f"unexpected feature dim {feat_dim}, expected 2 or 4"
+
         # Reshape to (B*C*F, T*feat_dim) for MLP
         features_flat = features.reshape(b * c * f, t * feat_dim)
         
@@ -99,6 +102,10 @@ class LocalTFNorm(nn.Module):
         win_length: int | None = None,
         gate_type: str = "depthwise",
         gate_log_mag: bool = True,
+        gate_arch: str = "pointwise",
+        gate_threshold_mode: str = "shift",
+        gate_entropy_weight: float = 0.0,
+        gate_use_log_mag: bool = True,
         stationarity_loss_weight: float = 0.0,
         stationarity_chunks: int = 4,
         future_mode: str = "repeat_last",
@@ -122,6 +129,10 @@ class LocalTFNorm(nn.Module):
         self.pred_len = pred_len
         self.enc_in = enc_in
         self.gate_log_mag = gate_log_mag
+        self.gate_arch = gate_arch
+        self.gate_threshold_mode = gate_threshold_mode
+        self.gate_entropy_weight = float(gate_entropy_weight)
+        self.gate_use_log_mag = gate_use_log_mag
         self.stationarity_loss_weight = stationarity_loss_weight
         self.stationarity_chunks = stationarity_chunks
         self.future_mode = future_mode
@@ -149,6 +160,8 @@ class LocalTFNorm(nn.Module):
             gate_mode=gate_mode,
             gate_budget_dim=gate_budget_dim,
             gate_ratio_target=gate_ratio_target,
+            gate_arch=self.gate_arch,
+            gate_threshold_mode=self.gate_threshold_mode,
         )
         in_frames = self.stft.time_bins(self.seq_len)
         out_frames = self.stft.time_bins(self.pred_len)
@@ -178,10 +191,12 @@ class LocalTFNorm(nn.Module):
 
         self._last_state: Optional[LocalTFNormState] = None
         self._last_residual: Optional[torch.Tensor] = None
+        self._last_gate: Optional[torch.Tensor] = None
 
     def _make_gate(self, x_tf: torch.Tensor) -> torch.Tensor:
         magnitude = x_tf.abs()
-        if self.gate_log_mag:
+        # allow toggling log-mag transform separately from legacy flag
+        if self.gate_use_log_mag:
             magnitude = torch.log1p(magnitude)
         return self.gate(magnitude)
 
@@ -241,6 +256,8 @@ class LocalTFNorm(nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, LocalTFNormState]:
         x_tf = self.stft(batch_x)
         g_local = self._make_gate(x_tf)
+        # keep last gate for optional regularizers / debugging
+        self._last_gate = g_local
         n_tf = g_local * x_tf
         r_tf = x_tf - n_tf
         length = batch_x.shape[1]
@@ -325,6 +342,24 @@ class LocalTFNorm(nn.Module):
                 ratio = g.mean()
                 ratio_loss = (ratio - self.gate_ratio_target) ** 2
                 loss = loss + ratio_loss * self.gate_ratio_weight
+            # Optional entropy regularizer on gate (encourage peaky distribution)
+            if self.gate_entropy_weight is not None and self.gate_entropy_weight > 0:
+                gate = None
+                if self._last_state is not None and getattr(self._last_state, 'g_local', None) is not None:
+                    gate = self._last_state.g_local
+                elif getattr(self, '_last_gate', None) is not None:
+                    gate = self._last_gate
+                if gate is not None:
+                    try:
+                        p_f = torch.softmax(gate, dim=2)
+                        eps = 1e-12
+                        ent = -torch.sum(p_f * torch.log(p_f + eps), dim=2)  # (B,C,T)
+                        logF = math.log(max(1, gate.shape[2]))
+                        ent_norm = ent / (logF + 1e-12)
+                        ent_mean = ent_norm.mean()
+                        loss = loss + float(self.gate_entropy_weight) * ent_mean
+                    except Exception:
+                        pass
         return loss
 
     def loss_with_target(self, true: torch.Tensor) -> torch.Tensor:

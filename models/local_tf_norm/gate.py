@@ -15,21 +15,38 @@ class LocalTFGate(nn.Module):
         gate_mode: str = "sigmoid",
         gate_budget_dim: str = "freq",
         gate_ratio_target: float = 0.3,
+        gate_arch: str = "pointwise",
+        gate_threshold_mode: str = "shift",
     ):
         super().__init__()
-        if gate_type == "depthwise":
-            self.proj = nn.Conv2d(
-                channels, channels, kernel_size=1, groups=channels, bias=True
+        # Build projection depending on requested gate architecture
+        self.gate_arch = gate_arch
+        if gate_arch == "pointwise":
+            if gate_type == "depthwise":
+                self.proj = nn.Conv2d(
+                    channels, channels, kernel_size=1, groups=channels, bias=True
+                )
+            else:
+                self.proj = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        elif gate_arch == "freqconv3":
+            # Depthwise conv along freq (kernel (3,1)) followed by pointwise
+            self.proj = nn.Sequential(
+                nn.Conv2d(channels, channels, kernel_size=(3, 1), padding=(1, 0), groups=channels, bias=True),
+                nn.Conv2d(channels, channels, kernel_size=1, bias=True),
             )
-        elif gate_type == "pointwise":
-            self.proj = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        elif gate_arch == "freqconv5":
+            self.proj = nn.Sequential(
+                nn.Conv2d(channels, channels, kernel_size=(5, 1), padding=(2, 0), groups=channels, bias=True),
+                nn.Conv2d(channels, channels, kernel_size=1, bias=True),
+            )
         else:
-            raise ValueError(f"Unsupported gate_type: {gate_type}")
+            raise ValueError(f"Unsupported gate_arch: {gate_arch}")
         self.use_threshold = use_threshold
         self.temperature = float(temperature)
         self.gate_mode = gate_mode
         self.gate_budget_dim = gate_budget_dim
         self.gate_ratio_target = float(gate_ratio_target)
+        self.gate_threshold_mode = gate_threshold_mode
         if use_threshold:
             self.threshold = nn.Parameter(torch.full((channels, 1, 1), init_threshold))
         else:
@@ -38,18 +55,27 @@ class LocalTFGate(nn.Module):
     def forward(self, magnitude: torch.Tensor) -> torch.Tensor:
         # magnitude: (B, C, F, TT)
         logits = self.proj(magnitude)
+        # Threshold handling: shift (subtract) or mask (suppress low logits)
         if self.use_threshold and self.threshold is not None:
-            logits = logits - self.threshold
+            if self.gate_threshold_mode == "shift":
+                logits = logits - self.threshold
+            elif self.gate_threshold_mode == "mask":
+                # mask low logits by setting them to a large negative value
+                thr = self.threshold
+                mask = logits < thr
+                logits = logits.masked_fill(mask, float(-1e9))
+            else:
+                logits = logits - self.threshold
         temperature = max(self.temperature, 1e-3)
         
         if self.gate_mode == "sigmoid":
             return torch.sigmoid(logits / temperature)
         
         elif self.gate_mode == "softmax_budget":
-            # Soft top-k: softmax along budget_dim, scale by target_sum
+            # Soft top-k: softmax along budget_dim, then scale by target_sum
             axis = 2 if self.gate_budget_dim == "freq" else 3
             bins = logits.shape[axis]
-            
+
             probs = torch.softmax(logits / temperature, dim=axis)
             target_sum = self.gate_ratio_target * bins
             g = probs * target_sum
