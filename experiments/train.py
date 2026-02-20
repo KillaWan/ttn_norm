@@ -49,27 +49,124 @@ def _parse_scaler(name: str):
     return mapping[name]
 
 
+# ETT datasets that support the "popular" fixed calendar split
+_ETT_POPULAR_DATASETS = {"ETTh1", "ETTh2", "ETTm1", "ETTm2"}
+
+
 def _build_dataloader(cfg):
+    """Build train/val/test dataloaders according to cfg.split_type.
+
+    Returns:
+        (dataloader, dataset, scaler, split_info)
+        where split_info is a dict describing the exact row boundaries used.
+    """
     _ensure_fan_on_path()
-    from torch_timeseries.datasets.dataloader import ChunkSequenceTimefeatureDataLoader
+    from torch_timeseries.datasets.dataloader import (
+        ChunkSequenceTimefeatureDataLoader,
+        ETTHLoader,
+        ETTMLoader,
+    )
+
+    if cfg.split_type not in {"ratio", "popular"}:
+        raise ValueError(
+            f"split_type must be 'ratio' or 'popular', got: {cfg.split_type!r}"
+        )
 
     dataset = _parse_type(cfg.dataset_type)(root=cfg.data_path)
     scaler = _parse_scaler(cfg.scaler_type)(device=cfg.device)
-    dataloader = ChunkSequenceTimefeatureDataLoader(
-        dataset,
-        scaler,
-        window=cfg.window,
-        horizon=cfg.horizon,
-        steps=cfg.pred_len,
-        scale_in_train=cfg.scale_in_train,
-        shuffle_train=True,
-        freq=cfg.freq,
-        batch_size=cfg.batch_size,
-        train_ratio=cfg.train_ratio,
-        val_ratio=cfg.val_ratio,
-        num_worker=cfg.num_worker,
-    )
-    return dataloader, dataset, scaler
+    n_total = len(dataset)
+
+    if cfg.split_type == "popular":
+        if cfg.dataset_type not in _ETT_POPULAR_DATASETS:
+            raise ValueError(
+                f"split_type='popular' is only supported for ETT datasets "
+                f"({sorted(_ETT_POPULAR_DATASETS)}). "
+                f"Got dataset_type={cfg.dataset_type!r}. "
+                f"Use --split-type ratio instead."
+            )
+        # Use FAN's fixed calendar-based borders (the standard ETT "popular" split):
+        #   ETTh: 12 months train / 4 months val / 4 months test (hourly, 30-day month)
+        #   ETTm: same × 4 (15-minute resolution)
+        w, h = cfg.window, cfg.horizon
+        if cfg.dataset_type.startswith("ETTh"):
+            border2s = [
+                12 * 30 * 24,
+                12 * 30 * 24 + 4 * 30 * 24,
+                12 * 30 * 24 + 8 * 30 * 24,
+            ]
+            LoaderCls = ETTHLoader
+        else:  # ETTm1 / ETTm2
+            border2s = [
+                12 * 30 * 24 * 4,
+                12 * 30 * 24 * 4 + 4 * 30 * 24 * 4,
+                12 * 30 * 24 * 4 + 8 * 30 * 24 * 4,
+            ]
+            LoaderCls = ETTMLoader
+
+        # Val/test raw data windows start slightly before the split boundary so
+        # the first evaluation sample has a full input context (same as FAN).
+        val_start  = border2s[0] - w - h + 1
+        test_start = border2s[1] - w - h + 1
+        train_end, val_end, test_end = border2s
+        test_end_capped = min(test_end, n_total)
+
+        split_info = {
+            "split_type": "popular",
+            "dataset_len": n_total,
+            "train_rows": train_end,
+            "val_rows":   val_end - train_end,
+            "test_rows":  test_end_capped - val_end,
+            "train_idx":  (0, train_end),
+            "val_idx":    (val_start, val_end),
+            "test_idx":   (test_start, test_end_capped),
+        }
+
+        dataloader = LoaderCls(
+            dataset,
+            scaler,
+            window=cfg.window,
+            horizon=cfg.horizon,
+            steps=cfg.pred_len,
+            shuffle_train=True,
+            freq=cfg.freq,
+            batch_size=cfg.batch_size,
+            num_worker=cfg.num_worker,
+        )
+
+    else:  # split_type == "ratio"
+        train_size = int(cfg.train_ratio * n_total)
+        val_size   = int(cfg.val_ratio   * n_total)
+        test_size  = n_total - train_size - val_size
+
+        split_info = {
+            "split_type": "ratio",
+            "dataset_len": n_total,
+            "train_rows": train_size,
+            "val_rows":   val_size,
+            "test_rows":  test_size,
+            "train_ratio": cfg.train_ratio,
+            "val_ratio":   cfg.val_ratio,
+            "train_idx":  (0, train_size),
+            "val_idx":    (train_size, train_size + val_size),
+            "test_idx":   (train_size + val_size, n_total),
+        }
+
+        dataloader = ChunkSequenceTimefeatureDataLoader(
+            dataset,
+            scaler,
+            window=cfg.window,
+            horizon=cfg.horizon,
+            steps=cfg.pred_len,
+            scale_in_train=cfg.scale_in_train,
+            shuffle_train=True,
+            freq=cfg.freq,
+            batch_size=cfg.batch_size,
+            train_ratio=cfg.train_ratio,
+            val_ratio=cfg.val_ratio,
+            num_worker=cfg.num_worker,
+        )
+
+    return dataloader, dataset, scaler, split_info
 
 
 def _set_seed(seed: int) -> None:
@@ -255,6 +352,7 @@ class TrainConfig:
     scale_in_train: bool = False
     train_ratio: float = 0.7
     val_ratio: float = 0.2
+    split_type: str = "ratio"   # "ratio" | "popular"
     freq: str | None = None
 
     label_len: int = 48
@@ -572,7 +670,20 @@ def main(argv: list[str] | None = None):
     cfg = TrainConfig(**vars(args))
 
     _set_seed(cfg.seed)
-    dataloader, dataset, scaler = _build_dataloader(cfg)
+    dataloader, dataset, scaler, split_info = _build_dataloader(cfg)
+
+    # Log the exact row boundaries used for this run (for reproducibility)
+    si = split_info
+    print(
+        f"[Split] type={si['split_type']}  dataset_len={si['dataset_len']}"
+        f"  train={si['train_rows']} rows {si['train_idx']}"
+        f"  val={si['val_rows']} rows {si['val_idx']}"
+        f"  test={si['test_rows']} rows {si['test_idx']}"
+    )
+    print(
+        f"[Split] dataloader sizes: "
+        f"train={dataloader.train_size}, val={dataloader.val_size}, test={dataloader.test_size}"
+    )
 
     model = build_model(cfg, dataset.num_features).to(cfg.device)
     optimizer = _build_optimizer(model, cfg)
