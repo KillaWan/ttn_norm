@@ -297,10 +297,6 @@ class TrainConfig:
     gate_lr: float = 0.0
     predictor_lr: float = 0.0
     use_instance_norm: bool = True
-    # hf_cutoff gate params
-    hf_tau: float = 0.05
-    hf_cutoff_mode: str = "global"  # "global" or "channel"
-    hf_init_ratio: float = -1.0     # -1 means use gate_ratio_target as default
 
 
 def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
@@ -337,9 +333,6 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             gate_budget_dim=cfg.gate_budget_dim,
             pred_input=cfg.pred_input,
             use_instance_norm=cfg.use_instance_norm,
-            hf_tau=cfg.hf_tau,
-            hf_cutoff_mode=cfg.hf_cutoff_mode,
-            hf_init_ratio=cfg.hf_init_ratio if cfg.hf_init_ratio >= 0 else cfg.gate_ratio_target,
         )
     label_len = cfg.label_len or (cfg.window // 2)
     label_len = min(label_len, cfg.window)
@@ -465,13 +458,6 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
             f"sumF={stats['gate_sum_f']:.4f}, maxF={stats['gate_max_f']:.4f}, "
             f"entF={stats['gate_ent_f']:.4f}"
         )
-        if "cutoff" in stats:
-            gate_stats_str += f", cutoff={stats['cutoff']:.4f}"
-        elif "cutoff_mean" in stats:
-            gate_stats_str += (
-                f", cutoff: mean={stats['cutoff_mean']:.4f}"
-                f" min={stats['cutoff_min']:.4f} max={stats['cutoff_max']:.4f}"
-            )
     
     return float(np.mean(losses)) if losses else 0.0, gate_stats_str
 
