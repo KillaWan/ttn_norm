@@ -397,6 +397,7 @@ class TrainConfig:
     use_instance_norm: bool = True
     lambda_E: float = 1.0
     lambda_P: float = 1.0
+    eps_E: float = 1e-6
 
 
 def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
@@ -435,6 +436,7 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             use_instance_norm=cfg.use_instance_norm,
             lambda_E=cfg.lambda_E,
             lambda_P=cfg.lambda_P,
+            eps_E=cfg.eps_E,
         )
     label_len = cfg.label_len or (cfg.window // 2)
     label_len = min(label_len, cfg.window)

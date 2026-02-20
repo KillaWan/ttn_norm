@@ -125,6 +125,7 @@ class LocalTFNorm(nn.Module):
         use_instance_norm: bool = True,
         lambda_E: float = 1.0,
         lambda_P: float = 1.0,
+        eps_E: float = 1e-6,
         **kwargs,
     ):
         super().__init__()
@@ -151,6 +152,7 @@ class LocalTFNorm(nn.Module):
         self.pred_input = pred_input
         self.lambda_E = float(lambda_E)
         self.lambda_P = float(lambda_P)
+        self.eps_E = float(eps_E)
 
         if n_fft is None:
             n_fft = min(64, max(16, seq_len // 4))
@@ -361,10 +363,11 @@ class LocalTFNorm(nn.Module):
 
         L_stat = lambda_E * L_E + lambda_P * L_P
 
-          P  = |r_tf|^2              (B, C, F, T)  power spectrum of TF residual
-          E  = mean_F(P)             (B, C, T)     per-frame energy
-          p  = P / (sum_F(P) + eps)  (B, C, F, T)  normalised spectral shape
-          L_E = mean |E[..., 1:] - E[..., :-1]|           energy total variation
+          P    = |r_tf|^2              (B, C, F, T)  power spectrum of TF residual
+          E    = mean_F(P)             (B, C, T)     per-frame energy
+          logE = log(E + eps_E)        (B, C, T)     log-energy
+          p    = P / (sum_F(P) + eps)  (B, C, F, T)  normalised spectral shape
+          L_E = mean |logE[..., 1:] - logE[..., :-1]|     log-energy total variation
           L_P = mean |p[..., :, 1:] - p[..., :, :-1]|    shape total variation
         """
         device = self._device()
@@ -387,8 +390,9 @@ class LocalTFNorm(nn.Module):
         # Normalised spectral shape
         p = P / (P.sum(dim=2, keepdim=True) + eps)  # (B, C, F, T)
 
-        # Energy total variation along time
-        L_E = torch.mean(torch.abs(E[..., 1:] - E[..., :-1]))
+        # Log-energy total variation along time (scale-invariant)
+        logE = torch.log(E + self.eps_E)
+        L_E = torch.mean(torch.abs(logE[..., 1:] - logE[..., :-1]))
 
         # Spectral-shape total variation along time
         L_P = torch.mean(torch.abs(p[..., :, 1:] - p[..., :, :-1]))

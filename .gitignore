@@ -1,0 +1,89 @@
+# ---- OS / Editor ----
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.swn
+*.bak
+*.tmp
+.idea/
+.vscode/
+*.code-workspace
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.coverage
+htmlcov/
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+*.log
+*.pyc
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+
+# ---- Virtualenv ----
+.venv/
+venv/
+ENV/
+env/
+.conda/
+conda/
+.poetry/
+.uv/
+
+# ---- Torch / CUDA artifacts ----
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.tflite
+
+# ---- Experiment outputs / logs ----
+results/
+runs/
+wandb/
+lightning_logs/
+tensorboard/
+checkpoints/
+outputs/
+logs/
+*.out
+*.err
+*.slurm
+
+# ---- Data ----
+data/
+datasets/
+*.csv
+*.parquet
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+
+# ---- Cache ----
+.cache/
+tmp/
+temp/
+.cache-*/
+*.cache
+
+# ---- SSH keys / secrets (safety) ----
+*.pem
+*.key
+*.crt
+*.env
+.env.*
+secrets/
