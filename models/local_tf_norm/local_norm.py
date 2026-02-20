@@ -6,11 +6,9 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
-import math
 
 from .stft import STFT
 from .gate import LocalTFGate
-from .losses import residual_stationarity_loss
 
 
 @dataclass
@@ -125,6 +123,8 @@ class LocalTFNorm(nn.Module):
         pred_input: str = "n_tf",
         gate_temporal_smooth_weight: float = 0.0,
         use_instance_norm: bool = True,
+        lambda_E: float = 1.0,
+        lambda_P: float = 1.0,
         **kwargs,
     ):
         super().__init__()
@@ -149,6 +149,8 @@ class LocalTFNorm(nn.Module):
         self.gate_ratio_target = gate_ratio_target
         self.gate_mode = gate_mode
         self.pred_input = pred_input
+        self.lambda_E = float(lambda_E)
+        self.lambda_P = float(lambda_P)
 
         if n_fft is None:
             n_fft = min(64, max(16, seq_len // 4))
@@ -197,6 +199,10 @@ class LocalTFNorm(nn.Module):
         self._last_state: Optional[LocalTFNormState] = None
         self._last_residual: Optional[torch.Tensor] = None
         self._last_gate: Optional[torch.Tensor] = None
+        self._last_r_tf: Optional[torch.Tensor] = None
+        self._last_L_E: float = 0.0
+        self._last_L_P: float = 0.0
+        self._last_stationarity_loss: float = 0.0
 
     def _make_gate(self, x_tf: torch.Tensor) -> torch.Tensor:
         magnitude = x_tf.abs()
@@ -260,6 +266,14 @@ class LocalTFNorm(nn.Module):
             "gate_ent_f": self._last_gate_ent_f,
         }
 
+    def get_last_stationarity_stats(self) -> dict[str, float]:
+        """Return last computed stationarity loss components for logging."""
+        return {
+            "stationarity_loss": self._last_stationarity_loss,
+            "L_E": self._last_L_E,
+            "L_P": self._last_L_P,
+        }
+
     def normalize(
         self, batch_x: torch.Tensor, return_state: bool = False
     ) -> torch.Tensor | tuple[torch.Tensor, LocalTFNormState]:
@@ -276,6 +290,7 @@ class LocalTFNorm(nn.Module):
         self._last_gate = g_local
         n_tf = g_local * x_tf
         r_tf = x_tf - n_tf
+        self._last_r_tf = r_tf
         length = batch_x.shape[1]
         residual = self.stft.inverse(r_tf, length=length)
         n_time = self.stft.inverse(n_tf, length=length)
@@ -342,72 +357,54 @@ class LocalTFNorm(nn.Module):
         return result
 
     def loss(self, _: Optional[torch.Tensor] = None) -> torch.Tensor:
-        loss = torch.tensor(0.0, device=self._device())
-        if self.stationarity_loss_weight > 0 and self._last_residual is not None:
-            loss = loss + residual_stationarity_loss(
-                self._last_residual, num_chunks=self.stationarity_chunks
-            ) * self.stationarity_loss_weight
-        if self._last_state is not None:
-            g = self._last_state.g_local
-            if self.gate_smooth_weight > 0:
-                # Frequency-axis smoothness: penalise adjacent-freq differences
-                smooth = torch.mean(torch.abs(g[:, :, 1:, :] - g[:, :, :-1, :]))
-                loss = loss + smooth * self.gate_smooth_weight
-            if self.gate_temporal_smooth_weight > 0:
-                # Time-axis smoothness: penalise adjacent-time differences
-                t_smooth = torch.mean(torch.abs(g[:, :, :, 1:] - g[:, :, :, :-1]))
-                loss = loss + t_smooth * self.gate_temporal_smooth_weight
-            # Ratio regularisation is meaningless when the gate already enforces a
-            # hard budget via softmax/sigmoid_budget; skip it to avoid conflicting
-            # gradients.
-            budget_modes = {"softmax_budget", "sigmoid_budget"}
-            if self.gate_ratio_weight > 0 and self.gate_mode not in budget_modes:
-                ratio = g.mean()
-                ratio_loss = (ratio - self.gate_ratio_target) ** 2
-                loss = loss + ratio_loss * self.gate_ratio_weight
-            # Optional entropy regularizer on gate (encourage peaky distribution)
-            if self.gate_entropy_weight is not None and self.gate_entropy_weight > 0:
-                gate = None
-                if self._last_state is not None and getattr(self._last_state, 'g_local', None) is not None:
-                    gate = self._last_state.g_local
-                elif getattr(self, '_last_gate', None) is not None:
-                    gate = self._last_gate
-                if gate is not None:
-                    try:
-                        eps = 1e-12
-                        # normalize gate into probabilities over frequency (no softmax)
-                        p = gate / (gate.sum(dim=2, keepdim=True) + eps)
-                        ent = -torch.sum(p * torch.log(p + eps), dim=2)  # (B,C,T)
-                        logF = math.log(max(1, gate.shape[2]))
-                        ent_norm = ent / (logF + 1e-12)
-                        ent_mean = ent_norm.mean()
-                        loss = loss + float(self.gate_entropy_weight) * ent_mean
-                    except Exception:
-                        pass
-        return loss
+        """Stationarity loss computed in the TF domain from the last normalize() call.
+
+        L_stat = lambda_E * L_E + lambda_P * L_P
+
+          P  = |r_tf|^2              (B, C, F, T)  power spectrum of TF residual
+          E  = mean_F(P)             (B, C, T)     per-frame energy
+          p  = P / (sum_F(P) + eps)  (B, C, F, T)  normalised spectral shape
+          L_E = mean |E[..., 1:] - E[..., :-1]|           energy total variation
+          L_P = mean |p[..., :, 1:] - p[..., :, :-1]|    shape total variation
+        """
+        device = self._device()
+        zero = torch.tensor(0.0, device=device)
+
+        if self._last_r_tf is None:
+            self._last_L_E = 0.0
+            self._last_L_P = 0.0
+            self._last_stationarity_loss = 0.0
+            return zero
+
+        r_tf = self._last_r_tf  # (B, C, F, T) complex
+        eps = 1e-8
+
+        P = r_tf.abs() ** 2  # (B, C, F, T)
+
+        # Per-frame energy: mean over frequency bins
+        E = P.mean(dim=2)  # (B, C, T)
+
+        # Normalised spectral shape
+        p = P / (P.sum(dim=2, keepdim=True) + eps)  # (B, C, F, T)
+
+        # Energy total variation along time
+        L_E = torch.mean(torch.abs(E[..., 1:] - E[..., :-1]))
+
+        # Spectral-shape total variation along time
+        L_P = torch.mean(torch.abs(p[..., :, 1:] - p[..., :, :-1]))
+
+        L_stat = self.lambda_E * L_E + self.lambda_P * L_P
+
+        # Cache scalar values for logging (detached)
+        self._last_L_E = float(L_E.detach().cpu().item())
+        self._last_L_P = float(L_P.detach().cpu().item())
+        self._last_stationarity_loss = float(L_stat.detach().cpu().item())
+
+        return L_stat
 
     def loss_with_target(self, true: torch.Tensor) -> torch.Tensor:
-        loss = self.loss()
-        if (
-            self.n_tf_predictor is None
-            or self._last_state is None
-            or self._last_state.pred_n_time is None
-        ):
-            return loss
-        # Use no_grad so the gate does NOT receive gradients from the predictor
-        # target computation.  This decouples gate training from predictor training
-        # and prevents the "moving target" instability where the gate and predictor
-        # co-adapt in a circular way.
-        with torch.no_grad():
-            _, true_n_time = self._extract_n_time(
-                true,
-                mean=self._last_state.mean,
-                std=self._last_state.std,
-            )
-        if true_n_time.shape[1] != self._last_state.pred_n_time.shape[1]:
-            return loss
-        pred_loss = nn.functional.mse_loss(self._last_state.pred_n_time, true_n_time)
-        return loss + pred_loss * self.pred_loss_weight
+        """Stationarity loss only — no predictor supervision."""
+        return self.loss()
 
     def _device(self) -> torch.device:
         return next(self.parameters()).device

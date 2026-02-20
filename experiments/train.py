@@ -245,7 +245,7 @@ class TrainConfig:
     early_stop_metric: str = "val_mse"
     val_mse_ema_alpha: float = 1.0
     early_stop_delta: float = 0.0
-    aux_loss_schedule: str = "cosine"
+    aux_loss_schedule: str = "none"
     aux_loss_scale: float = 1.0
     aux_loss_min_scale: float = 0.2
     aux_loss_decay_start_epoch: int = 4
@@ -281,7 +281,7 @@ class TrainConfig:
     stationarity_loss_weight: float = 0.0
     stationarity_chunks: int = 4
     future_mode: str = "repeat_last"
-    predict_n_time: bool = True
+    predict_n_time: bool = False
     pred_hidden_dim: int = 64
     pred_dropout: float = 0.1
     pred_loss_weight: float = 1.0
@@ -297,6 +297,8 @@ class TrainConfig:
     gate_lr: float = 0.0
     predictor_lr: float = 0.0
     use_instance_norm: bool = True
+    lambda_E: float = 1.0
+    lambda_P: float = 1.0
 
 
 def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
@@ -333,6 +335,8 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             gate_budget_dim=cfg.gate_budget_dim,
             pred_input=cfg.pred_input,
             use_instance_norm=cfg.use_instance_norm,
+            lambda_E=cfg.lambda_E,
+            lambda_P=cfg.lambda_P,
         )
     label_len = cfg.label_len or (cfg.window // 2)
     label_len = min(label_len, cfg.window)
@@ -409,6 +413,16 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
     model.train()
     loss_fn = nn.MSELoss()
     losses = []
+    task_losses = []
+    aux_losses = []
+    stat_losses: list[float] = []
+    l_e_vals: list[float] = []
+    l_p_vals: list[float] = []
+    has_nm_stat = (
+        hasattr(model, "nm")
+        and model.nm is not None
+        and hasattr(model.nm, "get_last_stationarity_stats")
+    )
     aux_scale = _aux_scale(cfg, epoch_idx)
     print(f"aux_loss_scale: {aux_scale:.6f}")
     with tqdm(total=len(loader.dataset), leave=True) as pbar:
@@ -446,8 +460,19 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
             optimizer.step()
 
             losses.append(loss.item())
+            task_losses.append(task_loss.item())
+            aux_losses.append(aux_loss.item())
+            if has_nm_stat:
+                s = model.nm.get_last_stationarity_stats()
+                stat_losses.append(s["stationarity_loss"])
+                l_e_vals.append(s["L_E"])
+                l_p_vals.append(s["L_P"])
             pbar.update(batch_x.size(0))
-            pbar.set_postfix(loss=loss.item())
+            pbar.set_postfix(
+                task=f"{task_loss.item():.4f}",
+                aux=f"{aux_loss.item():.4f}",
+                total=f"{loss.item():.4f}",
+            )
     
     # Get gate statistics from model
     gate_stats_str = ""
@@ -458,8 +483,18 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
             f"sumF={stats['gate_sum_f']:.4f}, maxF={stats['gate_max_f']:.4f}, "
             f"entF={stats['gate_ent_f']:.4f}"
         )
-    
-    return float(np.mean(losses)) if losses else 0.0, gate_stats_str
+
+    train_stat: dict[str, float] = {}
+    if stat_losses:
+        train_stat = {
+            "stationarity_loss": float(np.mean(stat_losses)),
+            "L_E": float(np.mean(l_e_vals)),
+            "L_P": float(np.mean(l_p_vals)),
+            "task_loss": float(np.mean(task_losses)),
+            "aux_loss": float(np.mean(aux_losses)),
+        }
+
+    return float(np.mean(losses)) if losses else 0.0, gate_stats_str, train_stat
 
 
 @torch.no_grad()
@@ -468,6 +503,15 @@ def evaluate(model, loader, cfg, scaler):
     metrics = _build_metrics(torch.device(cfg.device))
     for metric in metrics.values():
         metric.reset()
+    has_nm_stat = (
+        hasattr(model, "nm")
+        and model.nm is not None
+        and hasattr(model.nm, "get_last_stationarity_stats")
+        and hasattr(model.nm, "loss")
+    )
+    stat_losses: list[float] = []
+    l_e_vals: list[float] = []
+    l_p_vals: list[float] = []
     for batch_x, batch_y, origin_y, batch_x_enc, batch_y_enc in loader:
         batch_x = batch_x.to(cfg.device).float()
         batch_y = batch_y.to(cfg.device).float()
@@ -482,6 +526,13 @@ def evaluate(model, loader, cfg, scaler):
                 batch_x, batch_y_enc, batch_x_enc, label_len
             )
         pred = model(batch_x, batch_x_enc, dec_inp, dec_inp_enc)
+        if has_nm_stat:
+            # Compute stationarity stats from the forward pass (_last_r_tf is set)
+            model.nm.loss()
+            s = model.nm.get_last_stationarity_stats()
+            stat_losses.append(s["stationarity_loss"])
+            l_e_vals.append(s["L_E"])
+            l_p_vals.append(s["L_P"])
         true = batch_y
         if cfg.invtrans_loss:
             pred = scaler.inverse_transform(pred)
@@ -496,7 +547,12 @@ def evaluate(model, loader, cfg, scaler):
         for metric in metrics.values():
             metric.update(pred, true)
 
-    return {name: float(metric.compute()) for name, metric in metrics.items()}
+    results = {name: float(metric.compute()) for name, metric in metrics.items()}
+    if stat_losses:
+        results["stationarity_loss"] = float(np.mean(stat_losses))
+        results["L_E"] = float(np.mean(l_e_vals))
+        results["L_P"] = float(np.mean(l_p_vals))
+    return results
 
 
 def main(argv: list[str] | None = None):
@@ -555,21 +611,41 @@ def main(argv: list[str] | None = None):
         result = train_one_epoch(
             model, dataloader.train_loader, optimizer, cfg, scaler, epoch_idx=epoch
         )
-        if isinstance(result, tuple):
+        if isinstance(result, tuple) and len(result) == 3:
+            train_loss, gate_info, train_stat = result
+        elif isinstance(result, tuple):
             train_loss, gate_info = result
+            train_stat = {}
         else:
             train_loss = result
             gate_info = ""
+            train_stat = {}
         val_metrics = evaluate(model, dataloader.val_loader, cfg, scaler)
         test_metrics = evaluate(model, dataloader.test_loader, cfg, scaler)
 
-        print(f"Epoch: {epoch + 1} Traininng loss : {train_loss:.6f}{gate_info}")
+        # Build stationarity info strings
+        train_stat_str = ""
+        if train_stat:
+            train_stat_str = (
+                f" | task_loss={train_stat['task_loss']:.6f}"
+                f", stat_loss={train_stat['stationarity_loss']:.6f}"
+                f" (L_E={train_stat['L_E']:.6f}, L_P={train_stat['L_P']:.6f})"
+            )
+        val_stat_str = ""
+        if "stationarity_loss" in val_metrics:
+            val_stat_str = (
+                f" | stat_loss={val_metrics['stationarity_loss']:.6f}"
+                f" (L_E={val_metrics['L_E']:.6f}, L_P={val_metrics['L_P']:.6f})"
+            )
+
+        print(f"Epoch: {epoch + 1} Training loss: {train_loss:.6f}{gate_info}{train_stat_str}")
         print(
             "vali_results: "
             f"{{'mae': {val_metrics['mae']:.6f}, "
             f"'mape': {val_metrics['mape']:.6f}, "
             f"'mse': {val_metrics['mse']:.6f}, "
             f"'rmse': {val_metrics['rmse']:.6f}}}"
+            f"{val_stat_str}"
         )
         print(
             "test_results: "
