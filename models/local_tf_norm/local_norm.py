@@ -125,6 +125,9 @@ class LocalTFNorm(nn.Module):
         pred_input: str = "n_tf",
         gate_temporal_smooth_weight: float = 0.0,
         use_instance_norm: bool = True,
+        hf_tau: float = 0.05,
+        hf_cutoff_mode: str = "global",
+        hf_init_ratio: float = 0.25,
         **kwargs,
     ):
         super().__init__()
@@ -167,6 +170,9 @@ class LocalTFNorm(nn.Module):
             gate_ratio_target=gate_ratio_target,
             gate_arch=self.gate_arch,
             gate_threshold_mode=self.gate_threshold_mode,
+            hf_tau=hf_tau,
+            hf_cutoff_mode=hf_cutoff_mode,
+            hf_init_ratio=hf_init_ratio,
         )
         in_frames = self.stft.time_bins(self.seq_len)
         out_frames = self.stft.time_bins(self.pred_len)
@@ -253,12 +259,15 @@ class LocalTFNorm(nn.Module):
 
     def get_last_gate_stats(self) -> dict[str, float]:
         """Return last computed gate statistics for monitoring."""
-        return {
+        stats: dict[str, float] = {
             "gate_mean": self._last_gate_mean,
             "gate_sum_f": self._last_gate_sum_f,
             "gate_max_f": self._last_gate_max_f,
             "gate_ent_f": self._last_gate_ent_f,
         }
+        if self.gate_mode == "hf_cutoff":
+            stats.update(self.gate.get_hf_cutoff_stats())
+        return stats
 
     def normalize(
         self, batch_x: torch.Tensor, return_state: bool = False
@@ -360,7 +369,7 @@ class LocalTFNorm(nn.Module):
             # Ratio regularisation is meaningless when the gate already enforces a
             # hard budget via softmax/sigmoid_budget; skip it to avoid conflicting
             # gradients.
-            budget_modes = {"softmax_budget", "sigmoid_budget"}
+            budget_modes = {"softmax_budget", "sigmoid_budget", "hf_cutoff"}
             if self.gate_ratio_weight > 0 and self.gate_mode not in budget_modes:
                 ratio = g.mean()
                 ratio_loss = (ratio - self.gate_ratio_target) ** 2
