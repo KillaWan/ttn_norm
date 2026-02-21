@@ -210,6 +210,24 @@ class LocalTFNorm(nn.Module):
         self._last_L_P: float = 0.0
         self._last_stationarity_loss: float = 0.0
 
+        # Extended diagnostic caches (detached, no grad)
+        self._last_x_time: Optional[torch.Tensor] = None      # (B,T,C) after RevIN
+        self._last_x_tf: Optional[torch.Tensor] = None        # (B,C,F,TT) complex
+        self._last_n_tf: Optional[torch.Tensor] = None        # (B,C,F,TT) complex
+        self._last_n_time: Optional[torch.Tensor] = None      # (B,T,C)
+        self._last_r_time: Optional[torch.Tensor] = None      # (B,T,C) == _last_residual
+        self._last_pred_n_tf: Optional[torch.Tensor] = None   # (B,C,F,TT) or None
+        self._last_pred_n_time: Optional[torch.Tensor] = None # (B,T,C) or None
+        self._last_inst_mean: Optional[torch.Tensor] = None   # (B,1,C) or None
+        self._last_inst_std: Optional[torch.Tensor] = None    # (B,1,C) or None
+        self._last_dE: Optional[torch.Tensor] = None          # (B,C,T-1) log-energy steps
+        self._last_dP: Optional[torch.Tensor] = None          # (B,C,T-1) shape steps
+
+        # Denormalize branch usage counters (reset each epoch by caller)
+        self._denorm_used_pred: int = 0
+        self._denorm_used_input: int = 0
+        self._denorm_used_extrap: int = 0
+
     def _make_gate(self, x_tf: torch.Tensor) -> torch.Tensor:
         magnitude = x_tf.abs()
         # decide whether to use log-mag: explicit override wins, else legacy flag
@@ -338,6 +356,17 @@ class LocalTFNorm(nn.Module):
         self._last_state = state
         self._last_residual = residual
 
+        # Extended diagnostic caches (all detached)
+        self._last_x_time = batch_x.detach()
+        self._last_x_tf = x_tf.detach()
+        self._last_n_tf = n_tf.detach()
+        self._last_n_time = n_time.detach()
+        self._last_r_time = residual.detach()
+        self._last_inst_mean = inst_mean.detach() if inst_mean is not None else None
+        self._last_inst_std = inst_std.detach() if inst_std is not None else None
+        self._last_pred_n_tf = pred_n_tf.detach() if pred_n_tf is not None else None
+        self._last_pred_n_time = pred_n_time.detach() if pred_n_time is not None else None
+
         if return_state:
             return residual, state
         return residual
@@ -351,10 +380,13 @@ class LocalTFNorm(nn.Module):
             raise RuntimeError("LocalTFNorm denormalize requires a stored state.")
         target_len = batch_x.shape[1]
         if state.pred_n_time is not None and target_len == state.pred_n_time.shape[1]:
+            self._denorm_used_pred += 1
             result = batch_x + state.pred_n_time
         elif target_len == state.length:
+            self._denorm_used_input += 1
             result = batch_x + state.n_time
         else:
+            self._denorm_used_extrap += 1
             n_time = self._extrapolate_n_time(state.n_time, target_len)
             result = batch_x + n_time
         # Reverse RevIN: restore instance mean and std
@@ -405,6 +437,10 @@ class LocalTFNorm(nn.Module):
         dP = torch.abs(p[..., :, 1:] - p[..., :, :-1]).mean(dim=2)  # (B, C, T-1)
         L_P = torch.mean(torch.relu(dP - self.delta_P))
 
+        # Cache per-transition tensors for diagnostics
+        self._last_dE = dE.detach()
+        self._last_dP = dP.detach()
+
         L_stat = self.lambda_E * L_E + self.lambda_P * L_P
 
         # Cache scalar values for logging (detached)
@@ -434,6 +470,24 @@ class LocalTFNorm(nn.Module):
         n_tf = g_local * x_tf
         n_time = self.stft.inverse(n_tf, length=batch_x.shape[1])
         return n_tf, n_time
+
+    @torch.no_grad()
+    def extract_n_time_only(self, x_time: torch.Tensor) -> torch.Tensor:
+        """Apply RevIN + STFT + gate + iSTFT and return n_time.
+
+        Does NOT write any _last_* cache fields.  Safe to call during debug
+        collection without disturbing the training-batch state.
+        """
+        if self.use_instance_norm:
+            inst_mean = x_time.mean(dim=1, keepdim=True)
+            inst_std = x_time.std(dim=1, keepdim=True) + 1e-8
+            x = (x_time - inst_mean) / inst_std
+        else:
+            x = x_time
+        x_tf = self.stft(x)
+        g_local = self._make_gate(x_tf)
+        n_tf = g_local * x_tf
+        return self.stft.inverse(n_tf, length=x.shape[1])
 
     def _extrapolate_n_time(self, n_time: torch.Tensor, target_len: int) -> torch.Tensor:
         # n_time: (B, T, C)

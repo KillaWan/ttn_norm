@@ -468,12 +468,26 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
     if cfg.backbone_kwargs:
         extra = json.loads(cfg.backbone_kwargs)
         backbone_kwargs.update(extra)
-    return TTNModel(
+    ttn = TTNModel(
         backbone_type=cfg.backbone_type,
         backbone_kwargs=backbone_kwargs,
         norm_model=norm_model,
         is_former=True if cfg.force_former else None,
     )
+    # Print STFT configuration for reproducibility
+    _nm = getattr(ttn, "nm", None)
+    if _nm is not None and hasattr(_nm, "stft"):
+        _stft = _nm.stft
+        _freq_bins = _stft.n_fft // 2 + 1
+        _in_frames = _stft.time_bins(cfg.window)
+        _out_frames = _stft.time_bins(cfg.pred_len)
+        print(
+            f"[STFT_CFG] n_fft={_stft.n_fft} hop_length={_stft.hop_length}"
+            f" win_length={_stft.win_length} freq_bins={_freq_bins}"
+            f" in_frames={_in_frames} out_frames={_out_frames}"
+            f" target_frames={cfg.target_frames} auto_stft={cfg.auto_stft}"
+        )
+    return ttn
 
 
 @torch.no_grad()
@@ -540,7 +554,263 @@ def calibrate_thresholds(
     q = float(cfg.trigger_q)
     delta_E = float(torch.quantile(cat_dE, q).item())
     delta_P = float(torch.quantile(cat_dP, q).item())
+
+    def _qs(t: torch.Tensor, qs: list[float]) -> list[float]:
+        return [float(torch.quantile(t, qi).item()) for qi in qs]
+
+    qs = [0.50, 0.90, 0.95, 0.99, 0.999]
+    eqs = _qs(cat_dE, qs)
+    pqs = _qs(cat_dP, qs)
+    e99, e95 = eqs[3], eqs[2]
+    p99, p95 = pqs[3], pqs[2]
+    heavy_E = e99 / e95 if e95 > 1e-15 else float("nan")
+    heavy_P = p99 / p95 if p95 > 1e-15 else float("nan")
+    print(
+        f"[Calibration][dE_dist]"
+        f" n={cat_dE.numel()}"
+        f" mean={cat_dE.mean():.6f} std={cat_dE.std():.6f}"
+        f" p50={eqs[0]:.6f} p90={eqs[1]:.6f} p95={eqs[2]:.6f}"
+        f" p99={eqs[3]:.6f} p999={eqs[4]:.6f}"
+        f" heavy_tail_ratio={heavy_E:.4f}"
+    )
+    print(
+        f"[Calibration][dP_dist]"
+        f" n={cat_dP.numel()}"
+        f" mean={cat_dP.mean():.6f} std={cat_dP.std():.6f}"
+        f" p50={pqs[0]:.6f} p90={pqs[1]:.6f} p95={pqs[2]:.6f}"
+        f" p99={pqs[3]:.6f} p999={pqs[4]:.6f}"
+        f" heavy_tail_ratio={heavy_P:.4f}"
+    )
     return delta_E, delta_P
+
+
+def _sq(t: torch.Tensor, q: float) -> float:
+    """Safe quantile on a flattened tensor; returns nan if empty."""
+    t = t.float().flatten()
+    return float(torch.quantile(t, q).item()) if t.numel() > 0 else float("nan")
+
+
+def _pearson(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Pearson correlation of two tensors (flattened)."""
+    a = a.float().flatten()
+    b = b.float().flatten()
+    if a.numel() < 2:
+        return float("nan")
+    a = a - a.mean()
+    b = b - b.mean()
+    denom = (a.norm() * b.norm()).clamp(min=1e-12)
+    return float((a * b).sum() / denom)
+
+
+def _norm_or_nan(params) -> float:
+    total = sum(p.data.norm() ** 2 for p in params if p is not None)
+    return float(total ** 0.5) if total > 0 else float("nan")
+
+
+def _grad_norm_or_nan(params) -> float:
+    grads = [p.grad for p in params if p is not None and p.grad is not None]
+    if not grads:
+        return float("nan")
+    total = sum(g.norm() ** 2 for g in grads)
+    return float(total ** 0.5)
+
+
+@torch.no_grad()
+def collect_and_print_debug(
+    prefix: str,
+    model: nn.Module,
+    cfg: TrainConfig,
+    batch_x: torch.Tensor | None = None,
+    batch_y: torch.Tensor | None = None,
+    y_pred: torch.Tensor | None = None,
+    y_true: torch.Tensor | None = None,
+    step_info: dict | None = None,
+    grad_info: dict | None = None,
+) -> None:
+    """Print a fixed set of diagnostic fields for one (prefix, batch) pair.
+
+    Each logical group is printed on its own line, prefixed with
+    [{prefix}][CATEGORY], fields separated by spaces.  Missing values → nan.
+    """
+    nm = getattr(model, "nm", None)
+    gate = getattr(nm, "gate", None) if nm is not None else None
+    nan = float("nan")
+    eps = 1e-12
+
+    # ------------------------------------------------------------------ RECON
+    x = getattr(nm, "_last_x_time", None)
+    r = getattr(nm, "_last_r_time", None)
+    n = getattr(nm, "_last_n_time", None)
+    if x is not None and r is not None and n is not None:
+        recon = x - (r + n)
+        x_norm = x.norm().clamp(min=eps)
+        recon_rel = float(recon.norm() / x_norm)
+        recon_max_abs = float(recon.abs().max())
+        ratio_n_time = float(n.pow(2).mean() / (x.pow(2).mean() + eps))
+        ratio_r_time = float(r.pow(2).mean() / (x.pow(2).mean() + eps))
+        corr_x_r = _pearson(x, r)
+        corr_x_n = _pearson(x, n)
+    else:
+        recon_rel = recon_max_abs = ratio_n_time = ratio_r_time = nan
+        corr_x_r = corr_x_n = nan
+    print(
+        f"[{prefix}][RECON]"
+        f" recon_rel={recon_rel:.6f} recon_max_abs={recon_max_abs:.6e}"
+        f" ratio_n_time={ratio_n_time:.6f} ratio_r_time={ratio_r_time:.6f}"
+        f" corr_x_r={corr_x_r:.6f} corr_x_n={corr_x_n:.6f}"
+    )
+
+    # ------------------------------------------------------------------ STAT
+    dE = getattr(nm, "_last_dE", None)
+    dP = getattr(nm, "_last_dP", None)
+    delta_E = float(cfg.delta_E) if nm is None else float(getattr(nm, "delta_E", cfg.delta_E))
+    delta_P = float(cfg.delta_P) if nm is None else float(getattr(nm, "delta_P", cfg.delta_P))
+    if dE is not None:
+        dE_f = dE.float().flatten()
+        mask_E = dE_f > delta_E
+        trigger_E = float(mask_E.float().mean())
+        excess_E = float((dE_f[mask_E] - delta_E).mean()) if mask_E.any() else nan
+        mean_dE = float(dE_f.mean())
+        p95_dE, p99_dE = _sq(dE_f, 0.95), _sq(dE_f, 0.99)
+    else:
+        trigger_E = excess_E = mean_dE = p95_dE = p99_dE = nan
+    if dP is not None:
+        dP_f = dP.float().flatten()
+        mask_P = dP_f > delta_P
+        trigger_P = float(mask_P.float().mean())
+        excess_P = float((dP_f[mask_P] - delta_P).mean()) if mask_P.any() else nan
+        mean_dP = float(dP_f.mean())
+        p95_dP, p99_dP = _sq(dP_f, 0.95), _sq(dP_f, 0.99)
+    else:
+        trigger_P = excess_P = mean_dP = p95_dP = p99_dP = nan
+    print(
+        f"[{prefix}][STAT]"
+        f" delta_E={delta_E:.6f} delta_P={delta_P:.6f}"
+        f" trigger_E={trigger_E:.6f} trigger_P={trigger_P:.6f}"
+        f" excess_E={excess_E:.6e} excess_P={excess_P:.6e}"
+        f" mean_dE={mean_dE:.6f} mean_dP={mean_dP:.6f}"
+        f" p95_dE={p95_dE:.6f} p99_dE={p99_dE:.6f}"
+        f" p95_dP={p95_dP:.6f} p99_dP={p99_dP:.6f}"
+    )
+
+    # ------------------------------------------------------------------ REVIN
+    inst_std = getattr(nm, "_last_inst_std", None)
+    if inst_std is not None:
+        s = inst_std.float().flatten()
+        std_min = float(s.min())
+        std_p1 = _sq(s, 0.01)
+        std_p50 = _sq(s, 0.50)
+        std_p99 = _sq(s, 0.99)
+        small_frac = float((s < 1e-3).float().mean())
+    else:
+        std_min = std_p1 = std_p50 = std_p99 = small_frac = nan
+    print(
+        f"[{prefix}][REVIN]"
+        f" inst_std_min={std_min:.6e} inst_std_p1={std_p1:.6e}"
+        f" inst_std_p50={std_p50:.6f} inst_std_p99={std_p99:.6f}"
+        f" inst_std_small_frac={small_frac:.6f}"
+    )
+
+    # ------------------------------------------------------------------ GATE
+    g = getattr(nm, "_last_gate", None)
+    gate_stats = nm.get_last_gate_stats() if nm is not None and hasattr(nm, "get_last_gate_stats") else {}
+    gate_mean = gate_stats.get("gate_mean", nan)
+    gate_maxF = gate_stats.get("gate_max_f", nan)
+    gate_sumF = gate_stats.get("gate_sum_f", nan)
+    gate_entF = gate_stats.get("gate_ent_f", nan)
+    if g is not None:
+        g_f = g.float().flatten()
+        gate_sat0 = float((g_f < 0.01).float().mean())
+        gate_sat1 = float((g_f > 0.99).float().mean())
+    else:
+        gate_sat0 = gate_sat1 = nan
+    if gate is not None and hasattr(gate, "threshold") and gate.threshold is not None:
+        thr = gate.threshold.float().flatten()
+        thr_mean = float(thr.mean())
+        thr_std = float(thr.std()) if thr.numel() > 1 else 0.0
+        thr_min = float(thr.min())
+        thr_max = float(thr.max())
+    else:
+        thr_mean = thr_std = thr_min = thr_max = nan
+    logits = getattr(gate, "_last_logits", None) if gate is not None else None
+    if logits is not None:
+        lf = logits.float().flatten()
+        lgts_mean = float(lf.mean())
+        lgts_std = float(lf.std())
+        lgts_p1 = _sq(lf, 0.01)
+        lgts_p99 = _sq(lf, 0.99)
+    else:
+        lgts_mean = lgts_std = lgts_p1 = lgts_p99 = nan
+    print(
+        f"[{prefix}][GATE]"
+        f" gate_mean={gate_mean:.6f} gate_maxF={gate_maxF:.6f}"
+        f" gate_sumF={gate_sumF:.6f} gate_entF={gate_entF:.6f}"
+        f" gate_sat0={gate_sat0:.6f} gate_sat1={gate_sat1:.6f}"
+        f" thr_mean={thr_mean:.6f} thr_std={thr_std:.6f}"
+        f" thr_min={thr_min:.6f} thr_max={thr_max:.6f}"
+        f" lgts_mean={lgts_mean:.6f} lgts_std={lgts_std:.6f}"
+        f" lgts_p1={lgts_p1:.6f} lgts_p99={lgts_p99:.6f}"
+    )
+
+    # ------------------------------------------------------------------ GFLK (gate flicker)
+    if g is not None:
+        flicker_t = float(g[..., 1:].sub(g[..., :-1]).abs().mean()) if g.shape[-1] > 1 else nan
+        rough_f = float(g[:, :, 1:, :].sub(g[:, :, :-1, :]).abs().mean()) if g.shape[2] > 1 else nan
+    else:
+        flicker_t = rough_f = nan
+    print(
+        f"[{prefix}][GFLK]"
+        f" flicker_t={flicker_t:.6f} rough_f={rough_f:.6f}"
+    )
+
+    # ------------------------------------------------------------------ PRED (branch usage)
+    pnt_enabled = bool(getattr(cfg, "predict_n_time", False))
+    pred_n_time_cache = getattr(nm, "_last_pred_n_time", None)
+    pred_n_time_exists = pred_n_time_cache is not None
+    denorm_pred = int(getattr(nm, "_denorm_used_pred", 0))
+    denorm_input = int(getattr(nm, "_denorm_used_input", 0))
+    denorm_extrap = int(getattr(nm, "_denorm_used_extrap", 0))
+    print(
+        f"[{prefix}][PRED]"
+        f" predict_n_time={int(pnt_enabled)}"
+        f" pred_n_time_exists={int(pred_n_time_exists)}"
+        f" denorm_pred={denorm_pred}"
+        f" denorm_input={denorm_input}"
+        f" denorm_extrap={denorm_extrap}"
+    )
+
+    # ------------------------------------------------------------------ PACC (predictor accuracy)
+    if pnt_enabled and pred_n_time_exists and batch_x is not None and batch_y is not None and nm is not None:
+        try:
+            x_full = torch.cat([batch_x.float(), batch_y.float()], dim=1)
+            oracle_n_full = nm.extract_n_time_only(x_full.to(next(nm.parameters()).device))
+            pred_len = cfg.pred_len
+            oracle_n_future = oracle_n_full[:, -pred_len:, :]
+            p_pred = pred_n_time_cache.float()
+            o_gt = oracle_n_future.float()
+            if p_pred.shape == o_gt.shape:
+                mse_n = float(((p_pred - o_gt) ** 2).mean())
+                rel_err_n = float((p_pred - o_gt).norm() / (o_gt.norm().clamp(min=eps)))
+                corr_n = _pearson(p_pred, o_gt)
+            else:
+                mse_n = rel_err_n = corr_n = nan
+        except Exception:
+            mse_n = rel_err_n = corr_n = nan
+        print(
+            f"[{prefix}][PACC]"
+            f" mse_n={mse_n:.6e} rel_err_n={rel_err_n:.6f} corr_n={corr_n:.6f}"
+        )
+
+    # ------------------------------------------------------------------ GRAD
+    gi = grad_info or {}
+    print(
+        f"[{prefix}][GRAD]"
+        f" gate_grad_norm={gi.get('gate_grad_norm', nan):.6e}"
+        f" gate_param_norm={gi.get('gate_param_norm', nan):.6f}"
+        f" pred_grad_norm={gi.get('pred_grad_norm', nan):.6e}"
+        f" pred_param_norm={gi.get('pred_param_norm', nan):.6f}"
+        f" update_ratio_predictor={gi.get('update_ratio_predictor', nan):.6e}"
+    )
 
 
 def _aux_scale(cfg: TrainConfig, epoch_idx: int) -> float:
@@ -600,6 +870,21 @@ def _build_optimizer(model: nn.Module, cfg: TrainConfig) -> Adam:
     return Adam(groups, lr=base_lr)
 
 
+def _get_nm_params(model: nn.Module) -> tuple[list, list]:
+    """Return (gate_params, pred_params) from model.nm."""
+    nm = getattr(model, "nm", None)
+    gate_params: list = []
+    pred_params: list = []
+    if nm is not None:
+        gate_mod = getattr(nm, "gate", None)
+        if gate_mod is not None:
+            gate_params = [p for p in gate_mod.parameters() if p.requires_grad]
+        pred_mod = getattr(nm, "n_tf_predictor", None)
+        if pred_mod is not None:
+            pred_params = [p for p in pred_mod.parameters() if p.requires_grad]
+    return gate_params, pred_params
+
+
 def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
     model.train()
     loss_fn = nn.MSELoss()
@@ -616,6 +901,17 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
     )
     aux_scale = _aux_scale(cfg, epoch_idx)
     print(f"aux_loss_scale: {aux_scale:.6f}")
+
+    # Reset denorm branch counters at epoch start
+    nm = getattr(model, "nm", None)
+    if nm is not None:
+        nm._denorm_used_pred = 0
+        nm._denorm_used_input = 0
+        nm._denorm_used_extrap = 0
+
+    gate_params, pred_params = _get_nm_params(model)
+    first_batch_done = False
+
     with tqdm(total=len(loader.dataset), leave=True) as pbar:
         for batch_x, batch_y, origin_y, batch_x_enc, batch_y_enc in loader:
             batch_x = batch_x.to(cfg.device).float()
@@ -646,9 +942,45 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
                 aux_loss = model.nm.loss(true)
             loss = task_loss + aux_loss * aux_scale
 
+            # --- First-batch gradient / update-ratio collection ---
+            if not first_batch_done:
+                # Snapshot param values before optimizer.step (for update ratio)
+                pred_snap = [p.data.clone() for p in pred_params]
+
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+
+            if not first_batch_done:
+                gate_grad_norm = _grad_norm_or_nan(gate_params)
+                gate_param_norm = _norm_or_nan(gate_params)
+                pred_grad_norm = _grad_norm_or_nan(pred_params)
+                pred_param_norm = _norm_or_nan(pred_params)
+
             optimizer.step()
+
+            if not first_batch_done:
+                if pred_params and pred_snap:
+                    num = float(sum((p.data - s).norm() ** 2 for p, s in zip(pred_params, pred_snap)) ** 0.5)
+                    den = float(sum(s.norm() ** 2 for s in pred_snap) ** 0.5) + 1e-12
+                    update_ratio_pred = num / den
+                else:
+                    update_ratio_pred = float("nan")
+                grad_info = {
+                    "gate_grad_norm": gate_grad_norm,
+                    "gate_param_norm": gate_param_norm,
+                    "pred_grad_norm": pred_grad_norm,
+                    "pred_param_norm": pred_param_norm,
+                    "update_ratio_predictor": update_ratio_pred,
+                }
+                collect_and_print_debug(
+                    "TRAIN_DBG", model, cfg,
+                    batch_x=batch_x.detach().cpu(),
+                    batch_y=batch_y.detach().cpu(),
+                    y_pred=pred.detach().cpu(),
+                    y_true=true.detach().cpu(),
+                    grad_info=grad_info,
+                )
+                first_batch_done = True
 
             losses.append(loss.item())
             task_losses.append(task_loss.item())
@@ -689,7 +1021,7 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
 
 
 @torch.no_grad()
-def evaluate(model, loader, cfg, scaler):
+def evaluate(model, loader, cfg, scaler, debug_prefix: str | None = None):
     model.eval()
     metrics = _build_metrics(torch.device(cfg.device))
     for metric in metrics.values():
@@ -703,6 +1035,7 @@ def evaluate(model, loader, cfg, scaler):
     stat_losses: list[float] = []
     l_e_vals: list[float] = []
     l_p_vals: list[float] = []
+    first_batch_done = False
     for batch_x, batch_y, origin_y, batch_x_enc, batch_y_enc in loader:
         batch_x = batch_x.to(cfg.device).float()
         batch_y = batch_y.to(cfg.device).float()
@@ -724,6 +1057,18 @@ def evaluate(model, loader, cfg, scaler):
             stat_losses.append(s["stationarity_loss"])
             l_e_vals.append(s["L_E"])
             l_p_vals.append(s["L_P"])
+
+        # First-batch debug print for val/test
+        if debug_prefix is not None and not first_batch_done:
+            collect_and_print_debug(
+                debug_prefix, model, cfg,
+                batch_x=batch_x.detach().cpu(),
+                batch_y=batch_y.detach().cpu(),
+                y_pred=pred.detach().cpu(),
+                y_true=batch_y.detach().cpu(),
+            )
+            first_batch_done = True
+
         true = batch_y
         if cfg.invtrans_loss:
             pred = scaler.inverse_transform(pred)
@@ -842,7 +1187,7 @@ def main(argv: list[str] | None = None):
             train_loss = result
             gate_info = ""
             train_stat = {}
-        val_metrics = evaluate(model, dataloader.val_loader, cfg, scaler)
+        val_metrics = evaluate(model, dataloader.val_loader, cfg, scaler, debug_prefix="VAL_DBG")
         test_metrics = evaluate(model, dataloader.test_loader, cfg, scaler)
 
         # Build stationarity info strings

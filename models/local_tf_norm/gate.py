@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 
@@ -56,9 +58,14 @@ class LocalTFGate(nn.Module):
         else:
             self.register_parameter("threshold", None)
 
+        # Diagnostic caches (detached, no grad)
+        self._last_logits: Optional[torch.Tensor] = None
+
     def forward(self, magnitude: torch.Tensor) -> torch.Tensor:
         # magnitude: (B, C, F, TT)
         logits = self.proj(magnitude)
+        # Cache raw logits (before threshold/temperature) for diagnostics
+        self._last_logits = logits.detach()
         # Threshold handling: shift (subtract) or mask (suppress low logits)
         if self.use_threshold and self.threshold is not None:
             if self.gate_threshold_mode == "shift":
