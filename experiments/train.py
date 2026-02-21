@@ -519,6 +519,10 @@ def calibrate_thresholds(
     eps = 1e-8
     eps_E = float(getattr(nm, "eps_E", 1e-6))
 
+    # Temporarily disable trigger_mask so forward passes succeed before thresholds are known
+    _orig_trigger_mask = getattr(nm, "trigger_mask", False)
+    nm.trigger_mask = False
+
     all_dE: list[torch.Tensor] = []
     all_dP: list[torch.Tensor] = []
     all_dE_mask: list[torch.Tensor] = []
@@ -568,6 +572,9 @@ def calibrate_thresholds(
             dP_x = torch.abs(p_x[..., :, 1:] - p_x[..., :, :-1]).mean(dim=2)  # (B, C, T-1)
             all_dE_mask.append(dE_x.cpu().flatten())
             all_dP_mask.append(dP_x.cpu().flatten())
+
+    # Restore original trigger_mask setting
+    nm.trigger_mask = _orig_trigger_mask
 
     if not all_dE:
         return 0.0, 0.0, 0.0, 0.0
