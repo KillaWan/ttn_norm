@@ -126,6 +126,8 @@ class LocalTFNorm(nn.Module):
         lambda_E: float = 1.0,
         lambda_P: float = 1.0,
         eps_E: float = 1e-6,
+        delta_E: float = 0.0,
+        delta_P: float = 0.0,
         **kwargs,
     ):
         super().__init__()
@@ -153,6 +155,8 @@ class LocalTFNorm(nn.Module):
         self.lambda_E = float(lambda_E)
         self.lambda_P = float(lambda_P)
         self.eps_E = float(eps_E)
+        self.delta_E = float(delta_E)
+        self.delta_P = float(delta_P)
 
         if n_fft is None:
             n_fft = min(64, max(16, seq_len // 4))
@@ -363,12 +367,14 @@ class LocalTFNorm(nn.Module):
 
         L_stat = lambda_E * L_E + lambda_P * L_P
 
-          P    = |r_tf|^2              (B, C, F, T)  power spectrum of TF residual
-          E    = mean_F(P)             (B, C, T)     per-frame energy
-          logE = log(E + eps_E)        (B, C, T)     log-energy
-          p    = P / (sum_F(P) + eps)  (B, C, F, T)  normalised spectral shape
-          L_E = mean |logE[..., 1:] - logE[..., :-1]|     log-energy total variation
-          L_P = mean |p[..., :, 1:] - p[..., :, :-1]|    shape total variation
+          P    = |r_tf|^2                      (B, C, F, T)  power spectrum of TF residual
+          E    = mean_F(P)                     (B, C, T)     per-frame energy
+          logE = log(E + eps_E)                (B, C, T)     log-energy
+          p    = P / (sum_F(P) + eps)          (B, C, F, T)  normalised spectral shape
+          dE   = |logE[...,1:] - logE[...,:-1]|              (B, C, T-1)  log-energy step
+          dP   = mean_F(|p[...,:,1:] - p[...,:,:-1]|)        (B, C, T-1)  shape step
+          L_E  = mean(relu(dE - delta_E))      margin-triggered log-energy TV
+          L_P  = mean(relu(dP - delta_P))      margin-triggered shape TV
         """
         device = self._device()
         zero = torch.tensor(0.0, device=device)
@@ -390,12 +396,14 @@ class LocalTFNorm(nn.Module):
         # Normalised spectral shape
         p = P / (P.sum(dim=2, keepdim=True) + eps)  # (B, C, F, T)
 
-        # Log-energy total variation along time (scale-invariant)
+        # Log-energy margin-triggered TV along time
         logE = torch.log(E + self.eps_E)
-        L_E = torch.mean(torch.abs(logE[..., 1:] - logE[..., :-1]))
+        dE = torch.abs(logE[..., 1:] - logE[..., :-1])          # (B, C, T-1)
+        L_E = torch.mean(torch.relu(dE - self.delta_E))
 
-        # Spectral-shape total variation along time
-        L_P = torch.mean(torch.abs(p[..., :, 1:] - p[..., :, :-1]))
+        # Spectral-shape margin-triggered TV along time (averaged over freq first)
+        dP = torch.abs(p[..., :, 1:] - p[..., :, :-1]).mean(dim=2)  # (B, C, T-1)
+        L_P = torch.mean(torch.relu(dP - self.delta_P))
 
         L_stat = self.lambda_E * L_E + self.lambda_P * L_P
 

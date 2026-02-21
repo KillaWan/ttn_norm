@@ -342,9 +342,9 @@ class TrainConfig:
     early_stop_metric: str = "val_mse"
     val_mse_ema_alpha: float = 1.0
     early_stop_delta: float = 0.0
-    aux_loss_schedule: str = "none"
-    aux_loss_scale: float = 1.0
-    aux_loss_min_scale: float = 0.2
+    aux_loss_schedule: str = "cosine"
+    aux_loss_scale: float = 0.2
+    aux_loss_min_scale: float = 0.05
     aux_loss_decay_start_epoch: int = 4
     aux_loss_decay_epochs: int = 16
 
@@ -398,12 +398,34 @@ class TrainConfig:
     lambda_E: float = 1.0
     lambda_P: float = 1.0
     eps_E: float = 1e-6
+    delta_E: float = 0.0
+    delta_P: float = 0.0
+    auto_thresholds: bool = True
+    trigger_q: float = 0.99
+    target_frames: int = 24
+    auto_stft: bool = True
+
+
+def _next_power_of_two(n: int) -> int:
+    p = 1
+    while p < n:
+        p <<= 1
+    return p
 
 
 def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
     if cfg.norm_type.lower() in {"none", "baseline", "no"}:
         norm_model: nn.Module | None = nn.Identity()
     else:
+        # Auto-compute STFT params from target_frames when requested
+        if cfg.auto_stft and cfg.hop_length is None and cfg.win_length is None and cfg.n_fft is None:
+            hop = max(1, cfg.window // cfg.target_frames)
+            win = 4 * hop
+            nfft = _next_power_of_two(win)
+            cfg.hop_length = hop
+            cfg.win_length = win
+            cfg.n_fft = nfft
+
         norm_model = LocalTFNorm(
             seq_len=cfg.window,
             pred_len=cfg.pred_len,
@@ -437,6 +459,8 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             lambda_E=cfg.lambda_E,
             lambda_P=cfg.lambda_P,
             eps_E=cfg.eps_E,
+            delta_E=cfg.delta_E,
+            delta_P=cfg.delta_P,
         )
     label_len = cfg.label_len or (cfg.window // 2)
     label_len = min(label_len, cfg.window)
@@ -450,6 +474,73 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
         norm_model=norm_model,
         is_former=True if cfg.force_former else None,
     )
+
+
+@torch.no_grad()
+def calibrate_thresholds(
+    model: nn.Module,
+    train_loader,
+    cfg: TrainConfig,
+    max_batches: int = 200,
+) -> tuple[float, float]:
+    """Estimate delta_E and delta_P from the training data distribution.
+
+    Runs up to *max_batches* forward passes, collects per-transition log-energy
+    differences (dE) and per-transition mean spectral-shape differences (dP),
+    then returns the trigger_q quantile of each as the margin thresholds.
+    """
+    nm = getattr(model, "nm", None)
+    if nm is None or not hasattr(nm, "_last_r_tf"):
+        return 0.0, 0.0
+
+    model.eval()
+    eps = 1e-8
+    eps_E = float(getattr(nm, "eps_E", 1e-6))
+
+    all_dE: list[torch.Tensor] = []
+    all_dP: list[torch.Tensor] = []
+
+    for i, (batch_x, batch_y, origin_y, batch_x_enc, batch_y_enc) in enumerate(train_loader):
+        if i >= max_batches:
+            break
+        batch_x = batch_x.to(cfg.device).float()
+        batch_x_enc = batch_x_enc.to(cfg.device).float()
+
+        dec_inp, dec_inp_enc = None, None
+        if model.is_former:
+            batch_y = batch_y.to(cfg.device).float()
+            batch_y_enc = batch_y_enc.to(cfg.device).float()
+            label_len = min(cfg.label_len or (cfg.window // 2), batch_x.size(1))
+            dec_inp, dec_inp_enc = _make_dec_inputs(
+                batch_x, batch_y_enc, batch_x_enc, label_len
+            )
+
+        model(batch_x, batch_x_enc, dec_inp, dec_inp_enc)
+
+        r_tf = nm._last_r_tf  # (B, C, F, T) complex
+        if r_tf is None:
+            continue
+
+        P = r_tf.abs() ** 2                              # (B, C, F, T)
+        E = P.mean(dim=2)                                # (B, C, T)
+        p = P / (P.sum(dim=2, keepdim=True) + eps)      # (B, C, F, T)
+
+        logE = torch.log(E + eps_E)
+        dE = torch.abs(logE[..., 1:] - logE[..., :-1])  # (B, C, T-1)
+        dP = torch.abs(p[..., :, 1:] - p[..., :, :-1]).mean(dim=2)  # (B, C, T-1)
+
+        all_dE.append(dE.cpu().flatten())
+        all_dP.append(dP.cpu().flatten())
+
+    if not all_dE:
+        return 0.0, 0.0
+
+    cat_dE = torch.cat(all_dE)
+    cat_dP = torch.cat(all_dP)
+    q = float(cfg.trigger_q)
+    delta_E = float(torch.quantile(cat_dE, q).item())
+    delta_P = float(torch.quantile(cat_dP, q).item())
+    return delta_E, delta_P
 
 
 def _aux_scale(cfg: TrainConfig, epoch_idx: int) -> float:
@@ -688,6 +779,24 @@ def main(argv: list[str] | None = None):
     )
 
     model = build_model(cfg, dataset.num_features).to(cfg.device)
+
+    # Auto-calibrate stationarity margin thresholds from training data
+    # Skipped when user explicitly supplied non-zero delta_E or delta_P
+    if cfg.auto_thresholds and cfg.delta_E == 0.0 and cfg.delta_P == 0.0:
+        nm = getattr(model, "nm", None)
+        if nm is not None and hasattr(nm, "delta_E"):
+            delta_E, delta_P = calibrate_thresholds(
+                model, dataloader.train_loader, cfg, max_batches=200
+            )
+            cfg.delta_E = delta_E
+            cfg.delta_P = delta_P
+            nm.delta_E = delta_E
+            nm.delta_P = delta_P
+            print(
+                f"[Calibration] trigger_q={cfg.trigger_q}"
+                f"  delta_E={delta_E:.6f}  delta_P={delta_P:.6f}"
+            )
+
     optimizer = _build_optimizer(model, cfg)
     scheduler = CosineAnnealingLR(optimizer, T_max=cfg.epochs)
 
