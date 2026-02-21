@@ -432,9 +432,27 @@ class LocalTFNorm(nn.Module):
                 _cnm_p = float((_s_frame_p * _mask_t_p.float()).sum().cpu().item())
                 _p_table[_p] = (_mr_p, _cnm_p / _cdn_p)
             self._last_mask_p_table = _p_table
-            self._last_mask_min_rate_cov95 = _p_table[0.95][0]
-            self._last_mask_min_rate_cov99 = _p_table[0.99][0]
-            self._last_mask_min_rate_cov995 = _p_table[0.995][0]
+
+            # ---- min_rate_cov*: minimum frame fraction to reach target coverage ----
+            # Flatten _s_frame to 1-D, sort descending, find smallest k such that
+            # cumsum[k] >= target * total; min_rate = (k+1) / N
+            _sf_flat = _s_frame.detach().float().flatten()
+            _sf_total = float(_sf_flat.sum().item())
+            if _sf_total > 0.0 and _sf_flat.numel() > 0:
+                _sf_sorted, _ = torch.sort(_sf_flat, descending=True)
+                _csum = torch.cumsum(_sf_sorted, dim=0)
+                _N = float(_sf_flat.numel())
+                for _tgt, _attr in (
+                    (0.95, "_last_mask_min_rate_cov95"),
+                    (0.99, "_last_mask_min_rate_cov99"),
+                    (0.995, "_last_mask_min_rate_cov995"),
+                ):
+                    _k = int(torch.searchsorted(_csum, _tgt * _sf_total).item())
+                    setattr(self, _attr, (_k + 1) / _N)
+            else:
+                self._last_mask_min_rate_cov95 = float("nan")
+                self._last_mask_min_rate_cov99 = float("nan")
+                self._last_mask_min_rate_cov995 = float("nan")
         else:
             g_eff = g_local
             self._last_trigger_mask_t = None
