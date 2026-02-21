@@ -382,7 +382,7 @@ class TrainConfig:
     predict_n_time: bool = False
     pred_hidden_dim: int = 64
     pred_dropout: float = 0.1
-    pred_loss_weight: float = 1.0
+    pred_loss_weight: float = 0.0
     gate_threshold: float = 0.0
     gate_temperature: float = 1.0
     gate_smooth_weight: float = 0.0
@@ -895,6 +895,42 @@ def collect_and_print_debug(
         f" update_ratio_predictor={gi.get('update_ratio_predictor', nan):.6e}"
     )
 
+    # ------------------------------------------------------------------ MASKCOV
+    if nm is not None and hasattr(nm, "get_last_mask_coverage_stats"):
+        cov_stats = nm.get_last_mask_coverage_stats()
+        _cov = cov_stats.get("cov", nan)
+        _mr95 = cov_stats.get("min_rate_cov95", nan)
+        _mr99 = cov_stats.get("min_rate_cov99", nan)
+        _mr995 = cov_stats.get("min_rate_cov995", nan)
+    else:
+        _cov = _mr95 = _mr99 = _mr995 = nan
+    print(
+        f"[{prefix}][MASKCOV]"
+        f" cov={_cov:.6f}"
+        f" min_rate@95={_mr95:.6f}"
+        f" min_rate@99={_mr99:.6f}"
+        f" min_rate@995={_mr995:.6f}"
+    )
+
+    # ------------------------------------------------------------------ MASKP
+    if nm is not None and hasattr(nm, "get_last_mask_coverage_stats"):
+        _p_table = nm.get_last_mask_coverage_stats().get("p_table", {})
+        _p950 = _p_table.get(0.95, (nan, nan))
+        _p990 = _p_table.get(0.99, (nan, nan))
+        _p995 = _p_table.get(0.995, (nan, nan))
+        print(
+            f"[{prefix}][MASKP]"
+            f" p=0.950:mr={_p950[0]:.6f},cov={_p950[1]:.6f}"
+            f" | p=0.990:mr={_p990[0]:.6f},cov={_p990[1]:.6f}"
+            f" | p=0.995:mr={_p995[0]:.6f},cov={_p995[1]:.6f}"
+        )
+    else:
+        print(f"[{prefix}][MASKP] p=0.950:mr={nan:.6f},cov={nan:.6f} | p=0.990:mr={nan:.6f},cov={nan:.6f} | p=0.995:mr={nan:.6f},cov={nan:.6f}")
+
+    # ------------------------------------------------------------------ PSUP
+    _pred_sup_mse = float(getattr(nm, "_last_pred_sup_loss", nan)) if nm is not None else nan
+    print(f"[{prefix}][PSUP] pred_sup_mse={_pred_sup_mse:.6e}")
+
 
 def _aux_scale(cfg: TrainConfig, epoch_idx: int) -> float:
     if cfg.aux_loss_schedule == "none":
@@ -977,10 +1013,19 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
     stat_losses: list[float] = []
     l_e_vals: list[float] = []
     l_p_vals: list[float] = []
+    pred_sup_mse_vals: list[float] = []
     has_nm_stat = (
         hasattr(model, "nm")
         and model.nm is not None
         and hasattr(model.nm, "get_last_stationarity_stats")
+    )
+    # Determine if pred supervision loss should be computed each batch
+    _nm_for_pred = getattr(model, "nm", None)
+    _use_pred_sup = (
+        bool(getattr(cfg, "predict_n_time", False))
+        and float(getattr(cfg, "pred_loss_weight", 0.0)) > 0.0
+        and _nm_for_pred is not None
+        and hasattr(_nm_for_pred, "pred_supervision_loss")
     )
     aux_scale = _aux_scale(cfg, epoch_idx)
     print(f"aux_loss_scale: {aux_scale:.6f}")
@@ -1023,7 +1068,14 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
                 aux_loss = model.nm.loss_with_target(true)
             elif hasattr(model.nm, "loss"):
                 aux_loss = model.nm.loss(true)
-            loss = task_loss + aux_loss * aux_scale
+
+            # Prediction supervision loss (teacher extraction oracle)
+            pred_sup_loss = torch.tensor(0.0, device=task_loss.device)
+            if _use_pred_sup:
+                pred_sup_loss = _nm_for_pred.pred_supervision_loss(batch_y)
+                pred_sup_mse_vals.append(float(_nm_for_pred._last_pred_sup_loss))
+
+            loss = task_loss + aux_loss * aux_scale + cfg.pred_loss_weight * pred_sup_loss
 
             # --- First-batch gradient / update-ratio collection ---
             if not first_batch_done:
@@ -1099,6 +1151,8 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
             "task_loss": float(np.mean(task_losses)),
             "aux_loss": float(np.mean(aux_losses)),
         }
+    if pred_sup_mse_vals:
+        train_stat["pred_sup_mse"] = float(np.mean(pred_sup_mse_vals))
 
     return float(np.mean(losses)) if losses else 0.0, gate_stats_str, train_stat
 
@@ -1118,6 +1172,14 @@ def evaluate(model, loader, cfg, scaler, debug_prefix: str | None = None):
     stat_losses: list[float] = []
     l_e_vals: list[float] = []
     l_p_vals: list[float] = []
+    pred_sup_mse_vals: list[float] = []
+    _nm_eval = getattr(model, "nm", None)
+    _use_pred_sup_eval = (
+        bool(getattr(cfg, "predict_n_time", False))
+        and float(getattr(cfg, "pred_loss_weight", 0.0)) > 0.0
+        and _nm_eval is not None
+        and hasattr(_nm_eval, "pred_supervision_loss")
+    )
     first_batch_done = False
     for batch_x, batch_y, origin_y, batch_x_enc, batch_y_enc in loader:
         batch_x = batch_x.to(cfg.device).float()
@@ -1140,6 +1202,11 @@ def evaluate(model, loader, cfg, scaler, debug_prefix: str | None = None):
             stat_losses.append(s["stationarity_loss"])
             l_e_vals.append(s["L_E"])
             l_p_vals.append(s["L_P"])
+
+        # Prediction supervision tracking (no grad; updates _last_pred_sup_loss cache)
+        if _use_pred_sup_eval:
+            _nm_eval.pred_supervision_loss(batch_y)
+            pred_sup_mse_vals.append(float(_nm_eval._last_pred_sup_loss))
 
         # First-batch debug print for val/test
         if debug_prefix is not None and not first_batch_done:
@@ -1171,6 +1238,8 @@ def evaluate(model, loader, cfg, scaler, debug_prefix: str | None = None):
         results["stationarity_loss"] = float(np.mean(stat_losses))
         results["L_E"] = float(np.mean(l_e_vals))
         results["L_P"] = float(np.mean(l_p_vals))
+    if pred_sup_mse_vals:
+        results["pred_sup_mse"] = float(np.mean(pred_sup_mse_vals))
     return results
 
 
@@ -1287,12 +1356,16 @@ def main(argv: list[str] | None = None):
                 f", stat_loss={train_stat['stationarity_loss']:.6f}"
                 f" (L_E={train_stat['L_E']:.6f}, L_P={train_stat['L_P']:.6f})"
             )
+            if "pred_sup_mse" in train_stat:
+                train_stat_str += f", pred_sup_mse={train_stat['pred_sup_mse']:.6e}"
         val_stat_str = ""
         if "stationarity_loss" in val_metrics:
             val_stat_str = (
                 f" | stat_loss={val_metrics['stationarity_loss']:.6f}"
                 f" (L_E={val_metrics['L_E']:.6f}, L_P={val_metrics['L_P']:.6f})"
             )
+        if "pred_sup_mse" in val_metrics:
+            val_stat_str += f", pred_sup_mse={val_metrics['pred_sup_mse']:.6e}"
 
         print(f"Epoch: {epoch + 1} Training loss: {train_loss:.6f}{gate_info}{train_stat_str}")
         print(

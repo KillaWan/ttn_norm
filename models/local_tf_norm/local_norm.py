@@ -241,6 +241,19 @@ class LocalTFNorm(nn.Module):
         self._last_mask_delta_P: float = float("nan")
         self._last_trigger_mask_t: Optional[torch.Tensor] = None
 
+        # Trigger mask coverage diagnostics
+        self._last_mask_cov: float = float("nan")
+        self._last_mask_min_rate_cov95: float = float("nan")
+        self._last_mask_min_rate_cov99: float = float("nan")
+        self._last_mask_min_rate_cov995: float = float("nan")
+        self._last_mask_p_table: dict = {}  # key: p (float), value: (mask_rate, coverage)
+
+        # Pre-RevIN raw input cache (needed for teacher extraction)
+        self._last_x_raw: Optional[torch.Tensor] = None
+
+        # Prediction supervision loss cache
+        self._last_pred_sup_loss: float = 0.0
+
     def _dE_dP_from_tf(
         self, tf_complex: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -337,6 +350,9 @@ class LocalTFNorm(nn.Module):
     def normalize(
         self, batch_x: torch.Tensor, return_state: bool = False
     ) -> torch.Tensor | tuple[torch.Tensor, LocalTFNormState]:
+        # Cache raw (pre-RevIN) input for teacher extraction in pred_supervision_loss
+        self._last_x_raw = batch_x.detach()
+
         # RevIN-style instance normalization: remove per-sample mean and std
         inst_mean = inst_std = None
         if self.use_instance_norm:
@@ -375,6 +391,50 @@ class LocalTFNorm(nn.Module):
             self._last_mask_trig_rate = float(trig.float().mean().cpu().item())
             self._last_mask_delta_E = float(de)
             self._last_mask_delta_P = float(dp)
+
+            # ---- Coverage diagnostics ----
+            # Transition strength: s_trans[i] = max(dE[i]/de, dP[i]/dp) shape (B,C,T-1)
+            _s_trans = torch.maximum(dE_x / de, dP_x / dp)
+            # Map to frame strength via left-right coverage rule: same as mask_t
+            _s_frame = torch.zeros(
+                x_tf.shape[0], x_tf.shape[1], T,
+                device=x_tf.device, dtype=_s_trans.dtype,
+            )
+            _s_frame[..., :-1] = torch.maximum(_s_frame[..., :-1], _s_trans)
+            _s_frame[..., 1:] = torch.maximum(_s_frame[..., 1:], _s_trans)
+            _cov_den = float(_s_frame.sum().cpu().item()) + 1e-12
+            _cov_num = float((_s_frame * mask_t.float()).sum().cpu().item())
+            self._last_mask_cov = _cov_num / _cov_den
+
+            # p-table: for p in {0.95, 0.99, 0.995}, compute alt thresholds + coverage
+            _p_table: dict = {}
+            _dE_flat = dE_x.detach().float().flatten()
+            _dP_flat = dP_x.detach().float().flatten()
+            for _p in (0.95, 0.99, 0.995):
+                _de_p = float(torch.quantile(_dE_flat, _p).item())
+                _dp_p = float(torch.quantile(_dP_flat, _p).item())
+                _trig_p = (dE_x > _de_p) | (dP_x > _dp_p)
+                _mask_t_p = torch.zeros(
+                    x_tf.shape[0], x_tf.shape[1], T,
+                    dtype=torch.bool, device=x_tf.device,
+                )
+                _mask_t_p[..., :-1] |= _trig_p
+                _mask_t_p[..., 1:] |= _trig_p
+                _mr_p = float(_mask_t_p.float().mean().cpu().item())
+                # coverage at this p threshold
+                _de_p_safe = _de_p if _de_p > 1e-15 else 1e-15
+                _dp_p_safe = _dp_p if _dp_p > 1e-15 else 1e-15
+                _s_trans_p = torch.maximum(dE_x / _de_p_safe, dP_x / _dp_p_safe)
+                _s_frame_p = torch.zeros_like(_s_frame)
+                _s_frame_p[..., :-1] = torch.maximum(_s_frame_p[..., :-1], _s_trans_p)
+                _s_frame_p[..., 1:] = torch.maximum(_s_frame_p[..., 1:], _s_trans_p)
+                _cdn_p = float(_s_frame_p.sum().cpu().item()) + 1e-12
+                _cnm_p = float((_s_frame_p * _mask_t_p.float()).sum().cpu().item())
+                _p_table[_p] = (_mr_p, _cnm_p / _cdn_p)
+            self._last_mask_p_table = _p_table
+            self._last_mask_min_rate_cov95 = _p_table[0.95][0]
+            self._last_mask_min_rate_cov99 = _p_table[0.99][0]
+            self._last_mask_min_rate_cov995 = _p_table[0.995][0]
         else:
             g_eff = g_local
             self._last_trigger_mask_t = None
@@ -382,6 +442,11 @@ class LocalTFNorm(nn.Module):
             self._last_mask_trig_rate = 0.0
             self._last_mask_delta_E = float("nan")
             self._last_mask_delta_P = float("nan")
+            self._last_mask_cov = float("nan")
+            self._last_mask_min_rate_cov95 = float("nan")
+            self._last_mask_min_rate_cov99 = float("nan")
+            self._last_mask_min_rate_cov995 = float("nan")
+            self._last_mask_p_table = {}
 
         # keep effective gate for debugging (reflects actual decomposition used)
         self._last_gate = g_eff
@@ -527,6 +592,68 @@ class LocalTFNorm(nn.Module):
         """Stationarity loss only — no predictor supervision."""
         return self.loss()
 
+    def pred_supervision_loss(self, true: torch.Tensor) -> torch.Tensor:
+        """Prediction supervision loss: MSE(pred_n_time, oracle_n_future).
+
+        The oracle is derived via teacher extraction: concatenate the cached
+        pre-RevIN input window with `true`, apply the same normalization and
+        gate+trigger_mask pipeline via _extract_n_time, and take the last
+        pred_len frames as the oracle target.
+
+        Args:
+            true: (B, pred_len, C) ground truth in the same scale as the
+                  original input batch_x (pre-RevIN).
+
+        Returns:
+            Scalar MSE tensor (for backprop); also caches the float value in
+            self._last_pred_sup_loss.
+        """
+        state = self._last_state
+        if state is None or state.pred_n_time is None:
+            self._last_pred_sup_loss = 0.0
+            return torch.tensor(0.0, device=self._device())
+
+        x_raw = self._last_x_raw  # (B, T, C) pre-RevIN
+        if x_raw is None:
+            self._last_pred_sup_loss = 0.0
+            return torch.tensor(0.0, device=self._device())
+
+        dev = self._device()
+        true_dev = true.to(dev)
+        x_full = torch.cat([x_raw, true_dev], dim=1)  # (B, T+pred_len, C)
+
+        # Save and restore gate._last_logits to avoid polluting debug state
+        gate = getattr(self, "gate", None)
+        saved_logits = gate._last_logits if gate is not None else None
+
+        with torch.no_grad():
+            _, oracle_n_full = self._extract_n_time(
+                x_full, mean=state.mean, std=state.std
+            )
+            oracle_n_future = oracle_n_full[:, -self.pred_len:, :]  # (B, pred_len, C)
+
+        if gate is not None and saved_logits is not None:
+            gate._last_logits = saved_logits
+
+        pred_n_time = state.pred_n_time  # (B, pred_len, C)
+        if pred_n_time.shape != oracle_n_future.shape:
+            self._last_pred_sup_loss = 0.0
+            return torch.tensor(0.0, device=dev)
+
+        loss = torch.nn.functional.mse_loss(pred_n_time, oracle_n_future)
+        self._last_pred_sup_loss = float(loss.detach().cpu().item())
+        return loss
+
+    def get_last_mask_coverage_stats(self) -> dict:
+        """Return last computed trigger-mask coverage statistics."""
+        return {
+            "cov": self._last_mask_cov,
+            "min_rate_cov95": self._last_mask_min_rate_cov95,
+            "min_rate_cov99": self._last_mask_min_rate_cov99,
+            "min_rate_cov995": self._last_mask_min_rate_cov995,
+            "p_table": self._last_mask_p_table,
+        }
+
     def _device(self) -> torch.device:
         return next(self.parameters()).device
 
@@ -536,11 +663,39 @@ class LocalTFNorm(nn.Module):
         mean: Optional[torch.Tensor] = None,
         std: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Extract n_tf and n_time with the same gate+trigger_mask logic as normalize().
+
+        In teacher path (called from pred_supervision_loss) no diagnostic caches
+        are updated; gate._last_logits is saved and restored by the caller.
+        """
         if mean is not None and std is not None:
             batch_x = (batch_x - mean) / std
         x_tf = self.stft(batch_x)
         g_local = self._make_gate(x_tf)
-        n_tf = g_local * x_tf
+
+        # Apply trigger mask if enabled (consistent with normalize(), no cache updates)
+        if self.trigger_mask:
+            with torch.no_grad():
+                dE_x, dP_x = self._dE_dP_from_tf(x_tf)
+            de = self.delta_E_mask if self.delta_E_mask > 0.0 else self.delta_E
+            dp = self.delta_P_mask if self.delta_P_mask > 0.0 else self.delta_P
+            if de > 0.0 and dp > 0.0:
+                trig = (dE_x > de) | (dP_x > dp)
+                T = x_tf.shape[-1]
+                mask_t = torch.zeros(
+                    x_tf.shape[0], x_tf.shape[1], T,
+                    dtype=torch.bool, device=x_tf.device,
+                )
+                mask_t[..., :-1] |= trig
+                mask_t[..., 1:] |= trig
+                mask_f = mask_t.unsqueeze(2).float()
+                g_eff = g_local * mask_f
+            else:
+                g_eff = g_local
+        else:
+            g_eff = g_local
+
+        n_tf = g_eff * x_tf
         n_time = self.stft.inverse(n_tf, length=batch_x.shape[1])
         return n_tf, n_time
 
