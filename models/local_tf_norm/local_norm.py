@@ -128,6 +128,9 @@ class LocalTFNorm(nn.Module):
         eps_E: float = 1e-6,
         delta_E: float = 0.0,
         delta_P: float = 0.0,
+        trigger_mask: bool = True,
+        delta_E_mask: float = 0.0,
+        delta_P_mask: float = 0.0,
         **kwargs,
     ):
         super().__init__()
@@ -157,6 +160,9 @@ class LocalTFNorm(nn.Module):
         self.eps_E = float(eps_E)
         self.delta_E = float(delta_E)
         self.delta_P = float(delta_P)
+        self.trigger_mask = bool(trigger_mask)
+        self.delta_E_mask = float(delta_E_mask)
+        self.delta_P_mask = float(delta_P_mask)
 
         if n_fft is None:
             n_fft = min(64, max(16, seq_len // 4))
@@ -227,6 +233,36 @@ class LocalTFNorm(nn.Module):
         self._denorm_used_pred: int = 0
         self._denorm_used_input: int = 0
         self._denorm_used_extrap: int = 0
+
+        # Trigger mask diagnostic caches (all detached)
+        self._last_mask_rate: float = 1.0
+        self._last_mask_trig_rate: float = 0.0
+        self._last_mask_delta_E: float = float("nan")
+        self._last_mask_delta_P: float = float("nan")
+        self._last_trigger_mask_t: Optional[torch.Tensor] = None
+
+    def _dE_dP_from_tf(
+        self, tf_complex: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute per-transition log-energy and spectral-shape differences.
+
+        Uses the same formula as loss() but accepts any TF tensor as input.
+
+        Args:
+            tf_complex: (B, C, F, T) complex tensor
+
+        Returns:
+            dE: (B, C, T-1) log-energy differences
+            dP: (B, C, T-1) spectral-shape differences
+        """
+        eps = 1e-8
+        P = tf_complex.abs() ** 2                               # (B, C, F, T)
+        E = P.mean(dim=2)                                       # (B, C, T)
+        p = P / (P.sum(dim=2, keepdim=True) + eps)              # (B, C, F, T)
+        logE = torch.log(E + self.eps_E)
+        dE = torch.abs(logE[..., 1:] - logE[..., :-1])          # (B, C, T-1)
+        dP = torch.abs(p[..., :, 1:] - p[..., :, :-1]).mean(dim=2)  # (B, C, T-1)
+        return dE, dP
 
     def _make_gate(self, x_tf: torch.Tensor) -> torch.Tensor:
         magnitude = x_tf.abs()
@@ -310,17 +346,54 @@ class LocalTFNorm(nn.Module):
 
         x_tf = self.stft(batch_x)
         g_local = self._make_gate(x_tf)
-        # keep last gate for optional regularizers / debugging
-        self._last_gate = g_local
-        n_tf = g_local * x_tf
+
+        # Trigger mask: restrict effective gate to boundary frames only
+        if self.trigger_mask:
+            with torch.no_grad():
+                dE_x, dP_x = self._dE_dP_from_tf(x_tf)
+            de = self.delta_E_mask if self.delta_E_mask > 0.0 else self.delta_E
+            dp = self.delta_P_mask if self.delta_P_mask > 0.0 else self.delta_P
+            if de <= 0.0 or dp <= 0.0:
+                raise RuntimeError(
+                    "trigger_mask enabled but delta_E_mask/delta_P_mask not set; "
+                    "run calibration or set manually"
+                )
+            # trig: (B, C, T-1) — True wherever a transition exceeds threshold
+            trig = (dE_x > de) | (dP_x > dp)
+            T = x_tf.shape[-1]
+            mask_t = torch.zeros(
+                x_tf.shape[0], x_tf.shape[1], T,
+                dtype=torch.bool, device=x_tf.device,
+            )
+            mask_t[..., :-1] |= trig   # left frame of each triggered transition
+            mask_t[..., 1:] |= trig    # right frame of each triggered transition
+            mask_f = mask_t.unsqueeze(2).float()  # (B, C, 1, T) broadcast over freq
+            g_eff = g_local * mask_f              # (B, C, F, T)
+            # Update trigger mask diagnostics (all detached)
+            self._last_trigger_mask_t = mask_t.detach()
+            self._last_mask_rate = float(mask_t.float().mean().cpu().item())
+            self._last_mask_trig_rate = float(trig.float().mean().cpu().item())
+            self._last_mask_delta_E = float(de)
+            self._last_mask_delta_P = float(dp)
+        else:
+            g_eff = g_local
+            self._last_trigger_mask_t = None
+            self._last_mask_rate = 1.0
+            self._last_mask_trig_rate = 0.0
+            self._last_mask_delta_E = float("nan")
+            self._last_mask_delta_P = float("nan")
+
+        # keep effective gate for debugging (reflects actual decomposition used)
+        self._last_gate = g_eff
+        n_tf = g_eff * x_tf
         r_tf = x_tf - n_tf
         self._last_r_tf = r_tf
         length = batch_x.shape[1]
         residual = self.stft.inverse(r_tf, length=length)
         n_time = self.stft.inverse(n_tf, length=length)
 
-        # Compute gate statistics
-        self._compute_gate_stats(g_local)
+        # Compute gate statistics on effective gate
+        self._compute_gate_stats(g_eff)
 
         pred_n_time = None
         pred_n_tf = None

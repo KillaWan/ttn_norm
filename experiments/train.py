@@ -404,6 +404,9 @@ class TrainConfig:
     trigger_q: float = 0.99
     target_frames: int = 24
     auto_stft: bool = True
+    trigger_mask: bool = True
+    delta_E_mask: float = 0.0
+    delta_P_mask: float = 0.0
 
 
 def _next_power_of_two(n: int) -> int:
@@ -461,6 +464,9 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             eps_E=cfg.eps_E,
             delta_E=cfg.delta_E,
             delta_P=cfg.delta_P,
+            trigger_mask=cfg.trigger_mask,
+            delta_E_mask=cfg.delta_E_mask,
+            delta_P_mask=cfg.delta_P_mask,
         )
     label_len = cfg.label_len or (cfg.window // 2)
     label_len = min(label_len, cfg.window)
@@ -496,16 +502,18 @@ def calibrate_thresholds(
     train_loader,
     cfg: TrainConfig,
     max_batches: int = 200,
-) -> tuple[float, float]:
-    """Estimate delta_E and delta_P from the training data distribution.
+) -> tuple[float, float, float, float]:
+    """Estimate delta_E, delta_P, delta_E_mask, and delta_P_mask from training data.
 
     Runs up to *max_batches* forward passes, collects per-transition log-energy
-    differences (dE) and per-transition mean spectral-shape differences (dP),
-    then returns the trigger_q quantile of each as the margin thresholds.
+    differences (dE) and per-transition mean spectral-shape differences (dP)
+    from both the residual r_tf (for stationarity loss thresholds) and the raw
+    input x_tf (for trigger mask thresholds), then returns the trigger_q quantile
+    of each as the margin thresholds.
     """
     nm = getattr(model, "nm", None)
     if nm is None or not hasattr(nm, "_last_r_tf"):
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
 
     model.eval()
     eps = 1e-8
@@ -513,6 +521,8 @@ def calibrate_thresholds(
 
     all_dE: list[torch.Tensor] = []
     all_dP: list[torch.Tensor] = []
+    all_dE_mask: list[torch.Tensor] = []
+    all_dP_mask: list[torch.Tensor] = []
 
     for i, (batch_x, batch_y, origin_y, batch_x_enc, batch_y_enc) in enumerate(train_loader):
         if i >= max_batches:
@@ -531,6 +541,7 @@ def calibrate_thresholds(
 
         model(batch_x, batch_x_enc, dec_inp, dec_inp_enc)
 
+        # --- dE/dP from residual r_tf (for stationarity loss thresholds) ---
         r_tf = nm._last_r_tf  # (B, C, F, T) complex
         if r_tf is None:
             continue
@@ -546,8 +557,20 @@ def calibrate_thresholds(
         all_dE.append(dE.cpu().flatten())
         all_dP.append(dP.cpu().flatten())
 
+        # --- dE/dP from raw input x_tf (for trigger mask thresholds) ---
+        x_tf = nm._last_x_tf  # (B, C, F, T) complex
+        if x_tf is not None:
+            P_x = x_tf.abs() ** 2                               # (B, C, F, T)
+            E_x = P_x.mean(dim=2)                               # (B, C, T)
+            p_x = P_x / (P_x.sum(dim=2, keepdim=True) + eps)   # (B, C, F, T)
+            logE_x = torch.log(E_x + eps_E)
+            dE_x = torch.abs(logE_x[..., 1:] - logE_x[..., :-1])          # (B, C, T-1)
+            dP_x = torch.abs(p_x[..., :, 1:] - p_x[..., :, :-1]).mean(dim=2)  # (B, C, T-1)
+            all_dE_mask.append(dE_x.cpu().flatten())
+            all_dP_mask.append(dP_x.cpu().flatten())
+
     if not all_dE:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
 
     cat_dE = torch.cat(all_dE)
     cat_dP = torch.cat(all_dP)
@@ -581,7 +604,40 @@ def calibrate_thresholds(
         f" p99={pqs[3]:.6f} p999={pqs[4]:.6f}"
         f" heavy_tail_ratio={heavy_P:.4f}"
     )
-    return delta_E, delta_P
+
+    # --- mask thresholds from x_tf distribution ---
+    if all_dE_mask:
+        cat_dE_mask = torch.cat(all_dE_mask)
+        cat_dP_mask = torch.cat(all_dP_mask)
+        delta_E_mask = float(torch.quantile(cat_dE_mask, q).item())
+        delta_P_mask = float(torch.quantile(cat_dP_mask, q).item())
+        meqs = _qs(cat_dE_mask, qs)
+        mpqs = _qs(cat_dP_mask, qs)
+        me99, me95 = meqs[3], meqs[2]
+        mp99, mp95 = mpqs[3], mpqs[2]
+        heavy_mE = me99 / me95 if me95 > 1e-15 else float("nan")
+        heavy_mP = mp99 / mp95 if mp95 > 1e-15 else float("nan")
+        print(
+            f"[Calibration][dE_mask_dist]"
+            f" n={cat_dE_mask.numel()}"
+            f" mean={cat_dE_mask.mean():.6f} std={cat_dE_mask.std():.6f}"
+            f" p50={meqs[0]:.6f} p90={meqs[1]:.6f} p95={meqs[2]:.6f}"
+            f" p99={meqs[3]:.6f} p999={meqs[4]:.6f}"
+            f" heavy_tail_ratio={heavy_mE:.4f}"
+        )
+        print(
+            f"[Calibration][dP_mask_dist]"
+            f" n={cat_dP_mask.numel()}"
+            f" mean={cat_dP_mask.mean():.6f} std={cat_dP_mask.std():.6f}"
+            f" p50={mpqs[0]:.6f} p90={mpqs[1]:.6f} p95={mpqs[2]:.6f}"
+            f" p99={mpqs[3]:.6f} p999={mpqs[4]:.6f}"
+            f" heavy_tail_ratio={heavy_mP:.4f}"
+        )
+    else:
+        delta_E_mask = 0.0
+        delta_P_mask = 0.0
+
+    return delta_E, delta_P, delta_E_mask, delta_P_mask
 
 
 def _sq(t: torch.Tensor, q: float) -> float:
@@ -750,6 +806,26 @@ def collect_and_print_debug(
         f" thr_min={thr_min:.6f} thr_max={thr_max:.6f}"
         f" lgts_mean={lgts_mean:.6f} lgts_std={lgts_std:.6f}"
         f" lgts_p1={lgts_p1:.6f} lgts_p99={lgts_p99:.6f}"
+    )
+
+    # ------------------------------------------------------------------ MASK (trigger mask)
+    trigger_mask_on = bool(getattr(cfg, "trigger_mask", False))
+    if nm is not None and trigger_mask_on:
+        m_rate = float(getattr(nm, "_last_mask_rate", nan))
+        m_trig_rate = float(getattr(nm, "_last_mask_trig_rate", nan))
+        m_delta_E = float(getattr(nm, "_last_mask_delta_E", nan))
+        m_delta_P = float(getattr(nm, "_last_mask_delta_P", nan))
+    else:
+        m_rate = 1.0
+        m_trig_rate = 0.0
+        m_delta_E = nan
+        m_delta_P = nan
+    print(
+        f"[{prefix}][MASK]"
+        f" mask_rate={m_rate:.6f}"
+        f" mask_trig_rate={m_trig_rate:.6f}"
+        f" delta_E_mask={m_delta_E:.6f}"
+        f" delta_P_mask={m_delta_P:.6f}"
     )
 
     # ------------------------------------------------------------------ GFLK (gate flicker)
@@ -1130,16 +1206,22 @@ def main(argv: list[str] | None = None):
     if cfg.auto_thresholds and cfg.delta_E == 0.0 and cfg.delta_P == 0.0:
         nm = getattr(model, "nm", None)
         if nm is not None and hasattr(nm, "delta_E"):
-            delta_E, delta_P = calibrate_thresholds(
+            delta_E, delta_P, delta_E_mask, delta_P_mask = calibrate_thresholds(
                 model, dataloader.train_loader, cfg, max_batches=200
             )
             cfg.delta_E = delta_E
             cfg.delta_P = delta_P
+            cfg.delta_E_mask = delta_E_mask
+            cfg.delta_P_mask = delta_P_mask
             nm.delta_E = delta_E
             nm.delta_P = delta_P
+            nm.delta_E_mask = delta_E_mask
+            nm.delta_P_mask = delta_P_mask
             print(
                 f"[Calibration] trigger_q={cfg.trigger_q}"
                 f"  delta_E={delta_E:.6f}  delta_P={delta_P:.6f}"
+                f"  delta_E_mask={delta_E_mask:.6f}  delta_P_mask={delta_P_mask:.6f}"
+                f"  trigger_mask={cfg.trigger_mask}"
             )
 
     optimizer = _build_optimizer(model, cfg)
