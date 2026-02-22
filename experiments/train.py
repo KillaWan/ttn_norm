@@ -931,6 +931,23 @@ def collect_and_print_debug(
     _pred_sup_mse = float(getattr(nm, "_last_pred_sup_loss", nan)) if nm is not None else nan
     print(f"[{prefix}][PSUP] pred_sup_mse={_pred_sup_mse:.6e}")
 
+    # ------------------------------------------------------------------ GQ (gate quality diagnostics)
+    if nm is not None and hasattr(nm, "get_last_gq_stats"):
+        _gq = nm.get_last_gq_stats()
+        _gq_entF = _gq.get("entF_norm", nan)
+        _gq_topk = _gq.get("topk_mass", nan)
+        _gq_ratio = _gq.get("maxF_meanF", nan)
+        _gq_corr = _gq.get("corr_mag", nan)
+    else:
+        _gq_entF = _gq_topk = _gq_ratio = _gq_corr = nan
+    print(
+        f"[{prefix}][GQ]"
+        f" entF_norm={_gq_entF:.4f}"
+        f" topk_mass={_gq_topk:.4f}"
+        f" maxF_meanF={_gq_ratio:.4f}"
+        f" corr_mag={_gq_corr:.4f}"
+    )
+
 
 def _aux_scale(cfg: TrainConfig, epoch_idx: int) -> float:
     if cfg.aux_loss_schedule == "none":

@@ -109,10 +109,10 @@ class LocalTFNorm(nn.Module):
         stationarity_loss_weight: float = 0.0,
         stationarity_chunks: int = 4,
         future_mode: str = "repeat_last",
-        predict_n_time: bool = True,
+        predict_n_time: bool = False,
         pred_hidden_dim: int = 64,
         pred_dropout: float = 0.1,
-        pred_loss_weight: float = 1.0,
+        pred_loss_weight: float = 0.0,
         gate_threshold: float = 0.0,
         gate_temperature: float = 1.0,
         gate_smooth_weight: float = 0.0,
@@ -254,6 +254,12 @@ class LocalTFNorm(nn.Module):
         # Prediction supervision loss cache
         self._last_pred_sup_loss: float = 0.0
 
+        # Gate quality (GQ) diagnostic caches (detached, no grad)
+        self._last_gq_entF_norm: float = float("nan")
+        self._last_gq_topk_mass: float = float("nan")
+        self._last_gq_maxF_meanF: float = float("nan")
+        self._last_gq_corr_mag: float = float("nan")
+
     def _dE_dP_from_tf(
         self, tf_complex: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -277,15 +283,20 @@ class LocalTFNorm(nn.Module):
         dP = torch.abs(p[..., :, 1:] - p[..., :, :-1]).mean(dim=2)  # (B, C, T-1)
         return dE, dP
 
-    def _make_gate(self, x_tf: torch.Tensor) -> torch.Tensor:
+    def _compute_gate_magnitude(self, x_tf: torch.Tensor) -> torch.Tensor:
+        """Return the magnitude representation fed into the gate (same as _make_gate logic)."""
         magnitude = x_tf.abs()
-        # decide whether to use log-mag: explicit override wins, else legacy flag
         if self.gate_use_log_mag is None:
             use_log_mag = bool(self.gate_log_mag)
         else:
             use_log_mag = bool(self.gate_use_log_mag)
         if use_log_mag:
             magnitude = torch.log1p(magnitude)
+        return magnitude
+
+    def _make_gate(self, x_tf: torch.Tensor) -> torch.Tensor:
+        magnitude = self._compute_gate_magnitude(x_tf)
+        # decide whether to use log-mag: explicit override wins, else legacy flag
         return self.gate(magnitude)
 
     def _compute_gate_stats(self, g_local: torch.Tensor) -> None:
@@ -347,6 +358,92 @@ class LocalTFNorm(nn.Module):
             "L_P": self._last_L_P,
         }
 
+    @torch.no_grad()
+    def _compute_gq_stats(
+        self,
+        g_local: torch.Tensor,
+        gate_magnitude: torch.Tensor,
+        mask_t: Optional[torch.Tensor],
+    ) -> None:
+        """Compute gate quality diagnostics (all detached, no grad).
+
+        Args:
+            g_local:        (B, C, F, T) raw gate output before trigger mask.
+            gate_magnitude: (B, C, F, T) magnitude fed into the gate.
+            mask_t:         (B, C, T) bool mask of valid frames, or None for all frames.
+        """
+        g = g_local.detach().float()
+        mag = gate_magnitude.detach().float()
+        B, C, F, T = g.shape
+
+        # Build per-(B,C,T) validity mask
+        if mask_t is not None and mask_t.any():
+            valid = mask_t.detach().bool()  # (B, C, T)
+        else:
+            valid = torch.ones(B, C, T, dtype=torch.bool, device=g.device)
+
+        valid_f = valid.float()  # (B, C, T) for weighting
+
+        # ---- (a) entF_norm: per-(B,C,T) softmax of g(f) → H / ln(F) ----
+        probs = torch.softmax(g, dim=2)  # (B, C, F, T)
+        eps = 1e-10
+        ent = -(probs * torch.log(probs + eps)).sum(dim=2)  # (B, C, T)
+        log_F = float(np.log(F)) if F > 1 else 1.0
+        ent_norm = ent / log_F  # (B, C, T), in [0, 1]
+        n_valid = float(valid_f.sum().item())
+        if n_valid > 0:
+            entF_norm = float((ent_norm * valid_f).sum().item() / n_valid)
+        else:
+            entF_norm = float("nan")
+
+        # ---- (b) topk_mass: top-k probability mass ----
+        k = min(5, F)
+        topk_probs, _ = torch.topk(probs, k, dim=2)  # (B, C, k, T)
+        topk_mass_t = topk_probs.sum(dim=2)            # (B, C, T)
+        if n_valid > 0:
+            topk_mass = float((topk_mass_t * valid_f).sum().item() / n_valid)
+        else:
+            topk_mass = float("nan")
+
+        # ---- (c) maxF/meanF ----
+        g_max_f = g.max(dim=2)[0]            # (B, C, T)
+        g_mean_f = g.mean(dim=2)             # (B, C, T)
+        ratio = g_max_f / (g_mean_f + 1e-10) # (B, C, T)
+        if n_valid > 0:
+            maxF_meanF = float((ratio * valid_f).sum().item() / n_valid)
+        else:
+            maxF_meanF = float("nan")
+
+        # ---- (d) corr_mag: Pearson correlation of g_local vs gate_magnitude ----
+        # Select entries where valid_f expanded over F
+        valid_4d = valid.unsqueeze(2).expand_as(g)  # (B, C, F, T) bool
+        g_sel = g[valid_4d]      # (N,)
+        mag_sel = mag[valid_4d]  # (N,)
+        if g_sel.numel() > 1:
+            g_c = g_sel - g_sel.mean()
+            m_c = mag_sel - mag_sel.mean()
+            cov = (g_c * m_c).mean()
+            g_std = g_c.std() + 1e-10
+            m_std = m_c.std() + 1e-10
+            corr_mag = float((cov / (g_std * m_std)).item())
+        else:
+            corr_mag = float("nan")
+
+        # Cache results
+        self._last_gq_entF_norm = entF_norm
+        self._last_gq_topk_mass = topk_mass
+        self._last_gq_maxF_meanF = maxF_meanF
+        self._last_gq_corr_mag = corr_mag
+
+    def get_last_gq_stats(self) -> dict[str, float]:
+        """Return last computed gate quality diagnostics."""
+        return {
+            "entF_norm": self._last_gq_entF_norm,
+            "topk_mass": self._last_gq_topk_mass,
+            "maxF_meanF": self._last_gq_maxF_meanF,
+            "corr_mag": self._last_gq_corr_mag,
+        }
+
     def normalize(
         self, batch_x: torch.Tensor, return_state: bool = False
     ) -> torch.Tensor | tuple[torch.Tensor, LocalTFNormState]:
@@ -361,7 +458,8 @@ class LocalTFNorm(nn.Module):
             batch_x = (batch_x - inst_mean) / inst_std
 
         x_tf = self.stft(batch_x)
-        g_local = self._make_gate(x_tf)
+        gate_magnitude = self._compute_gate_magnitude(x_tf)
+        g_local = self.gate(gate_magnitude)
 
         # Trigger mask: restrict effective gate to boundary frames only
         if self.trigger_mask:
@@ -477,6 +575,10 @@ class LocalTFNorm(nn.Module):
 
         # Compute gate statistics on effective gate
         self._compute_gate_stats(g_eff)
+
+        # Compute gate quality (GQ) diagnostics on raw g_local (pre-mask)
+        _mask_t_for_gq = self._last_trigger_mask_t if self.trigger_mask else None
+        self._compute_gq_stats(g_local, gate_magnitude, _mask_t_for_gq)
 
         pred_n_time = None
         pred_n_tf = None
