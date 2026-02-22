@@ -407,6 +407,8 @@ class TrainConfig:
     trigger_mask: bool = True
     delta_E_mask: float = 0.0
     delta_P_mask: float = 0.0
+    shape_loss_mode: str = "meanF"
+    trigger_mask_mode: str = "time"
 
 
 def _next_power_of_two(n: int) -> int:
@@ -467,6 +469,8 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             trigger_mask=cfg.trigger_mask,
             delta_E_mask=cfg.delta_E_mask,
             delta_P_mask=cfg.delta_P_mask,
+            shape_loss_mode=cfg.shape_loss_mode,
+            trigger_mask_mode=cfg.trigger_mask_mode,
         )
     label_len = cfg.label_len or (cfg.window // 2)
     label_len = min(label_len, cfg.window)
@@ -556,10 +560,15 @@ def calibrate_thresholds(
 
         logE = torch.log(E + eps_E)
         dE = torch.abs(logE[..., 1:] - logE[..., :-1])  # (B, C, T-1)
-        dP = torch.abs(p[..., :, 1:] - p[..., :, :-1]).mean(dim=2)  # (B, C, T-1)
+        dP_f = torch.abs(p[..., :, 1:] - p[..., :, :-1])  # (B, C, F, T-1)
+        dP_mean = dP_f.mean(dim=2)                          # (B, C, T-1)
 
         all_dE.append(dE.cpu().flatten())
-        all_dP.append(dP.cpu().flatten())
+        # For delta_P threshold: use perF elements if shape_loss_mode=="perF"
+        if getattr(cfg, "shape_loss_mode", "meanF") == "perF":
+            all_dP.append(dP_f.cpu().flatten())
+        else:
+            all_dP.append(dP_mean.cpu().flatten())
 
         # --- dE/dP from raw input x_tf (for trigger mask thresholds) ---
         x_tf = nm._last_x_tf  # (B, C, F, T) complex
@@ -569,9 +578,14 @@ def calibrate_thresholds(
             p_x = P_x / (P_x.sum(dim=2, keepdim=True) + eps)   # (B, C, F, T)
             logE_x = torch.log(E_x + eps_E)
             dE_x = torch.abs(logE_x[..., 1:] - logE_x[..., :-1])          # (B, C, T-1)
-            dP_x = torch.abs(p_x[..., :, 1:] - p_x[..., :, :-1]).mean(dim=2)  # (B, C, T-1)
+            dP_f_x = torch.abs(p_x[..., :, 1:] - p_x[..., :, :-1])        # (B, C, F, T-1)
+            dP_mean_x = dP_f_x.mean(dim=2)                                 # (B, C, T-1)
             all_dE_mask.append(dE_x.cpu().flatten())
-            all_dP_mask.append(dP_x.cpu().flatten())
+            # For delta_P_mask: use perF elements if trigger_mask_mode=="tf"
+            if getattr(cfg, "trigger_mask_mode", "time") == "tf":
+                all_dP_mask.append(dP_f_x.cpu().flatten())
+            else:
+                all_dP_mask.append(dP_mean_x.cpu().flatten())
 
     # Restore original trigger_mask setting
     nm.trigger_mask = _orig_trigger_mask
@@ -827,12 +841,16 @@ def collect_and_print_debug(
         m_trig_rate = 0.0
         m_delta_E = nan
         m_delta_P = nan
+    m_rate_tf = float(getattr(nm, "_last_mask_rate_tf", nan)) if nm is not None else nan
+    m_trig_rate_tf = float(getattr(nm, "_last_mask_trig_rate_tf", nan)) if nm is not None else nan
     print(
         f"[{prefix}][MASK]"
         f" mask_rate={m_rate:.6f}"
         f" mask_trig_rate={m_trig_rate:.6f}"
         f" delta_E_mask={m_delta_E:.6f}"
         f" delta_P_mask={m_delta_P:.6f}"
+        f" mask_rate_tf={m_rate_tf:.6f}"
+        f" mask_trig_rate_tf={m_trig_rate_tf:.6f}"
     )
 
     # ------------------------------------------------------------------ GFLK (gate flicker)

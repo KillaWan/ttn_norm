@@ -131,9 +131,17 @@ class LocalTFNorm(nn.Module):
         trigger_mask: bool = True,
         delta_E_mask: float = 0.0,
         delta_P_mask: float = 0.0,
+        shape_loss_mode: str = "meanF",
+        trigger_mask_mode: str = "time",
         **kwargs,
     ):
         super().__init__()
+        if shape_loss_mode not in ("meanF", "perF"):
+            raise ValueError(f"shape_loss_mode must be 'meanF' or 'perF', got {shape_loss_mode!r}")
+        if trigger_mask_mode not in ("time", "tf"):
+            raise ValueError(f"trigger_mask_mode must be 'time' or 'tf', got {trigger_mask_mode!r}")
+        self.shape_loss_mode = shape_loss_mode
+        self.trigger_mask_mode = trigger_mask_mode
         self.seq_len = seq_len
         self.use_instance_norm = use_instance_norm
         self.pred_len = pred_len
@@ -260,6 +268,10 @@ class LocalTFNorm(nn.Module):
         self._last_gq_maxF_meanF: float = float("nan")
         self._last_gq_corr_mag: float = float("nan")
 
+        # TF-mask diagnostics (only populated when trigger_mask_mode=="tf")
+        self._last_mask_rate_tf: float = float("nan")
+        self._last_mask_trig_rate_tf: float = float("nan")
+
     def _dE_dP_from_tf(
         self, tf_complex: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -282,6 +294,25 @@ class LocalTFNorm(nn.Module):
         dE = torch.abs(logE[..., 1:] - logE[..., :-1])          # (B, C, T-1)
         dP = torch.abs(p[..., :, 1:] - p[..., :, :-1]).mean(dim=2)  # (B, C, T-1)
         return dE, dP
+
+    def _dP_mean_and_perF(
+        self, tf_complex: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute per-frequency and mean spectral-shape time-differences.
+
+        Args:
+            tf_complex: (B, C, F, T) complex tensor
+
+        Returns:
+            dP_f:    (B, C, F, T-1) per-frequency absolute shape difference
+            dP_mean: (B, C, T-1)   mean of dP_f over frequency dim
+        """
+        eps = 1e-8
+        P = tf_complex.abs() ** 2                               # (B, C, F, T)
+        p = P / (P.sum(dim=2, keepdim=True) + eps)              # (B, C, F, T)
+        dP_f = torch.abs(p[..., :, 1:] - p[..., :, :-1])       # (B, C, F, T-1)
+        dP_mean = dP_f.mean(dim=2)                              # (B, C, T-1)
+        return dP_f, dP_mean
 
     def _compute_gate_magnitude(self, x_tf: torch.Tensor) -> torch.Tensor:
         """Return the magnitude representation fed into the gate (same as _make_gate logic)."""
@@ -464,7 +495,9 @@ class LocalTFNorm(nn.Module):
         # Trigger mask: restrict effective gate to boundary frames only
         if self.trigger_mask:
             with torch.no_grad():
-                dE_x, dP_x = self._dE_dP_from_tf(x_tf)
+                dE_x, dP_mean_x = self._dE_dP_from_tf(x_tf)
+                if self.trigger_mask_mode == "tf":
+                    dP_f_x, _ = self._dP_mean_and_perF(x_tf)
             de = self.delta_E_mask if self.delta_E_mask > 0.0 else self.delta_E
             dp = self.delta_P_mask if self.delta_P_mask > 0.0 else self.delta_P
             if de <= 0.0 or dp <= 0.0:
@@ -472,70 +505,119 @@ class LocalTFNorm(nn.Module):
                     "trigger_mask enabled but delta_E_mask/delta_P_mask not set; "
                     "run calibration or set manually"
                 )
-            # trig: (B, C, T-1) — True wherever a transition exceeds threshold
-            trig = (dE_x > de) | (dP_x > dp)
-            T = x_tf.shape[-1]
-            mask_t = torch.zeros(
-                x_tf.shape[0], x_tf.shape[1], T,
-                dtype=torch.bool, device=x_tf.device,
-            )
-            mask_t[..., :-1] |= trig   # left frame of each triggered transition
-            mask_t[..., 1:] |= trig    # right frame of each triggered transition
-            mask_f = mask_t.unsqueeze(2).float()  # (B, C, 1, T) broadcast over freq
-            g_eff = g_local * mask_f              # (B, C, F, T)
-            # Update trigger mask diagnostics (all detached)
-            self._last_trigger_mask_t = mask_t.detach()
-            self._last_mask_rate = float(mask_t.float().mean().cpu().item())
-            self._last_mask_trig_rate = float(trig.float().mean().cpu().item())
+            B_sz, C_sz, F_sz, T = x_tf.shape[0], x_tf.shape[1], x_tf.shape[2], x_tf.shape[-1]
             self._last_mask_delta_E = float(de)
             self._last_mask_delta_P = float(dp)
 
-            # ---- Coverage diagnostics ----
-            # Transition strength: s_trans[i] = max(dE[i]/de, dP[i]/dp) shape (B,C,T-1)
-            _s_trans = torch.maximum(dE_x / de, dP_x / dp)
-            # Map to frame strength via left-right coverage rule: same as mask_t
-            _s_frame = torch.zeros(
-                x_tf.shape[0], x_tf.shape[1], T,
-                device=x_tf.device, dtype=_s_trans.dtype,
-            )
-            _s_frame[..., :-1] = torch.maximum(_s_frame[..., :-1], _s_trans)
-            _s_frame[..., 1:] = torch.maximum(_s_frame[..., 1:], _s_trans)
-            _cov_den = float(_s_frame.sum().cpu().item()) + 1e-12
-            _cov_num = float((_s_frame * mask_t.float()).sum().cpu().item())
-            self._last_mask_cov = _cov_num / _cov_den
+            if self.trigger_mask_mode == "time":
+                # ---- TIME mode: existing behaviour (broadcast over freq) ----
+                trig = (dE_x > de) | (dP_mean_x > dp)           # (B, C, T-1)
+                mask_t = torch.zeros(B_sz, C_sz, T, dtype=torch.bool, device=x_tf.device)
+                mask_t[..., :-1] |= trig
+                mask_t[..., 1:] |= trig
+                mask_f = mask_t.unsqueeze(2).float()             # (B, C, 1, T)
+                g_eff = g_local * mask_f                         # (B, C, F, T)
 
-            # p-table: for p in {0.95, 0.99, 0.995}, compute alt thresholds + coverage
-            _p_table: dict = {}
-            _dE_flat = dE_x.detach().float().flatten()
-            _dP_flat = dP_x.detach().float().flatten()
-            for _p in (0.95, 0.99, 0.995):
-                _de_p = float(torch.quantile(_dE_flat, _p).item())
-                _dp_p = float(torch.quantile(_dP_flat, _p).item())
-                _trig_p = (dE_x > _de_p) | (dP_x > _dp_p)
-                _mask_t_p = torch.zeros(
-                    x_tf.shape[0], x_tf.shape[1], T,
-                    dtype=torch.bool, device=x_tf.device,
-                )
-                _mask_t_p[..., :-1] |= _trig_p
-                _mask_t_p[..., 1:] |= _trig_p
-                _mr_p = float(_mask_t_p.float().mean().cpu().item())
-                # coverage at this p threshold
-                _de_p_safe = _de_p if _de_p > 1e-15 else 1e-15
-                _dp_p_safe = _dp_p if _dp_p > 1e-15 else 1e-15
-                _s_trans_p = torch.maximum(dE_x / _de_p_safe, dP_x / _dp_p_safe)
-                _s_frame_p = torch.zeros_like(_s_frame)
-                _s_frame_p[..., :-1] = torch.maximum(_s_frame_p[..., :-1], _s_trans_p)
-                _s_frame_p[..., 1:] = torch.maximum(_s_frame_p[..., 1:], _s_trans_p)
-                _cdn_p = float(_s_frame_p.sum().cpu().item()) + 1e-12
-                _cnm_p = float((_s_frame_p * _mask_t_p.float()).sum().cpu().item())
-                _p_table[_p] = (_mr_p, _cnm_p / _cdn_p)
-            self._last_mask_p_table = _p_table
+                self._last_trigger_mask_t = mask_t.detach()
+                self._last_mask_rate = float(mask_t.float().mean().cpu().item())
+                self._last_mask_trig_rate = float(trig.float().mean().cpu().item())
+                self._last_mask_rate_tf = float("nan")
+                self._last_mask_trig_rate_tf = float("nan")
 
-            # ---- min_rate_cov*: minimum frame fraction to reach target coverage ----
-            # Flatten _s_frame to 1-D, sort descending, find smallest k such that
-            # cumsum[k] >= target * total; min_rate = (k+1) / N
-            _sf_flat = _s_frame.detach().float().flatten()
-            _sf_total = float(_sf_flat.sum().item())
+                # Coverage: strength in (B,C,T-1) / (B,C,T) space
+                _s_trans = torch.maximum(dE_x / de, dP_mean_x / dp)
+                _s_frame = torch.zeros(B_sz, C_sz, T, device=x_tf.device, dtype=_s_trans.dtype)
+                _s_frame[..., :-1] = torch.maximum(_s_frame[..., :-1], _s_trans)
+                _s_frame[..., 1:] = torch.maximum(_s_frame[..., 1:], _s_trans)
+                _cov_den = float(_s_frame.sum().cpu().item()) + 1e-12
+                _cov_num = float((_s_frame * mask_t.float()).sum().cpu().item())
+                self._last_mask_cov = _cov_num / _cov_den
+
+                # p-table
+                _p_table: dict = {}
+                _dE_flat = dE_x.detach().float().flatten()
+                _dP_flat = dP_mean_x.detach().float().flatten()
+                for _p in (0.95, 0.99, 0.995):
+                    _de_p = float(torch.quantile(_dE_flat, _p).item())
+                    _dp_p = float(torch.quantile(_dP_flat, _p).item())
+                    _trig_p = (dE_x > _de_p) | (dP_mean_x > _dp_p)
+                    _mask_t_p = torch.zeros(B_sz, C_sz, T, dtype=torch.bool, device=x_tf.device)
+                    _mask_t_p[..., :-1] |= _trig_p
+                    _mask_t_p[..., 1:] |= _trig_p
+                    _mr_p = float(_mask_t_p.float().mean().cpu().item())
+                    _de_p_safe = _de_p if _de_p > 1e-15 else 1e-15
+                    _dp_p_safe = _dp_p if _dp_p > 1e-15 else 1e-15
+                    _s_trans_p = torch.maximum(dE_x / _de_p_safe, dP_mean_x / _dp_p_safe)
+                    _s_frame_p = torch.zeros_like(_s_frame)
+                    _s_frame_p[..., :-1] = torch.maximum(_s_frame_p[..., :-1], _s_trans_p)
+                    _s_frame_p[..., 1:] = torch.maximum(_s_frame_p[..., 1:], _s_trans_p)
+                    _cdn_p = float(_s_frame_p.sum().cpu().item()) + 1e-12
+                    _cnm_p = float((_s_frame_p * _mask_t_p.float()).sum().cpu().item())
+                    _p_table[_p] = (_mr_p, _cnm_p / _cdn_p)
+                self._last_mask_p_table = _p_table
+
+                # min_rate_cov*
+                _sf_flat = _s_frame.detach().float().flatten()
+                _sf_total = float(_sf_flat.sum().item())
+
+            else:
+                # ---- TF mode: frequency-aware mask ----
+                trig_tf = (dE_x.unsqueeze(2) > de) | (dP_f_x > dp)  # (B, C, F, T-1)
+                mask_tf = torch.zeros(B_sz, C_sz, F_sz, T, dtype=torch.bool, device=x_tf.device)
+                mask_tf[..., :-1] |= trig_tf
+                mask_tf[..., 1:] |= trig_tf
+                g_eff = g_local * mask_tf.float()                    # (B, C, F, T)
+
+                # Legacy (B,C,T) fields for GQ and existing logging
+                mask_t_any = mask_tf.any(dim=2)                      # (B, C, T)
+                self._last_trigger_mask_t = mask_t_any.detach()
+                self._last_mask_rate = float(mask_t_any.float().mean().cpu().item())
+                trig_t_any = trig_tf.any(dim=2)                      # (B, C, T-1)
+                self._last_mask_trig_rate = float(trig_t_any.float().mean().cpu().item())
+                # TF-specific rates
+                self._last_mask_rate_tf = float(mask_tf.float().mean().cpu().item())
+                self._last_mask_trig_rate_tf = float(trig_tf.float().mean().cpu().item())
+
+                # Coverage: strength in (B,C,F,T-1) / (B,C,F,T) space
+                _s_trans_tf = torch.maximum(
+                    dE_x.unsqueeze(2) / (de + 1e-15),
+                    dP_f_x / (dp + 1e-15),
+                )  # (B, C, F, T-1)
+                _s_frame_tf = torch.zeros(B_sz, C_sz, F_sz, T, device=x_tf.device, dtype=_s_trans_tf.dtype)
+                _s_frame_tf[..., :-1] = torch.maximum(_s_frame_tf[..., :-1], _s_trans_tf)
+                _s_frame_tf[..., 1:] = torch.maximum(_s_frame_tf[..., 1:], _s_trans_tf)
+                _cov_den = float(_s_frame_tf.sum().cpu().item()) + 1e-12
+                _cov_num = float((_s_frame_tf * mask_tf.float()).sum().cpu().item())
+                self._last_mask_cov = _cov_num / _cov_den
+
+                # p-table (dP quantile over dP_f_x elements)
+                _p_table = {}
+                _dE_flat = dE_x.detach().float().flatten()
+                _dP_flat = dP_f_x.detach().float().flatten()
+                for _p in (0.95, 0.99, 0.995):
+                    _de_p = float(torch.quantile(_dE_flat, _p).item())
+                    _dp_p = float(torch.quantile(_dP_flat, _p).item())
+                    _trig_tf_p = (dE_x.unsqueeze(2) > _de_p) | (dP_f_x > _dp_p)
+                    _mask_tf_p = torch.zeros(B_sz, C_sz, F_sz, T, dtype=torch.bool, device=x_tf.device)
+                    _mask_tf_p[..., :-1] |= _trig_tf_p
+                    _mask_tf_p[..., 1:] |= _trig_tf_p
+                    _mr_p = float(_mask_tf_p.float().mean().cpu().item())
+                    _de_p_safe = _de_p if _de_p > 1e-15 else 1e-15
+                    _dp_p_safe = _dp_p if _dp_p > 1e-15 else 1e-15
+                    _s_trans_tf_p = torch.maximum(dE_x.unsqueeze(2) / _de_p_safe, dP_f_x / _dp_p_safe)
+                    _s_frame_tf_p = torch.zeros_like(_s_frame_tf)
+                    _s_frame_tf_p[..., :-1] = torch.maximum(_s_frame_tf_p[..., :-1], _s_trans_tf_p)
+                    _s_frame_tf_p[..., 1:] = torch.maximum(_s_frame_tf_p[..., 1:], _s_trans_tf_p)
+                    _cdn_p = float(_s_frame_tf_p.sum().cpu().item()) + 1e-12
+                    _cnm_p = float((_s_frame_tf_p * _mask_tf_p.float()).sum().cpu().item())
+                    _p_table[_p] = (_mr_p, _cnm_p / _cdn_p)
+                self._last_mask_p_table = _p_table
+
+                # min_rate_cov*
+                _sf_flat = _s_frame_tf.detach().float().flatten()
+                _sf_total = float(_sf_flat.sum().item())
+
+            # ---- Shared min_rate_cov* computation (same logic, different _sf_flat) ----
             if _sf_total > 0.0 and _sf_flat.numel() > 0:
                 _sf_sorted, _ = torch.sort(_sf_flat, descending=True)
                 _csum = torch.cumsum(_sf_sorted, dim=0)
@@ -563,6 +645,8 @@ class LocalTFNorm(nn.Module):
             self._last_mask_min_rate_cov99 = float("nan")
             self._last_mask_min_rate_cov995 = float("nan")
             self._last_mask_p_table = {}
+            self._last_mask_rate_tf = float("nan")
+            self._last_mask_trig_rate_tf = float("nan")
 
         # keep effective gate for debugging (reflects actual decomposition used)
         self._last_gate = g_eff
@@ -691,13 +775,20 @@ class LocalTFNorm(nn.Module):
         dE = torch.abs(logE[..., 1:] - logE[..., :-1])          # (B, C, T-1)
         L_E = torch.mean(torch.relu(dE - self.delta_E))
 
-        # Spectral-shape margin-triggered TV along time (averaged over freq first)
-        dP = torch.abs(p[..., :, 1:] - p[..., :, :-1]).mean(dim=2)  # (B, C, T-1)
-        L_P = torch.mean(torch.relu(dP - self.delta_P))
+        # Spectral-shape margin-triggered TV: branch on shape_loss_mode
+        dP_f = torch.abs(p[..., :, 1:] - p[..., :, :-1])        # (B, C, F, T-1)
+        dP_mean = dP_f.mean(dim=2)                               # (B, C, T-1)
+        if self.shape_loss_mode == "perF":
+            # Per-frequency margin loss: relu applied per (B,C,F,T-1) then mean
+            L_P = torch.mean(torch.relu(dP_f - self.delta_P))
+            # Cache per-freq tensor for diagnostics (flatten over F for STAT printing)
+            self._last_dP = dP_f.detach()
+        else:  # "meanF" — original behaviour
+            L_P = torch.mean(torch.relu(dP_mean - self.delta_P))
+            self._last_dP = dP_mean.detach()
 
-        # Cache per-transition tensors for diagnostics
+        # Cache dE for diagnostics
         self._last_dE = dE.detach()
-        self._last_dP = dP.detach()
 
         L_stat = self.lambda_E * L_E + self.lambda_P * L_P
 
@@ -796,20 +887,32 @@ class LocalTFNorm(nn.Module):
         # Apply trigger mask if enabled (consistent with normalize(), no cache updates)
         if self.trigger_mask:
             with torch.no_grad():
-                dE_x, dP_x = self._dE_dP_from_tf(x_tf)
+                dE_x, dP_mean_x = self._dE_dP_from_tf(x_tf)
+                if self.trigger_mask_mode == "tf":
+                    dP_f_x, _ = self._dP_mean_and_perF(x_tf)
             de = self.delta_E_mask if self.delta_E_mask > 0.0 else self.delta_E
             dp = self.delta_P_mask if self.delta_P_mask > 0.0 else self.delta_P
             if de > 0.0 and dp > 0.0:
-                trig = (dE_x > de) | (dP_x > dp)
                 T = x_tf.shape[-1]
-                mask_t = torch.zeros(
-                    x_tf.shape[0], x_tf.shape[1], T,
-                    dtype=torch.bool, device=x_tf.device,
-                )
-                mask_t[..., :-1] |= trig
-                mask_t[..., 1:] |= trig
-                mask_f = mask_t.unsqueeze(2).float()
-                g_eff = g_local * mask_f
+                if self.trigger_mask_mode == "tf":
+                    trig_tf = (dE_x.unsqueeze(2) > de) | (dP_f_x > dp)
+                    mask_tf = torch.zeros(
+                        x_tf.shape[0], x_tf.shape[1], x_tf.shape[2], T,
+                        dtype=torch.bool, device=x_tf.device,
+                    )
+                    mask_tf[..., :-1] |= trig_tf
+                    mask_tf[..., 1:] |= trig_tf
+                    g_eff = g_local * mask_tf.float()
+                else:  # "time"
+                    trig = (dE_x > de) | (dP_mean_x > dp)
+                    mask_t = torch.zeros(
+                        x_tf.shape[0], x_tf.shape[1], T,
+                        dtype=torch.bool, device=x_tf.device,
+                    )
+                    mask_t[..., :-1] |= trig
+                    mask_t[..., 1:] |= trig
+                    mask_f = mask_t.unsqueeze(2).float()
+                    g_eff = g_local * mask_f
             else:
                 g_eff = g_local
         else:
