@@ -16,6 +16,7 @@ from tqdm import tqdm
 from torchmetrics import MeanAbsoluteError, MeanAbsolutePercentageError, MeanSquaredError
 
 from ttn_norm.models import LocalTFNorm, TTNModel
+from ttn_norm.normalizations import DishTS, FAN, No, RevIN, SAN
 from ttn_norm.utils.metrics import RMSE
 
 
@@ -417,6 +418,17 @@ class TrainConfig:
     gate_sup_on: str = "raw"
     gate_sup_target: str = "soft"
 
+    # ------------------------------------------------------------------ baseline norm configs
+    # RevIN
+    revin_affine: bool = True
+    # FAN (frequency adaptive normalization)
+    fan_freq_topk: int = 20
+    fan_rfft: bool = True
+    # DishTS
+    dish_init: str = "uniform"   # "standard" | "avg" | "uniform"
+    # SAN (seasonal adaptive normalization)
+    san_period_len: int = 12
+
 
 def _next_power_of_two(n: int) -> int:
     p = 1
@@ -426,9 +438,40 @@ def _next_power_of_two(n: int) -> int:
 
 
 def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
-    if cfg.norm_type.lower() in {"none", "baseline", "no"}:
+    _nt = cfg.norm_type.lower()
+
+    if _nt in {"none", "baseline", "no"}:
         norm_model: nn.Module | None = nn.Identity()
+
+    elif _nt == "revin":
+        norm_model = RevIN(n_series=num_features, affine=cfg.revin_affine)
+
+    elif _nt == "fan":
+        norm_model = FAN(
+            seq_len=cfg.window,
+            pred_len=cfg.pred_len,
+            enc_in=num_features,
+            freq_topk=cfg.fan_freq_topk,
+            rfft=cfg.fan_rfft,
+        )
+
+    elif _nt == "dishts":
+        norm_model = DishTS(
+            n_series=num_features,
+            seq_len=cfg.window,
+            dish_init=cfg.dish_init,
+        )
+
+    elif _nt == "san":
+        norm_model = SAN(
+            seq_len=cfg.window,
+            pred_len=cfg.pred_len,
+            period_len=cfg.san_period_len,
+            enc_in=num_features,
+        )
+
     else:
+        # Default: LocalTF normalization
         # Auto-compute STFT params from target_frames when requested
         if cfg.auto_stft and cfg.hop_length is None and cfg.win_length is None and cfg.n_fft is None:
             hop = max(1, cfg.window // cfg.target_frames)

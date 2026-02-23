@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from ttn_norm.backbones import build_backbone
 from ttn_norm.models.local_tf_norm.local_norm import LocalTFNorm, LocalTFNormState
+from ttn_norm.normalizations import DishTS, FAN, No, RevIN, SAN
 
 
 class TTNModel(nn.Module):
@@ -34,22 +35,54 @@ class TTNModel(nn.Module):
         batch_x: torch.Tensor,
         dec_inp: Optional[torch.Tensor] = None,
     ):
-        if isinstance(self.nm, LocalTFNorm):
-            batch_x, state = self.nm.normalize(batch_x, return_state=True)
+        nm = self.nm
+        if isinstance(nm, LocalTFNorm):
+            # Returns (residual, state); dec_inp rescaled by same instance stats.
+            batch_x, state = nm.normalize(batch_x, return_state=True)
             self._last_state = state
-            # Keep dec_inp in the same domain as batch_x: apply the same
-            # instance-norm statistics so transformer decoder sees consistent scale.
             if dec_inp is not None and state.mean is not None and state.std is not None:
                 dec_inp = (dec_inp - state.mean) / state.std
+
+        elif isinstance(nm, (RevIN, DishTS)):
+            # normalize() returns (normalized_x, normalized_dec_inp)
+            batch_x, dec_inp = nm.normalize(batch_x, dec_inp)
+
+        elif isinstance(nm, SAN):
+            # Adapted SAN: normalize() stores pred_stats internally, returns tensor.
+            batch_x = nm.normalize(batch_x)
+
+        elif isinstance(nm, FAN):
+            # FAN: normalize() returns a single tensor.
+            batch_x = nm.normalize(batch_x)
+
+        elif isinstance(nm, No):
+            # Pass-through — no transformation.
+            pass
+
         else:
-            batch_x = self.nm(batch_x)
+            # Generic fallback: assume nm(batch_x) → tensor (e.g. nn.Identity).
+            batch_x = nm(batch_x)
+
         return batch_x, dec_inp
 
     def denormalize(self, pred: torch.Tensor) -> torch.Tensor:
-        if isinstance(self.nm, LocalTFNorm):
-            return self.nm.denormalize(pred, state=self._last_state)
-        if hasattr(self.nm, "denormalize"):
-            return self.nm.denormalize(pred)
+        nm = self.nm
+        if isinstance(nm, LocalTFNorm):
+            return nm.denormalize(pred, state=self._last_state)
+
+        elif isinstance(nm, (RevIN, DishTS, FAN)):
+            return nm.denormalize(pred)
+
+        elif isinstance(nm, SAN):
+            # Uses internally stored _pred_stats from last normalize() call.
+            return nm.denormalize(pred)
+
+        elif isinstance(nm, No):
+            return pred
+
+        elif hasattr(nm, "denormalize"):
+            return nm.denormalize(pred)
+
         return pred
 
     def forward(
