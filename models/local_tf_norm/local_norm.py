@@ -3,9 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+import math
+
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .stft import STFT
 from .gate import LocalTFGate
@@ -133,6 +136,13 @@ class LocalTFNorm(nn.Module):
         delta_P_mask: float = 0.0,
         shape_loss_mode: str = "meanF",
         trigger_mask_mode: str = "time",
+        gate_sup_enable: bool = True,
+        gate_sup_weight: float = 0.2,
+        gate_sup_tau: float = 0.3,
+        gate_sup_loss: str = "bce",
+        gate_sup_pos_weight: float = 5.0,
+        gate_sup_on: str = "raw",
+        gate_sup_target: str = "soft",
         **kwargs,
     ):
         super().__init__()
@@ -140,6 +150,12 @@ class LocalTFNorm(nn.Module):
             raise ValueError(f"shape_loss_mode must be 'meanF' or 'perF', got {shape_loss_mode!r}")
         if trigger_mask_mode not in ("time", "tf"):
             raise ValueError(f"trigger_mask_mode must be 'time' or 'tf', got {trigger_mask_mode!r}")
+        if gate_sup_loss not in ("bce", "focal"):
+            raise ValueError(f"gate_sup_loss must be 'bce' or 'focal', got {gate_sup_loss!r}")
+        if gate_sup_on not in ("raw", "eff"):
+            raise ValueError(f"gate_sup_on must be 'raw' or 'eff', got {gate_sup_on!r}")
+        if gate_sup_target not in ("soft", "hard"):
+            raise ValueError(f"gate_sup_target must be 'soft' or 'hard', got {gate_sup_target!r}")
         self.shape_loss_mode = shape_loss_mode
         self.trigger_mask_mode = trigger_mask_mode
         self.seq_len = seq_len
@@ -171,6 +187,13 @@ class LocalTFNorm(nn.Module):
         self.trigger_mask = bool(trigger_mask)
         self.delta_E_mask = float(delta_E_mask)
         self.delta_P_mask = float(delta_P_mask)
+        self.gate_sup_enable = bool(gate_sup_enable)
+        self.gate_sup_weight = float(gate_sup_weight)
+        self.gate_sup_tau = float(gate_sup_tau)
+        self.gate_sup_loss = gate_sup_loss
+        self.gate_sup_pos_weight = float(gate_sup_pos_weight)
+        self.gate_sup_on = gate_sup_on
+        self.gate_sup_target = gate_sup_target
 
         if n_fft is None:
             n_fft = min(64, max(16, seq_len // 4))
@@ -271,6 +294,23 @@ class LocalTFNorm(nn.Module):
         # TF-mask diagnostics (only populated when trigger_mask_mode=="tf")
         self._last_mask_rate_tf: float = float("nan")
         self._last_mask_trig_rate_tf: float = float("nan")
+
+        # Gate supervision diagnostic caches (detached, no grad)
+        self._dbg_graw_stdF: float = float("nan")
+        self._dbg_geff_stdF: float = float("nan")
+        self._dbg_graw_entF: float = float("nan")
+        self._dbg_geff_entF: float = float("nan")
+        self._dbg_graw_maxF_meanF: float = float("nan")
+        self._dbg_geff_maxF_meanF: float = float("nan")
+        self._dbg_graw_topk_mass: float = float("nan")
+        self._dbg_geff_topk_mass: float = float("nan")
+        self._dbg_sup_pos_mean: float = float("nan")
+        self._dbg_sup_neg_mean: float = float("nan")
+        self._dbg_sup_pos_neg_ratio: float = float("nan")
+        self._dbg_sup_bce: float = float("nan")
+
+        # Gate supervision loss tensor (with grad) for loss() aggregation
+        self._last_L_sup_tensor: Optional[torch.Tensor] = None
 
     def _dE_dP_from_tf(
         self, tf_complex: torch.Tensor
@@ -475,6 +515,83 @@ class LocalTFNorm(nn.Module):
             "corr_mag": self._last_gq_corr_mag,
         }
 
+    @torch.no_grad()
+    def _freq_stats(self, g: torch.Tensor, topk: int = 5) -> tuple[float, float, float, float]:
+        """Compute frequency-axis gate statistics for diagnostics.
+
+        Args:
+            g: (B, C, F, T) gate tensor
+            topk: number of top frequency bins for mass computation
+
+        Returns:
+            (stdF_mean, entF_norm, maxF_meanF, topk_mass)
+        """
+        g = g.detach().float()
+        F = g.shape[2]
+        stdF_mean = g.std(dim=2).mean().item()
+        g_sum = g.sum(dim=2, keepdim=True) + 1e-8
+        p = g / g_sum
+        log_F = math.log(F) if F > 1 else 1.0
+        entF_norm = (-(p * (p + 1e-8).log()).sum(dim=2) / log_F).mean().item()
+        maxF_meanF = (g.max(dim=2).values / (g.mean(dim=2) + 1e-8)).mean().item()
+        k = min(topk, F)
+        topk_mass = p.topk(k=k, dim=2).values.sum(dim=2).mean().item()
+        return stdF_mean, entF_norm, maxF_meanF, topk_mass
+
+    def _gate_sup_target_from_stats(
+        self,
+        dE_x: torch.Tensor,
+        dP_f_x: torch.Tensor,
+        de_thr: float,
+        dp_thr: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute per-TF-cell supervision target from change statistics.
+
+        Args:
+            dE_x:   (B, C, T-1)   per-transition log-energy diff
+            dP_f_x: (B, C, F, T-1) per-frequency spectral-shape diff
+            de_thr: energy threshold (scalar)
+            dp_thr: shape threshold (scalar)
+
+        Returns:
+            y_tf:    (B, C, F, T-1)  supervision target in [0, 1]
+            trig_tf: (B, C, F, T-1)  boolean trigger mask (s > 1)
+        """
+        sE = dE_x.unsqueeze(2) / (de_thr + 1e-8)   # (B, C, 1, T-1) → broadcast over F
+        sP = dP_f_x / (dp_thr + 1e-8)               # (B, C, F, T-1)
+        s = torch.maximum(sE, sP)                    # (B, C, F, T-1)
+        trig_tf = s > 1.0                            # (B, C, F, T-1) bool
+        if self.gate_sup_target == "hard":
+            y_tf = trig_tf.float()
+        else:  # "soft"
+            y_tf = torch.sigmoid((s - 1.0) / self.gate_sup_tau)
+        return y_tf, trig_tf
+
+    def _weighted_bce(
+        self, g: torch.Tensor, y: torch.Tensor, pos_weight: float
+    ) -> torch.Tensor:
+        """BCE loss with positive-class weighting."""
+        eps = 1e-7
+        w = pos_weight * y + (1.0 - y)
+        loss = -(w * (y * torch.log(g + eps) + (1.0 - y) * torch.log(1.0 - g + eps)))
+        return loss.mean()
+
+    def _focal_bce(
+        self,
+        g: torch.Tensor,
+        y: torch.Tensor,
+        alpha: float = 0.25,
+        gamma: float = 2.0,
+        pos_weight: float = 5.0,
+    ) -> torch.Tensor:
+        """Focal BCE loss with positive-class weighting."""
+        eps = 1e-7
+        bce = -(y * torch.log(g + eps) + (1.0 - y) * torch.log(1.0 - g + eps))
+        p_t = g * y + (1.0 - g) * (1.0 - y)
+        focal = (1.0 - p_t) ** gamma
+        w = pos_weight * y + (1.0 - y)
+        return (alpha * focal * bce * w).mean()
+
     def normalize(
         self, batch_x: torch.Tensor, return_state: bool = False
     ) -> torch.Tensor | tuple[torch.Tensor, LocalTFNormState]:
@@ -491,13 +608,18 @@ class LocalTFNorm(nn.Module):
         x_tf = self.stft(batch_x)
         gate_magnitude = self._compute_gate_magnitude(x_tf)
         g_local = self.gate(gate_magnitude)
+        g_raw = g_local  # 1.6.1: always the pre-mask gate output
+
+        # Supervision targets (populated inside trigger_mask branch, else None)
+        y_tf_sup: Optional[torch.Tensor] = None
+        trig_tf_sup: Optional[torch.Tensor] = None
 
         # Trigger mask: restrict effective gate to boundary frames only
         if self.trigger_mask:
             with torch.no_grad():
                 dE_x, dP_mean_x = self._dE_dP_from_tf(x_tf)
-                if self.trigger_mask_mode == "tf":
-                    dP_f_x, _ = self._dP_mean_and_perF(x_tf)
+                # Always compute dP_f_x for gate supervision targets (1.5)
+                dP_f_x, _ = self._dP_mean_and_perF(x_tf)
             de = self.delta_E_mask if self.delta_E_mask > 0.0 else self.delta_E
             dp = self.delta_P_mask if self.delta_P_mask > 0.0 else self.delta_P
             if de <= 0.0 or dp <= 0.0:
@@ -633,6 +755,12 @@ class LocalTFNorm(nn.Module):
                 self._last_mask_min_rate_cov95 = float("nan")
                 self._last_mask_min_rate_cov99 = float("nan")
                 self._last_mask_min_rate_cov995 = float("nan")
+
+            # 1.5: Always build supervision targets regardless of trigger_mask_mode
+            with torch.no_grad():
+                y_tf_sup, trig_tf_sup = self._gate_sup_target_from_stats(
+                    dE_x, dP_f_x, de, dp
+                )
         else:
             g_eff = g_local
             self._last_trigger_mask_t = None
@@ -647,6 +775,22 @@ class LocalTFNorm(nn.Module):
             self._last_mask_p_table = {}
             self._last_mask_rate_tf = float("nan")
             self._last_mask_trig_rate_tf = float("nan")
+
+        # 1.7: Gate supervision loss
+        _bce_scalar = float("nan")
+        L_sup = torch.tensor(0.0, device=x_tf.device)
+        if self.gate_sup_enable and y_tf_sup is not None:
+            _g_sup = g_raw if self.gate_sup_on == "raw" else g_eff
+            _g_sup_clip = _g_sup[..., :-1].clamp(1e-6, 1.0 - 1e-6)  # (B,C,F,T-1)
+            if self.gate_sup_loss == "bce":
+                _bce = self._weighted_bce(_g_sup_clip, y_tf_sup, self.gate_sup_pos_weight)
+            else:  # "focal"
+                _bce = self._focal_bce(
+                    _g_sup_clip, y_tf_sup, 0.25, 2.0, self.gate_sup_pos_weight
+                )
+            _bce_scalar = _bce.item()
+            L_sup = _bce * self.gate_sup_weight
+        self._last_L_sup_tensor = L_sup  # stored with grad for loss() aggregation
 
         # keep effective gate for debugging (reflects actual decomposition used)
         self._last_gate = g_eff
@@ -708,6 +852,36 @@ class LocalTFNorm(nn.Module):
         self._last_inst_std = inst_std.detach() if inst_std is not None else None
         self._last_pred_n_tf = pred_n_tf.detach() if pred_n_tf is not None else None
         self._last_pred_n_time = pred_n_time.detach() if pred_n_time is not None else None
+
+        # 1.8: Update gate supervision diagnostic caches
+        with torch.no_grad():
+            _sr, _se, _sm, _st = self._freq_stats(g_raw)
+            self._dbg_graw_stdF = _sr
+            self._dbg_graw_entF = _se
+            self._dbg_graw_maxF_meanF = _sm
+            self._dbg_graw_topk_mass = _st
+
+            _sr, _se, _sm, _st = self._freq_stats(g_eff)
+            self._dbg_geff_stdF = _sr
+            self._dbg_geff_entF = _se
+            self._dbg_geff_maxF_meanF = _sm
+            self._dbg_geff_topk_mass = _st
+
+            if trig_tf_sup is not None:
+                _g_sup_d = (g_raw if self.gate_sup_on == "raw" else g_eff).detach().float()
+                _g_sup_d_clip = _g_sup_d[..., :-1]  # (B,C,F,T-1)
+                _pos = _g_sup_d_clip[trig_tf_sup]
+                _neg = _g_sup_d_clip[~trig_tf_sup]
+                self._dbg_sup_pos_mean = (
+                    float(_pos.mean().item()) if _pos.numel() > 0 else float("nan")
+                )
+                self._dbg_sup_neg_mean = (
+                    float(_neg.mean().item()) if _neg.numel() > 0 else float("nan")
+                )
+                self._dbg_sup_pos_neg_ratio = self._dbg_sup_pos_mean / (
+                    self._dbg_sup_neg_mean + 1e-8
+                )
+            self._dbg_sup_bce = _bce_scalar
 
         if return_state:
             return residual, state
@@ -792,12 +966,17 @@ class LocalTFNorm(nn.Module):
 
         L_stat = self.lambda_E * L_E + self.lambda_P * L_P
 
-        # Cache scalar values for logging (detached)
+        # Cache scalar values for logging (detached; stationarity only, not including L_sup)
         self._last_L_E = float(L_E.detach().cpu().item())
         self._last_L_P = float(L_P.detach().cpu().item())
         self._last_stationarity_loss = float(L_stat.detach().cpu().item())
 
-        return L_stat
+        # 1.7.7 / 1.9: Add gate supervision loss (computed in normalize(), stored with grad)
+        L_total = L_stat
+        if self._last_L_sup_tensor is not None:
+            L_total = L_total + self._last_L_sup_tensor
+
+        return L_total
 
     def loss_with_target(self, true: torch.Tensor) -> torch.Tensor:
         """Stationarity loss only — no predictor supervision."""

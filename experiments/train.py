@@ -409,6 +409,13 @@ class TrainConfig:
     delta_P_mask: float = 0.0
     shape_loss_mode: str = "meanF"
     trigger_mask_mode: str = "time"
+    gate_sup_enable: bool = True
+    gate_sup_weight: float = 0.2
+    gate_sup_tau: float = 0.3
+    gate_sup_loss: str = "bce"
+    gate_sup_pos_weight: float = 5.0
+    gate_sup_on: str = "raw"
+    gate_sup_target: str = "soft"
 
 
 def _next_power_of_two(n: int) -> int:
@@ -471,6 +478,13 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             delta_P_mask=cfg.delta_P_mask,
             shape_loss_mode=cfg.shape_loss_mode,
             trigger_mask_mode=cfg.trigger_mask_mode,
+            gate_sup_enable=cfg.gate_sup_enable,
+            gate_sup_weight=cfg.gate_sup_weight,
+            gate_sup_tau=cfg.gate_sup_tau,
+            gate_sup_loss=cfg.gate_sup_loss,
+            gate_sup_pos_weight=cfg.gate_sup_pos_weight,
+            gate_sup_on=cfg.gate_sup_on,
+            gate_sup_target=cfg.gate_sup_target,
         )
     label_len = cfg.label_len or (cfg.window // 2)
     label_len = min(label_len, cfg.window)
@@ -965,6 +979,37 @@ def collect_and_print_debug(
         f" maxF_meanF={_gq_ratio:.4f}"
         f" corr_mag={_gq_corr:.4f}"
     )
+
+    # ------------------------------------------------------------------ GRAW / GEFF / GSUP
+    if nm is not None:
+        _graw_stdF = float(getattr(nm, "_dbg_graw_stdF", nan))
+        _graw_entF = float(getattr(nm, "_dbg_graw_entF", nan))
+        _graw_maxF = float(getattr(nm, "_dbg_graw_maxF_meanF", nan))
+        _graw_topk = float(getattr(nm, "_dbg_graw_topk_mass", nan))
+        _geff_stdF = float(getattr(nm, "_dbg_geff_stdF", nan))
+        _geff_entF = float(getattr(nm, "_dbg_geff_entF", nan))
+        _geff_maxF = float(getattr(nm, "_dbg_geff_maxF_meanF", nan))
+        _geff_topk = float(getattr(nm, "_dbg_geff_topk_mass", nan))
+        _sup_bce = float(getattr(nm, "_dbg_sup_bce", nan))
+        _sup_pos = float(getattr(nm, "_dbg_sup_pos_mean", nan))
+        _sup_neg = float(getattr(nm, "_dbg_sup_neg_mean", nan))
+        _sup_ratio = float(getattr(nm, "_dbg_sup_pos_neg_ratio", nan))
+        print(
+            f"[{prefix}][GRAW]"
+            f" stdF={_graw_stdF:.4f} entF={_graw_entF:.4f}"
+            f" maxF_meanF={_graw_maxF:.4f} topk_mass={_graw_topk:.4f}"
+        )
+        print(
+            f"[{prefix}][GEFF]"
+            f" stdF={_geff_stdF:.4f} entF={_geff_entF:.4f}"
+            f" maxF_meanF={_geff_maxF:.4f} topk_mass={_geff_topk:.4f}"
+        )
+        print(
+            f"[{prefix}][GSUP]"
+            f" bce={_sup_bce:.6f}"
+            f" pos_mean={_sup_pos:.6f} neg_mean={_sup_neg:.6f}"
+            f" pos_neg_ratio={_sup_ratio:.4f}"
+        )
 
 
 def _aux_scale(cfg: TrainConfig, epoch_idx: int) -> float:
