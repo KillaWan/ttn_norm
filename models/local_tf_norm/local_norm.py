@@ -143,6 +143,8 @@ class LocalTFNorm(nn.Module):
         gate_sup_pos_weight: float = 5.0,
         gate_sup_on: str = "raw",
         gate_sup_target: str = "soft",
+        gate_sup_source: str = "P_only",
+        gate_sup_wE: float = 0.0,
         **kwargs,
     ):
         super().__init__()
@@ -156,6 +158,10 @@ class LocalTFNorm(nn.Module):
             raise ValueError(f"gate_sup_on must be 'raw' or 'eff', got {gate_sup_on!r}")
         if gate_sup_target not in ("soft", "hard"):
             raise ValueError(f"gate_sup_target must be 'soft' or 'hard', got {gate_sup_target!r}")
+        if gate_sup_source not in ("P_only", "EP_max"):
+            raise ValueError(f"gate_sup_source must be 'P_only' or 'EP_max', got {gate_sup_source!r}")
+        if gate_sup_wE < 0:
+            raise ValueError(f"gate_sup_wE must be >= 0, got {gate_sup_wE}")
         self.shape_loss_mode = shape_loss_mode
         self.trigger_mask_mode = trigger_mask_mode
         self.seq_len = seq_len
@@ -194,6 +200,8 @@ class LocalTFNorm(nn.Module):
         self.gate_sup_pos_weight = float(gate_sup_pos_weight)
         self.gate_sup_on = gate_sup_on
         self.gate_sup_target = gate_sup_target
+        self.gate_sup_source = gate_sup_source
+        self.gate_sup_wE = float(gate_sup_wE)
 
         if n_fft is None:
             n_fft = min(64, max(16, seq_len // 4))
@@ -308,6 +316,9 @@ class LocalTFNorm(nn.Module):
         self._dbg_sup_neg_mean: float = float("nan")
         self._dbg_sup_pos_neg_ratio: float = float("nan")
         self._dbg_sup_bce: float = float("nan")
+        self._dbg_sup_pos_rate: float = float("nan")
+        self._dbg_sup_mixed_rate: float = float("nan")
+        self._dbg_sup_y_stdF: float = float("nan")
 
         # Gate supervision loss tensor (with grad) for loss() aggregation
         self._last_L_sup_tensor: Optional[torch.Tensor] = None
@@ -557,9 +568,12 @@ class LocalTFNorm(nn.Module):
             y_tf:    (B, C, F, T-1)  supervision target in [0, 1]
             trig_tf: (B, C, F, T-1)  boolean trigger mask (s > 1)
         """
-        sE = dE_x.unsqueeze(2) / (de_thr + 1e-8)   # (B, C, 1, T-1) → broadcast over F
         sP = dP_f_x / (dp_thr + 1e-8)               # (B, C, F, T-1)
-        s = torch.maximum(sE, sP)                    # (B, C, F, T-1)
+        if self.gate_sup_source == "P_only":
+            s = sP
+        else:  # "EP_max"
+            sE = dE_x.unsqueeze(2) / (de_thr + 1e-8)  # (B, C, 1, T-1) → broadcast over F
+            s = torch.maximum(self.gate_sup_wE * sE, sP)  # (B, C, F, T-1)
         trig_tf = s > 1.0                            # (B, C, F, T-1) bool
         if self.gate_sup_target == "hard":
             y_tf = trig_tf.float()
@@ -608,18 +622,23 @@ class LocalTFNorm(nn.Module):
         x_tf = self.stft(batch_x)
         gate_magnitude = self._compute_gate_magnitude(x_tf)
         g_local = self.gate(gate_magnitude)
-        g_raw = g_local  # 1.6.1: always the pre-mask gate output
+        g_raw = g_local  # always the pre-mask gate output
 
-        # Supervision targets (populated inside trigger_mask branch, else None)
+        # Always compute x_tf change statistics (needed for trigger mask and/or supervision)
+        with torch.no_grad():
+            dE_x, dP_mean_x = self._dE_dP_from_tf(x_tf)
+            dP_f_x, _ = self._dP_mean_and_perF(x_tf)
+
+        # Default supervision thresholds (overwritten inside trigger_mask block)
+        _sup_de: float = max(float(self.delta_E), 1e-8)
+        _sup_dp: float = max(float(self.delta_P), 1e-8)
+
+        # Supervision targets — computed unconditionally after the if/else block
         y_tf_sup: Optional[torch.Tensor] = None
         trig_tf_sup: Optional[torch.Tensor] = None
 
         # Trigger mask: restrict effective gate to boundary frames only
         if self.trigger_mask:
-            with torch.no_grad():
-                dE_x, dP_mean_x = self._dE_dP_from_tf(x_tf)
-                # Always compute dP_f_x for gate supervision targets (1.5)
-                dP_f_x, _ = self._dP_mean_and_perF(x_tf)
             de = self.delta_E_mask if self.delta_E_mask > 0.0 else self.delta_E
             dp = self.delta_P_mask if self.delta_P_mask > 0.0 else self.delta_P
             if de <= 0.0 or dp <= 0.0:
@@ -627,6 +646,8 @@ class LocalTFNorm(nn.Module):
                     "trigger_mask enabled but delta_E_mask/delta_P_mask not set; "
                     "run calibration or set manually"
                 )
+            _sup_de = de
+            _sup_dp = dp
             B_sz, C_sz, F_sz, T = x_tf.shape[0], x_tf.shape[1], x_tf.shape[2], x_tf.shape[-1]
             self._last_mask_delta_E = float(de)
             self._last_mask_delta_P = float(dp)
@@ -756,11 +777,6 @@ class LocalTFNorm(nn.Module):
                 self._last_mask_min_rate_cov99 = float("nan")
                 self._last_mask_min_rate_cov995 = float("nan")
 
-            # 1.5: Always build supervision targets regardless of trigger_mask_mode
-            with torch.no_grad():
-                y_tf_sup, trig_tf_sup = self._gate_sup_target_from_stats(
-                    dE_x, dP_f_x, de, dp
-                )
         else:
             g_eff = g_local
             self._last_trigger_mask_t = None
@@ -776,12 +792,23 @@ class LocalTFNorm(nn.Module):
             self._last_mask_rate_tf = float("nan")
             self._last_mask_trig_rate_tf = float("nan")
 
-        # 1.7: Gate supervision loss
+        # Always build supervision targets unconditionally (1.4)
+        with torch.no_grad():
+            y_tf_sup, trig_tf_sup = self._gate_sup_target_from_stats(
+                dE_x, dP_f_x, _sup_de, _sup_dp
+            )
+            # 1.6: New diagnostics — pos_rate, mixed_rate, y_stdF
+            self._dbg_sup_pos_rate = float(trig_tf_sup.float().mean().item())
+            _mixed = trig_tf_sup.any(dim=2) & (~trig_tf_sup.all(dim=2))  # (B,C,T-1)
+            self._dbg_sup_mixed_rate = float(_mixed.float().mean().item())
+            self._dbg_sup_y_stdF = float(y_tf_sup.std(dim=2).mean().item())
+
+        # Gate supervision loss
         _bce_scalar = float("nan")
         L_sup = torch.tensor(0.0, device=x_tf.device)
-        if self.gate_sup_enable and y_tf_sup is not None:
+        if self.gate_sup_enable:
             _g_sup = g_raw if self.gate_sup_on == "raw" else g_eff
-            _g_sup_clip = _g_sup[..., :-1].clamp(1e-6, 1.0 - 1e-6)  # (B,C,F,T-1)
+            _g_sup_clip = _g_sup[..., 1:].clamp(1e-6, 1.0 - 1e-6)  # (B,C,F,T-1)
             if self.gate_sup_loss == "bce":
                 _bce = self._weighted_bce(_g_sup_clip, y_tf_sup, self.gate_sup_pos_weight)
             else:  # "focal"
@@ -867,17 +894,19 @@ class LocalTFNorm(nn.Module):
             self._dbg_geff_maxF_meanF = _sm
             self._dbg_geff_topk_mass = _st
 
-            if trig_tf_sup is not None:
-                _g_sup_d = (g_raw if self.gate_sup_on == "raw" else g_eff).detach().float()
-                _g_sup_d_clip = _g_sup_d[..., :-1]  # (B,C,F,T-1)
+            _g_sup_d = (g_raw if self.gate_sup_on == "raw" else g_eff).detach().float()
+            _g_sup_d_clip = _g_sup_d[..., 1:]  # (B,C,F,T-1) — aligned with g_sup[...,1:]
+            _n_pos = int(trig_tf_sup.sum().item())
+            _n_neg = int((~trig_tf_sup).sum().item())
+            if _n_pos == 0 or _n_neg == 0:
+                self._dbg_sup_pos_mean = float("nan")
+                self._dbg_sup_neg_mean = float("nan")
+                self._dbg_sup_pos_neg_ratio = float("nan")
+            else:
                 _pos = _g_sup_d_clip[trig_tf_sup]
                 _neg = _g_sup_d_clip[~trig_tf_sup]
-                self._dbg_sup_pos_mean = (
-                    float(_pos.mean().item()) if _pos.numel() > 0 else float("nan")
-                )
-                self._dbg_sup_neg_mean = (
-                    float(_neg.mean().item()) if _neg.numel() > 0 else float("nan")
-                )
+                self._dbg_sup_pos_mean = float(_pos.mean().item())
+                self._dbg_sup_neg_mean = float(_neg.mean().item())
                 self._dbg_sup_pos_neg_ratio = self._dbg_sup_pos_mean / (
                     self._dbg_sup_neg_mean + 1e-8
                 )

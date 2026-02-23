@@ -417,6 +417,8 @@ class TrainConfig:
     gate_sup_pos_weight: float = 5.0
     gate_sup_on: str = "raw"
     gate_sup_target: str = "soft"
+    gate_sup_source: str = "P_only"
+    gate_sup_wE: float = 0.0
 
     # ------------------------------------------------------------------ baseline norm configs
     # RevIN
@@ -528,6 +530,8 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             gate_sup_pos_weight=cfg.gate_sup_pos_weight,
             gate_sup_on=cfg.gate_sup_on,
             gate_sup_target=cfg.gate_sup_target,
+            gate_sup_source=cfg.gate_sup_source,
+            gate_sup_wE=cfg.gate_sup_wE,
         )
     label_len = cfg.label_len or (cfg.window // 2)
     label_len = min(label_len, cfg.window)
@@ -1047,11 +1051,17 @@ def collect_and_print_debug(
             f" stdF={_geff_stdF:.4f} entF={_geff_entF:.4f}"
             f" maxF_meanF={_geff_maxF:.4f} topk_mass={_geff_topk:.4f}"
         )
+        _sup_pos_rate = float(getattr(nm, "_dbg_sup_pos_rate", nan))
+        _sup_mixed_rate = float(getattr(nm, "_dbg_sup_mixed_rate", nan))
+        _sup_y_stdF = float(getattr(nm, "_dbg_sup_y_stdF", nan))
         print(
             f"[{prefix}][GSUP]"
             f" bce={_sup_bce:.6f}"
             f" pos_mean={_sup_pos:.6f} neg_mean={_sup_neg:.6f}"
             f" pos_neg_ratio={_sup_ratio:.4f}"
+            f" pos_rate={_sup_pos_rate:.4f}"
+            f" mixed_rate={_sup_mixed_rate:.4f}"
+            f" y_stdF={_sup_y_stdF:.4f}"
         )
 
 
