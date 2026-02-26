@@ -127,6 +127,96 @@ def _bc_standardize(x: torch.Tensor) -> torch.Tensor:
     return norm
 
 
+class LowRankProj(nn.Module):
+    """Low-rank TF gate projection.
+
+    Computes logits(f, t) = Σ_{k=1..r} u_k(t) · v_k(f) + optional a(t) + b(f).
+
+    u(t) is produced by a per-variable depthwise Conv1d applied to the time-marginal
+    of the STFT magnitude; v(f) comes from the freq-marginal.  v is L2-normalised
+    along the frequency axis to prevent u/v scale drift.
+
+    Args:
+        channels: number of input/output channels (C)
+        rank:     number of rank-1 components (r)
+        time_ks:  kernel size for the time-axis depthwise Conv1d
+        freq_ks:  kernel size for the freq-axis depthwise Conv1d
+        use_bias: if True, add learned a(t) and b(f) scalar-bias terms
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        rank: int = 4,
+        time_ks: int = 5,
+        freq_ks: int = 3,
+        use_bias: bool = True,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.rank = rank
+        self.use_bias = use_bias
+
+        # u: time-marginal (B, C, T) → (B, C*rank, T) via per-variable depthwise conv
+        self.u_conv = nn.Conv1d(
+            channels, channels * rank,
+            kernel_size=time_ks, padding=time_ks // 2,
+            groups=channels, bias=True,
+        )
+        # v: freq-marginal (B, C, F) → (B, C*rank, F)
+        self.v_conv = nn.Conv1d(
+            channels, channels * rank,
+            kernel_size=freq_ks, padding=freq_ks // 2,
+            groups=channels, bias=True,
+        )
+        if use_bias:
+            # a(t): time-varying scalar bias per variable
+            self.a_conv = nn.Conv1d(
+                channels, channels,
+                kernel_size=time_ks, padding=time_ks // 2,
+                groups=channels, bias=True,
+            )
+            # b(f): frequency scalar bias per variable
+            self.b_conv = nn.Conv1d(
+                channels, channels,
+                kernel_size=freq_ks, padding=freq_ks // 2,
+                groups=channels, bias=True,
+            )
+
+        # Diagnostic caches (last forward pass)
+        self._last_u: Optional[torch.Tensor] = None      # (B, C, rank, T) detached
+        self._last_u_raw: Optional[torch.Tensor] = None  # (B, C, rank, T) with grad
+
+    def forward(self, magnitude: torch.Tensor) -> torch.Tensor:
+        # magnitude: (B, C, F, T)
+        B, C, F, T = magnitude.shape
+        r = self.rank
+
+        # Time-marginal: average over F → (B, C, T)
+        m_t = magnitude.mean(dim=2)
+        # Freq-marginal: average over T → (B, C, F)
+        m_f = magnitude.mean(dim=3)
+
+        # u: (B, C, rank, T)
+        u = self.u_conv(m_t).reshape(B, C, r, T)
+        self._last_u_raw = u             # with grad for TV loss
+        self._last_u = u.detach()        # detached for diagnostics
+
+        # v: (B, C, rank, F), L2-normalised along F to decouple scale from u
+        v = self.v_conv(m_f).reshape(B, C, r, F)
+        v = torch.nn.functional.normalize(v, dim=3, eps=1e-6)
+
+        # Low-rank logits: Σ_k u_k(t) * v_k(f) → (B, C, F, T)
+        logits = torch.einsum('bckt,bckf->bcft', u, v)
+
+        if self.use_bias:
+            a = self.a_conv(m_t)   # (B, C, T)
+            b = self.b_conv(m_f)   # (B, C, F)
+            logits = logits + a.unsqueeze(2) + b.unsqueeze(3)
+
+        return logits
+
+
 class LocalTFGate(nn.Module):
     def __init__(
         self,
@@ -141,6 +231,11 @@ class LocalTFGate(nn.Module):
         gate_arch: str = "pointwise",
         gate_threshold_mode: str = "shift",
         ftsep5_feat_mode: str = "mdm",
+        # Low-rank gate params (used when gate_arch in {"lowrank", "lowrank_sparse"})
+        lowrank_rank: int = 4,
+        lowrank_time_ks: int = 5,
+        lowrank_freq_ks: int = 3,
+        lowrank_use_bias: bool = True,
     ):
         super().__init__()
         # Build projection depending on requested gate architecture
@@ -166,6 +261,23 @@ class LocalTFGate(nn.Module):
         elif gate_arch == "ftsep5":
             # TF-separable gate with per-variable time-diff features
             self.proj = FTSep5Proj(channels, h=8, feat_mode=ftsep5_feat_mode)
+        elif gate_arch == "lowrank":
+            self.proj = LowRankProj(
+                channels, rank=lowrank_rank,
+                time_ks=lowrank_time_ks, freq_ks=lowrank_freq_ks,
+                use_bias=lowrank_use_bias,
+            )
+        elif gate_arch == "lowrank_sparse":
+            self.proj = LowRankProj(
+                channels, rank=lowrank_rank,
+                time_ks=lowrank_time_ks, freq_ks=lowrank_freq_ks,
+                use_bias=lowrank_use_bias,
+            )
+            # Sparse residual: small 3×3 depthwise conv applied to magnitude
+            self.sparse_conv = nn.Conv2d(
+                channels, channels, kernel_size=3, padding=1,
+                groups=channels, bias=True,
+            )
         else:
             raise ValueError(f"Unsupported gate_arch: {gate_arch}")
         self.use_threshold = use_threshold
@@ -185,10 +297,21 @@ class LocalTFGate(nn.Module):
 
         # Diagnostic caches (detached, no grad)
         self._last_logits: Optional[torch.Tensor] = None
+        self._last_sparse_logits: Optional[torch.Tensor] = None  # detached, diagnostics
+        self._last_sparse_raw: Optional[torch.Tensor] = None     # with grad, for L1 loss
 
     def forward(self, magnitude: torch.Tensor) -> torch.Tensor:
         # magnitude: (B, C, F, TT)
         logits = self.proj(magnitude)
+        # For lowrank_sparse: add sparse residual and cache both versions
+        if self.gate_arch == "lowrank_sparse":
+            sparse = self.sparse_conv(magnitude)
+            self._last_sparse_raw = sparse             # with grad for L1 loss
+            self._last_sparse_logits = sparse.detach() # detached for diagnostics
+            logits = logits + sparse
+        else:
+            self._last_sparse_raw = None
+            self._last_sparse_logits = None
         # Cache raw logits (before threshold/temperature) for diagnostics
         self._last_logits = logits.detach()
         # Threshold handling: shift (subtract) or mask (suppress low logits)
@@ -242,3 +365,14 @@ class LocalTFGate(nn.Module):
 
         else:
             raise ValueError(f"Unsupported gate_mode: {self.gate_mode}")
+
+    def get_last_lowrank_u(self) -> Optional[torch.Tensor]:
+        """Return u(t) from the last forward() call (B, C, rank, T) detached, or None."""
+        proj = getattr(self, "proj", None)
+        if not isinstance(proj, LowRankProj):
+            return None
+        return proj._last_u
+
+    def get_last_sparse_logits(self) -> Optional[torch.Tensor]:
+        """Return sparse residual logits (B, C, F, T) detached from the last forward(), or None."""
+        return self._last_sparse_logits

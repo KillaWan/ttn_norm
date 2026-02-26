@@ -413,6 +413,13 @@ class TrainConfig:
     teacher_mask_only: bool = False
     n_pred_weight: float = 0.0
     n_pred_arch: str = "mlp"
+    # Low-rank gate hyperparams
+    gate_lowrank_rank: int = 4
+    gate_lowrank_time_ks: int = 5
+    gate_lowrank_freq_ks: int = 3
+    gate_lowrank_use_bias: bool = True
+    gate_sparse_l1_weight: float = 0.0
+    gate_lowrank_u_tv_weight: float = 0.0
 
     # ------------------------------------------------------------------ baseline norm configs
     # RevIN
@@ -519,6 +526,12 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             teacher_mask_only=cfg.teacher_mask_only,
             n_pred_weight=cfg.n_pred_weight,
             n_pred_arch=cfg.n_pred_arch,
+            gate_lowrank_rank=cfg.gate_lowrank_rank,
+            gate_lowrank_time_ks=cfg.gate_lowrank_time_ks,
+            gate_lowrank_freq_ks=cfg.gate_lowrank_freq_ks,
+            gate_lowrank_use_bias=cfg.gate_lowrank_use_bias,
+            gate_sparse_l1_weight=cfg.gate_sparse_l1_weight,
+            gate_lowrank_u_tv_weight=cfg.gate_lowrank_u_tv_weight,
         )
     label_len = cfg.label_len or (cfg.window // 2)
     label_len = min(label_len, cfg.window)
@@ -849,12 +862,15 @@ def collect_and_print_debug(
     L_w1 = aux_stats.get("L_w1", nan)
     L_min = aux_stats.get("L_min", nan)
     L_e_tv = aux_stats.get("L_e_tv", nan)
+    L_sparse = aux_stats.get("L_sparse", nan)
+    L_u_tv = aux_stats.get("L_u_tv", nan)
     print(
         f"[{prefix}][AUX]"
         f" aux_total={aux_total:.6e}"
         f" L_easy={L_easy:.6e} L_white={L_white:.6e}"
         f" L_js={L_js:.6e} L_w1={L_w1:.6e}"
         f" L_min={L_min:.6e} L_e_tv={L_e_tv:.6e}"
+        f" L_sparse={L_sparse:.6e} L_u_tv={L_u_tv:.6e}"
     )
 
     # ------------------------------------------------------------------ NRATIO
@@ -981,7 +997,7 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
     # Aux stats accumulators
     aux_stat_keys = ["aux_total", "L_easy", "L_white", "L_js", "L_w1", "L_min", "L_e_tv",
                      "ratio_n_bc_mean", "ratio_n_bc_min", "ratio_n_bc_max", "loss_n_ratio_budget",
-                     "pred_n_loss"]
+                     "pred_n_loss", "L_sparse", "L_u_tv"]
     aux_stat_vals: dict[str, list[float]] = {k: [] for k in aux_stat_keys}
 
     has_nm_aux = (
@@ -1119,7 +1135,7 @@ def evaluate(model, loader, cfg, scaler, debug_prefix: str | None = None):
     )
     aux_stat_keys = ["aux_total", "L_easy", "L_white", "L_js", "L_w1", "L_min", "L_e_tv",
                      "ratio_n_bc_mean", "ratio_n_bc_min", "ratio_n_bc_max", "loss_n_ratio_budget",
-                     "pred_n_loss"]
+                     "pred_n_loss", "L_sparse", "L_u_tv"]
     aux_stat_vals: dict[str, list[float]] = {k: [] for k in aux_stat_keys}
 
     first_batch_done = False
@@ -1249,6 +1265,16 @@ def main(argv: list[str] | None = None):
         raise ValueError("val_mse_ema_alpha must be in (0, 1].")
     if cfg.aux_loss_schedule not in {"none", "cosine"}:
         raise ValueError("aux_loss_schedule must be 'none' or 'cosine'.")
+    if cfg.gate_arch in ("lowrank", "lowrank_sparse"):
+        print(
+            f"[LowRankGate] gate_arch={cfg.gate_arch}"
+            f" rank={cfg.gate_lowrank_rank}"
+            f" time_ks={cfg.gate_lowrank_time_ks}"
+            f" freq_ks={cfg.gate_lowrank_freq_ks}"
+            f" use_bias={cfg.gate_lowrank_use_bias}"
+            f" sparse_l1_weight={cfg.gate_sparse_l1_weight}"
+            f" u_tv_weight={cfg.gate_lowrank_u_tv_weight}"
+        )
 
     best_val = float("inf")
     best_monitor = float("inf")
@@ -1288,7 +1314,9 @@ def main(argv: list[str] | None = None):
                     f" L_js={train_stat.get('L_js', 0.0):.3e}"
                     f" L_w1={train_stat.get('L_w1', 0.0):.3e}"
                     f" L_min={train_stat.get('L_min', 0.0):.3e}"
-                    f" L_e_tv={train_stat.get('L_e_tv', 0.0):.3e})"
+                    f" L_e_tv={train_stat.get('L_e_tv', 0.0):.3e}"
+                    f" L_sparse={train_stat.get('L_sparse', 0.0):.3e}"
+                    f" L_u_tv={train_stat.get('L_u_tv', 0.0):.3e})"
                 )
         val_stat_str = ""
         if "aux_total" in val_metrics:

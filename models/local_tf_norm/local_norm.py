@@ -53,6 +53,13 @@ class LocalTFNorm(nn.Module):
         trigger_soft: bool = True,
         trigger_soft_tau: float = 0.25,
         ftsep5_feat_mode: str = "mdm",
+        # Low-rank gate hyperparams
+        gate_lowrank_rank: int = 4,
+        gate_lowrank_time_ks: int = 5,
+        gate_lowrank_freq_ks: int = 3,
+        gate_lowrank_use_bias: bool = True,
+        gate_sparse_l1_weight: float = 0.0,
+        gate_lowrank_u_tv_weight: float = 0.0,
         # Aux loss hyperparams
         easy_ar_weight: float = 0.0,
         easy_ar_k: int = 8,
@@ -102,6 +109,18 @@ class LocalTFNorm(nn.Module):
                 f"Got n_ratio_min={n_ratio_min}, n_ratio_max={n_ratio_max}. "
                 f"Example: --n-ratio-min 0.05 --n-ratio-max 0.30 --n-ratio-weight 0.1 --n-ratio-power 2"
             )
+        if gate_arch in ("lowrank", "lowrank_sparse") and gate_lowrank_rank < 1:
+            raise ValueError(f"gate_lowrank_rank must be >= 1, got {gate_lowrank_rank}")
+        if gate_sparse_l1_weight > 0.0 and gate_arch != "lowrank_sparse":
+            raise ValueError(
+                f"gate_sparse_l1_weight > 0 requires gate_arch='lowrank_sparse', "
+                f"got gate_arch={gate_arch!r}"
+            )
+        if gate_lowrank_u_tv_weight > 0.0 and gate_arch not in ("lowrank", "lowrank_sparse"):
+            raise ValueError(
+                f"gate_lowrank_u_tv_weight > 0 requires gate_arch in ('lowrank', 'lowrank_sparse'), "
+                f"got gate_arch={gate_arch!r}"
+            )
 
         self.trigger_mask_mode = trigger_mask_mode
         self.seq_len = seq_len
@@ -123,6 +142,12 @@ class LocalTFNorm(nn.Module):
         self.trigger_soft = bool(trigger_soft)
         self.trigger_soft_tau = float(trigger_soft_tau)
         self.ftsep5_feat_mode = ftsep5_feat_mode
+        self.gate_lowrank_rank = int(gate_lowrank_rank)
+        self.gate_lowrank_time_ks = int(gate_lowrank_time_ks)
+        self.gate_lowrank_freq_ks = int(gate_lowrank_freq_ks)
+        self.gate_lowrank_use_bias = bool(gate_lowrank_use_bias)
+        self.gate_sparse_l1_weight = float(gate_sparse_l1_weight)
+        self.gate_lowrank_u_tv_weight = float(gate_lowrank_u_tv_weight)
 
         # Aux loss hyperparams
         self.easy_ar_weight = float(easy_ar_weight)
@@ -157,6 +182,10 @@ class LocalTFNorm(nn.Module):
             gate_arch=self.gate_arch,
             gate_threshold_mode=self.gate_threshold_mode,
             ftsep5_feat_mode=ftsep5_feat_mode,
+            lowrank_rank=gate_lowrank_rank,
+            lowrank_time_ks=gate_lowrank_time_ks,
+            lowrank_freq_ks=gate_lowrank_freq_ks,
+            lowrank_use_bias=gate_lowrank_use_bias,
         )
 
         # N_predictor: MLP or linear mapping n_hist (window) -> n_future (pred_len).
@@ -218,6 +247,8 @@ class LocalTFNorm(nn.Module):
         self._last_ratio_n_bc_max: float = 0.0
         self._last_loss_n_ratio_budget: float = 0.0
         self._last_pred_n_loss: float = 0.0
+        self._last_L_sparse: float = 0.0
+        self._last_L_u_tv: float = 0.0
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -696,6 +727,10 @@ class LocalTFNorm(nn.Module):
         # Reset pred_n_loss each call; training loop sets it after loss() if applicable
         self._last_pred_n_loss = 0.0
 
+        # Reset lowrank loss caches
+        self._last_L_sparse = 0.0
+        self._last_L_u_tv = 0.0
+
         if self._last_r_tf is None:
             self._last_aux_total = self._last_L_easy = self._last_L_white = 0.0
             self._last_L_js = self._last_L_w1 = self._last_L_min = self._last_L_e_tv = 0.0
@@ -805,6 +840,31 @@ class LocalTFNorm(nn.Module):
             self._last_ratio_n_bc_max = 0.0
             self._last_loss_n_ratio_budget = 0.0
 
+        # L_sparse: L1 of sparse residual logits (lowrank_sparse only)
+        if self.gate_sparse_l1_weight > 0.0:
+            sparse_raw = getattr(self.gate, "_last_sparse_raw", None)
+            if sparse_raw is not None:
+                L_sparse = sparse_raw.abs().mean()
+                aux_total = aux_total + self.gate_sparse_l1_weight * L_sparse
+                self._last_L_sparse = float(L_sparse.detach().item())
+            else:
+                self._last_L_sparse = 0.0
+        else:
+            self._last_L_sparse = 0.0
+
+        # L_u_tv: total-variation of u(t) along time (lowrank / lowrank_sparse)
+        if self.gate_lowrank_u_tv_weight > 0.0:
+            proj = getattr(self.gate, "proj", None)
+            u_raw = getattr(proj, "_last_u_raw", None)
+            if u_raw is not None and u_raw.shape[-1] > 1:
+                L_u_tv = u_raw[..., 1:].sub(u_raw[..., :-1]).abs().mean()
+                aux_total = aux_total + self.gate_lowrank_u_tv_weight * L_u_tv
+                self._last_L_u_tv = float(L_u_tv.detach().item())
+            else:
+                self._last_L_u_tv = 0.0
+        else:
+            self._last_L_u_tv = 0.0
+
         self._last_aux_total = float(aux_total.detach())
         return aux_total
 
@@ -823,6 +883,8 @@ class LocalTFNorm(nn.Module):
             "ratio_n_bc_max": self._last_ratio_n_bc_max,
             "loss_n_ratio_budget": self._last_loss_n_ratio_budget,
             "pred_n_loss": self._last_pred_n_loss,
+            "L_sparse": self._last_L_sparse,
+            "L_u_tv": self._last_L_u_tv,
         }
 
     def get_last_decomp_stats(self) -> dict[str, float]:
