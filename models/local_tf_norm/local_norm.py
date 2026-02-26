@@ -62,6 +62,10 @@ class LocalTFNorm(nn.Module):
         min_remove_weight: float = 0.0,
         min_remove_mode: str = "ntf_l2",
         energy_tv_weight: float = 0.0,
+        n_ratio_min: float = 0.0,
+        n_ratio_max: float = 0.0,
+        n_ratio_weight: float = 0.0,
+        n_ratio_power: int = 2,
         **kwargs,
     ):
         super().__init__()
@@ -78,6 +82,14 @@ class LocalTFNorm(nn.Module):
             raise ValueError(f"shape_weighting must be 'none' or 'trigger', got {shape_weighting!r}")
         if min_remove_mode not in ("ntf_l2", "ntf_l1", "g_l1"):
             raise ValueError(f"min_remove_mode must be 'ntf_l2', 'ntf_l1', or 'g_l1', got {min_remove_mode!r}")
+        if n_ratio_power not in (1, 2):
+            raise ValueError(f"n_ratio_power must be 1 or 2, got {n_ratio_power}")
+        if n_ratio_weight > 0.0 and (n_ratio_max <= 0.0 or n_ratio_max <= n_ratio_min):
+            raise ValueError(
+                f"n_ratio_weight > 0 requires n_ratio_max > 0 and n_ratio_max > n_ratio_min. "
+                f"Got n_ratio_min={n_ratio_min}, n_ratio_max={n_ratio_max}. "
+                f"Example: --n-ratio-min 0.05 --n-ratio-max 0.30 --n-ratio-weight 0.1 --n-ratio-power 2"
+            )
 
         self.trigger_mask_mode = trigger_mask_mode
         self.seq_len = seq_len
@@ -109,6 +121,10 @@ class LocalTFNorm(nn.Module):
         self.min_remove_weight = float(min_remove_weight)
         self.min_remove_mode = min_remove_mode
         self.energy_tv_weight = float(energy_tv_weight)
+        self.n_ratio_min = float(n_ratio_min)
+        self.n_ratio_max = float(n_ratio_max)
+        self.n_ratio_weight = float(n_ratio_weight)
+        self.n_ratio_power = int(n_ratio_power)
 
         if n_fft is None:
             n_fft = min(64, max(16, seq_len // 4))
@@ -158,6 +174,10 @@ class LocalTFNorm(nn.Module):
         self._last_L_w1: float = 0.0
         self._last_L_min: float = 0.0
         self._last_L_e_tv: float = 0.0
+        self._last_ratio_n_bc_mean: float = 0.0
+        self._last_ratio_n_bc_min: float = 0.0
+        self._last_ratio_n_bc_max: float = 0.0
+        self._last_loss_n_ratio_budget: float = 0.0
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -590,6 +610,42 @@ class LocalTFNorm(nn.Module):
         else:
             self._last_L_e_tv = 0.0
 
+        # L_n_ratio: hinge budget on per-(B,C) n/x energy ratio
+        if (
+            self.n_ratio_weight > 0.0
+            and self.n_ratio_max > 0.0
+            and self.n_ratio_max > self.n_ratio_min
+            and self._last_n_tf is not None
+            and self._last_x_tf is not None
+        ):
+            eps_ratio = 1e-8
+            # P_n keeps grad via _last_n_tf = g_eff * x_tf (computed in normalize())
+            P_n = self._last_n_tf.abs() ** 2                          # (B, C, F, T) w/ grad
+            # P_x uses the detached x_tf — denominator is treated as constant
+            P_x = self._last_x_tf.abs() ** 2                          # (B, C, F, T) detached
+            E_n = P_n.mean(dim=(2, 3))                                 # (B, C)
+            E_x = P_x.mean(dim=(2, 3))                                 # (B, C) detached
+            ratio_bc = E_n / (E_x + eps_ratio)                        # (B, C) w/ grad
+
+            low  = torch.relu(self.n_ratio_min - ratio_bc)
+            high = torch.relu(ratio_bc - self.n_ratio_max)
+            hinge = low + high
+            if self.n_ratio_power == 2:
+                loss_n_ratio_budget = (hinge ** 2).mean()
+            else:
+                loss_n_ratio_budget = hinge.mean()
+
+            aux_total = aux_total + self.n_ratio_weight * loss_n_ratio_budget
+            self._last_ratio_n_bc_mean = float(ratio_bc.detach().mean().item())
+            self._last_ratio_n_bc_min = float(ratio_bc.detach().min().item())
+            self._last_ratio_n_bc_max = float(ratio_bc.detach().max().item())
+            self._last_loss_n_ratio_budget = float(loss_n_ratio_budget.detach().item())
+        else:
+            self._last_ratio_n_bc_mean = 0.0
+            self._last_ratio_n_bc_min = 0.0
+            self._last_ratio_n_bc_max = 0.0
+            self._last_loss_n_ratio_budget = 0.0
+
         self._last_aux_total = float(aux_total.detach())
         return aux_total
 
@@ -603,6 +659,10 @@ class LocalTFNorm(nn.Module):
             "L_w1": self._last_L_w1,
             "L_min": self._last_L_min,
             "L_e_tv": self._last_L_e_tv,
+            "ratio_n_bc_mean": self._last_ratio_n_bc_mean,
+            "ratio_n_bc_min": self._last_ratio_n_bc_min,
+            "ratio_n_bc_max": self._last_ratio_n_bc_max,
+            "loss_n_ratio_budget": self._last_loss_n_ratio_budget,
         }
 
     def get_last_decomp_stats(self) -> dict[str, float]:

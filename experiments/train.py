@@ -405,6 +405,10 @@ class TrainConfig:
     min_remove_weight: float = 0.0
     min_remove_mode: str = "ntf_l2"
     energy_tv_weight: float = 0.0
+    n_ratio_min: float = 0.0
+    n_ratio_max: float = 0.0
+    n_ratio_weight: float = 0.0
+    n_ratio_power: int = 2
 
     # ------------------------------------------------------------------ baseline norm configs
     # RevIN
@@ -504,6 +508,10 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             min_remove_weight=cfg.min_remove_weight,
             min_remove_mode=cfg.min_remove_mode,
             energy_tv_weight=cfg.energy_tv_weight,
+            n_ratio_min=cfg.n_ratio_min,
+            n_ratio_max=cfg.n_ratio_max,
+            n_ratio_weight=cfg.n_ratio_weight,
+            n_ratio_power=cfg.n_ratio_power,
         )
     label_len = cfg.label_len or (cfg.window // 2)
     label_len = min(label_len, cfg.window)
@@ -842,6 +850,19 @@ def collect_and_print_debug(
         f" L_min={L_min:.6e} L_e_tv={L_e_tv:.6e}"
     )
 
+    # ------------------------------------------------------------------ NRATIO
+    ratio_n_bc_mean = aux_stats.get("ratio_n_bc_mean", nan)
+    ratio_n_bc_min  = aux_stats.get("ratio_n_bc_min",  nan)
+    ratio_n_bc_max  = aux_stats.get("ratio_n_bc_max",  nan)
+    loss_n_ratio_budget = aux_stats.get("loss_n_ratio_budget", nan)
+    print(
+        f"[{prefix}][NRATIO]"
+        f" ratio_budget_mean={ratio_n_bc_mean:.4f}"
+        f" ratio_budget_min={ratio_n_bc_min:.4f}"
+        f" ratio_budget_max={ratio_n_bc_max:.4f}"
+        f" loss_n_ratio_budget={loss_n_ratio_budget:.6e}"
+    )
+
     # ------------------------------------------------------------------ GRAD
     gi = grad_info or {}
     print(
@@ -917,7 +938,8 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
     task_losses = []
     aux_losses = []
     # Aux stats accumulators
-    aux_stat_keys = ["aux_total", "L_easy", "L_white", "L_js", "L_w1", "L_min", "L_e_tv"]
+    aux_stat_keys = ["aux_total", "L_easy", "L_white", "L_js", "L_w1", "L_min", "L_e_tv",
+                     "ratio_n_bc_mean", "ratio_n_bc_min", "ratio_n_bc_max", "loss_n_ratio_budget"]
     aux_stat_vals: dict[str, list[float]] = {k: [] for k in aux_stat_keys}
 
     has_nm_aux = (
@@ -1038,7 +1060,8 @@ def evaluate(model, loader, cfg, scaler, debug_prefix: str | None = None):
         and hasattr(model.nm, "loss")
         and hasattr(model.nm, "get_last_aux_stats")
     )
-    aux_stat_keys = ["aux_total", "L_easy", "L_white", "L_js", "L_w1", "L_min", "L_e_tv"]
+    aux_stat_keys = ["aux_total", "L_easy", "L_white", "L_js", "L_w1", "L_min", "L_e_tv",
+                     "ratio_n_bc_mean", "ratio_n_bc_min", "ratio_n_bc_max", "loss_n_ratio_budget"]
     aux_stat_vals: dict[str, list[float]] = {k: [] for k in aux_stat_keys}
 
     first_batch_done = False
