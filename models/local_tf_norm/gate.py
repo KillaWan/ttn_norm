@@ -186,16 +186,23 @@ class LowRankProj(nn.Module):
         # Diagnostic caches (last forward pass)
         self._last_u: Optional[torch.Tensor] = None      # (B, C, rank, T) detached
         self._last_u_raw: Optional[torch.Tensor] = None  # (B, C, rank, T) with grad
+        self._last_mag_mean: float = 0.0
+        self._last_mag_std: float = 0.0
 
     def forward(self, magnitude: torch.Tensor) -> torch.Tensor:
         # magnitude: (B, C, F, T)
         B, C, F, T = magnitude.shape
         r = self.rank
 
+        # Per-(B,C) standardization across (F,T) for scale-stable inputs
+        mag = _bc_standardize(magnitude)
+        self._last_mag_mean = float(mag.detach().mean().item())
+        self._last_mag_std = float(mag.detach().std(unbiased=False).item())
+
         # Time-marginal: average over F → (B, C, T)
-        m_t = magnitude.mean(dim=2)
+        m_t = mag.mean(dim=2)
         # Freq-marginal: average over T → (B, C, F)
-        m_f = magnitude.mean(dim=3)
+        m_f = mag.mean(dim=3)
 
         # u: (B, C, rank, T)
         u = self.u_conv(m_t).reshape(B, C, r, T)

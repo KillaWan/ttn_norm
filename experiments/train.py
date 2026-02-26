@@ -1265,6 +1265,16 @@ def main(argv: list[str] | None = None):
         raise ValueError("val_mse_ema_alpha must be in (0, 1].")
     if cfg.aux_loss_schedule not in {"none", "cosine"}:
         raise ValueError("aux_loss_schedule must be 'none' or 'cosine'.")
+    if cfg.gate_arch == "lowrank_sparse" and cfg.gate_sparse_l1_weight <= 0:
+        raise ValueError(
+            "gate_arch=lowrank_sparse requires --gate-sparse-l1-weight > 0 "
+            "to keep sparse residual constrained. Set e.g. 1e-3."
+        )
+    if cfg.gate_lowrank_time_ks % 2 == 0 or cfg.gate_lowrank_freq_ks % 2 == 0:
+        raise ValueError(
+            f"gate_lowrank_time_ks and gate_lowrank_freq_ks must be odd for symmetric padding. "
+            f"Got time_ks={cfg.gate_lowrank_time_ks}, freq_ks={cfg.gate_lowrank_freq_ks}."
+        )
     if cfg.gate_arch in ("lowrank", "lowrank_sparse"):
         print(
             f"[LowRankGate] gate_arch={cfg.gate_arch}"
