@@ -38,7 +38,10 @@ class LocalTFNorm(nn.Module):
         gate_arch: str = "pointwise",
         gate_threshold_mode: str = "shift",
         gate_use_log_mag: Optional[bool] = None,
-        future_mode: str = "repeat_last",
+        future_mode: str = "repeat_last",   # also accepts "pred"
+        teacher_mask_only: bool = False,
+        n_pred_weight: float = 0.0,
+        n_pred_arch: str = "mlp",
         gate_threshold: float = 0.0,
         gate_temperature: float = 1.0,
         use_instance_norm: bool = True,
@@ -70,8 +73,17 @@ class LocalTFNorm(nn.Module):
     ):
         super().__init__()
 
-        if future_mode not in ("repeat_last", "zero"):
-            raise ValueError(f"future_mode must be 'repeat_last' or 'zero', got {future_mode!r}")
+        if future_mode not in ("repeat_last", "zero", "pred"):
+            raise ValueError(f"future_mode must be 'repeat_last', 'zero', or 'pred', got {future_mode!r}")
+        if future_mode == "pred" and n_pred_weight <= 0.0:
+            raise ValueError(
+                "future_mode='pred' requires n_pred_weight > 0. "
+                "Example: --future-mode pred --n-pred-weight 1.0"
+            )
+        if n_pred_arch not in ("linear", "mlp"):
+            raise ValueError(f"n_pred_arch must be 'linear' or 'mlp', got {n_pred_arch!r}")
+        if teacher_mask_only and not trigger_mask:
+            raise ValueError("teacher_mask_only=True requires trigger_mask=True")
         if trigger_mask_mode not in ("time", "tf"):
             raise ValueError(f"trigger_mask_mode must be 'time' or 'tf', got {trigger_mask_mode!r}")
         if trigger_soft_tau <= 0:
@@ -101,6 +113,9 @@ class LocalTFNorm(nn.Module):
         self.gate_threshold_mode = gate_threshold_mode
         self.gate_use_log_mag = gate_use_log_mag
         self.future_mode = future_mode
+        self.teacher_mask_only = bool(teacher_mask_only)
+        self.n_pred_weight = float(n_pred_weight)
+        self.n_pred_arch = n_pred_arch
         self.eps_E = float(eps_E)
         self.trigger_mask = bool(trigger_mask)
         self.delta_E_mask = float(delta_E_mask)
@@ -144,6 +159,21 @@ class LocalTFNorm(nn.Module):
             ftsep5_feat_mode=ftsep5_feat_mode,
         )
 
+        # N_predictor: MLP or linear mapping n_hist (window) -> n_future (pred_len).
+        # Created only when future_mode=="pred"; input shape (B, C, window).
+        if future_mode == "pred":
+            hidden = max(128, seq_len)
+            if n_pred_arch == "mlp":
+                self.n_predictor: Optional[nn.Module] = nn.Sequential(
+                    nn.Linear(seq_len, hidden),
+                    nn.GELU(),
+                    nn.Linear(hidden, pred_len),
+                )
+            else:  # "linear"
+                self.n_predictor = nn.Linear(seq_len, pred_len)
+        else:
+            self.n_predictor = None
+
         # Gate scalar stats (for get_last_gate_stats)
         self._last_gate_mean = 0.0
         self._last_gate_sum_f = 0.0
@@ -165,6 +195,9 @@ class LocalTFNorm(nn.Module):
         self._last_w_frame: Optional[torch.Tensor] = None # (B,C,T) or (B,C,F,T)
         self._last_x_time: Optional[torch.Tensor] = None  # (B, T, C) after RevIN
         self._last_g_raw: Optional[torch.Tensor] = None   # (B, C, F, T)
+        # N-predictor caches
+        self._last_n_hist_time: Optional[torch.Tensor] = None   # (B, C, window) detached
+        self._last_n_pred_future: Optional[torch.Tensor] = None # (B, C, pred_len) w/ grad
 
         # Aux loss scalar caches (detached, for logging)
         self._last_aux_total: float = 0.0
@@ -178,6 +211,7 @@ class LocalTFNorm(nn.Module):
         self._last_ratio_n_bc_min: float = 0.0
         self._last_ratio_n_bc_max: float = 0.0
         self._last_loss_n_ratio_budget: float = 0.0
+        self._last_pred_n_loss: float = 0.0
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -448,7 +482,10 @@ class LocalTFNorm(nn.Module):
                 w_frame = torch.zeros(B, C, T, device=x_tf.device, dtype=w_trans.dtype)
                 w_frame[..., :-1] = torch.maximum(w_frame[..., :-1], w_trans)
                 w_frame[..., 1:] = torch.maximum(w_frame[..., 1:], w_trans)
-                g_eff = g_raw * w_frame.unsqueeze(2)                # (B, C, F, T)
+                if self.teacher_mask_only:
+                    g_eff = w_frame.unsqueeze(2)                    # (B, C, 1, T) broadcasts
+                else:
+                    g_eff = g_raw * w_frame.unsqueeze(2)            # (B, C, F, T)
             else:  # "tf"
                 sE_tf = dE_x / (de + 1e-8)                         # (B, C, T-1)
                 sP_tf = dP_f_x / (dp + 1e-8)                       # (B, C, F, T-1)
@@ -460,7 +497,10 @@ class LocalTFNorm(nn.Module):
                 w_frame = torch.zeros(B, C, F, T, device=x_tf.device, dtype=w_trans.dtype)
                 w_frame[..., :-1] = torch.maximum(w_frame[..., :-1], w_trans)
                 w_frame[..., 1:] = torch.maximum(w_frame[..., 1:], w_trans)
-                g_eff = g_raw * w_frame                             # (B, C, F, T)
+                if self.teacher_mask_only:
+                    g_eff = w_frame                                 # (B, C, F, T) pure mask
+                else:
+                    g_eff = g_raw * w_frame                         # (B, C, F, T)
         else:
             g_eff = g_raw
             w_trans = None
@@ -474,8 +514,12 @@ class LocalTFNorm(nn.Module):
         residual = self.stft.inverse(r_tf, length=length)          # (B, T, C)
         n_time = self.stft.inverse(n_tf, length=length)            # (B, T, C)
 
-        # Gate scalar diagnostics
-        self._compute_gate_stats(g_eff)
+        # Cache N history for N_predictor (detached: no coupling back to gate)
+        if self.future_mode == "pred":
+            self._last_n_hist_time = n_time.detach().permute(0, 2, 1)  # (B, C, window)
+
+        # Gate scalar diagnostics (always from g_raw so stats reflect learnable gate)
+        self._compute_gate_stats(g_raw)
 
         state = LocalTFNormState(
             x_tf=x_tf,
@@ -514,7 +558,13 @@ class LocalTFNorm(nn.Module):
         if state is None:
             raise RuntimeError("LocalTFNorm denormalize requires a stored state.")
         target_len = batch_x.shape[1]
-        if target_len == state.length:
+        if self.future_mode == "pred" and self.n_predictor is not None:
+            # Use learned N_predictor to add back the predicted future N component
+            n_hist = self._last_n_hist_time              # (B, C, window) detached
+            n_pred_future = self.n_predictor(n_hist)     # (B, C, pred_len)
+            self._last_n_pred_future = n_pred_future
+            n_time = n_pred_future.transpose(1, 2)       # (B, pred_len, C)
+        elif target_len == state.length:
             n_time = state.n_time
         else:
             n_time = self._extrapolate_n_time(state.n_time, target_len)
@@ -523,6 +573,86 @@ class LocalTFNorm(nn.Module):
         if state.mean is not None and state.std is not None:
             result = result * state.std + state.mean
         return result
+
+    # ------------------------------------------------------------------
+    # N_predictor API
+    # ------------------------------------------------------------------
+
+    def get_last_n_pred_future(self) -> Optional[torch.Tensor]:
+        """Return the predicted N future from the last denormalize() call.
+
+        Returns (B, C, pred_len) with grad, or None if not in pred mode.
+        """
+        return self._last_n_pred_future
+
+    @torch.no_grad()
+    def teacher_n_future(
+        self, x_hist_raw: torch.Tensor, y_true_raw: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute ground-truth N future via teacher (trigger-mask) decomposition.
+
+        The computation mirrors normalize() but runs over the full history+future
+        window under no_grad, using history stats for instance norm.
+
+        Args:
+            x_hist_raw: (B, window, C) — in the same space as model input
+            y_true_raw: (B, pred_len, C) — ground-truth future in the same space
+
+        Returns:
+            (B, C, pred_len) N future in per-sample instance-normed space
+        """
+        x_full_raw = torch.cat([x_hist_raw, y_true_raw], dim=1)   # (B, window+pred_len, C)
+        full_len = x_full_raw.shape[1]
+
+        # Instance norm using HISTORY stats only (mirrors normalize())
+        if self.use_instance_norm:
+            inst_mean = x_hist_raw.mean(dim=1, keepdim=True)        # (B, 1, C)
+            inst_std  = x_hist_raw.std(dim=1, keepdim=True) + 1e-8  # (B, 1, C)
+            x_full = (x_full_raw - inst_mean) / inst_std
+        else:
+            x_full = x_full_raw
+
+        x_full_tf = self.stft(x_full)                               # (B, C, F, T_full)
+        B, C, F, T_full = x_full_tf.shape
+
+        if self.delta_E_mask <= 0.0 or self.delta_P_mask <= 0.0:
+            raise RuntimeError(
+                "teacher_n_future() requires delta_E_mask > 0 and delta_P_mask > 0"
+            )
+        de = self.delta_E_mask
+        dp = self.delta_P_mask
+
+        dE_full, dP_mean_full = self._dE_dP_from_tf(x_full_tf)    # (B, C, T_full-1)
+        if self.trigger_mask_mode == "tf":
+            dP_f_full, _ = self._dP_mean_and_perF(x_full_tf)      # (B, C, F, T_full-1)
+
+        if self.trigger_mask_mode == "time":
+            s_t = torch.maximum(dE_full / (de + 1e-8), dP_mean_full / (dp + 1e-8))
+            if self.trigger_soft:
+                w_trans = torch.sigmoid((s_t - 1.0) / self.trigger_soft_tau)
+            else:
+                w_trans = (s_t > 1.0).float()
+            w_frame = torch.zeros(B, C, T_full, device=x_full_tf.device, dtype=w_trans.dtype)
+            w_frame[..., :-1] = torch.maximum(w_frame[..., :-1], w_trans)
+            w_frame[..., 1:]  = torch.maximum(w_frame[..., 1:],  w_trans)
+            mask = w_frame.unsqueeze(2)                             # (B, C, 1, T_full)
+        else:  # "tf"
+            sE_tf = dE_full / (de + 1e-8)
+            sP_tf = dP_f_full / (dp + 1e-8)
+            s_tf  = torch.maximum(sE_tf.unsqueeze(2), sP_tf)      # (B, C, F, T_full-1)
+            if self.trigger_soft:
+                w_trans = torch.sigmoid((s_tf - 1.0) / self.trigger_soft_tau)
+            else:
+                w_trans = (s_tf > 1.0).float()
+            w_frame = torch.zeros(B, C, F, T_full, device=x_full_tf.device, dtype=w_trans.dtype)
+            w_frame[..., :-1] = torch.maximum(w_frame[..., :-1], w_trans)
+            w_frame[..., 1:]  = torch.maximum(w_frame[..., 1:],  w_trans)
+            mask = w_frame                                          # (B, C, F, T_full)
+
+        n_full_tf   = mask * x_full_tf                             # (B, C, F, T_full)
+        n_full_time = self.stft.inverse(n_full_tf, length=full_len) # (B, window+pred_len, C)
+        n_future_true = n_full_time[:, -self.pred_len:, :]         # (B, pred_len, C)
+        return n_future_true.permute(0, 2, 1)                      # (B, C, pred_len)
 
     # ------------------------------------------------------------------
     # Loss
@@ -536,6 +666,9 @@ class LocalTFNorm(nn.Module):
         """
         device = self._device()
         zero = torch.tensor(0.0, device=device)
+
+        # Reset pred_n_loss each call; training loop sets it after loss() if applicable
+        self._last_pred_n_loss = 0.0
 
         if self._last_r_tf is None:
             self._last_aux_total = self._last_L_easy = self._last_L_white = 0.0
@@ -663,6 +796,7 @@ class LocalTFNorm(nn.Module):
             "ratio_n_bc_min": self._last_ratio_n_bc_min,
             "ratio_n_bc_max": self._last_ratio_n_bc_max,
             "loss_n_ratio_budget": self._last_loss_n_ratio_budget,
+            "pred_n_loss": self._last_pred_n_loss,
         }
 
     def get_last_decomp_stats(self) -> dict[str, float]:

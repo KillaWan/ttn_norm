@@ -409,6 +409,10 @@ class TrainConfig:
     n_ratio_max: float = 0.0
     n_ratio_weight: float = 0.0
     n_ratio_power: int = 2
+    # N-predictor (teacher mask + add-back)
+    teacher_mask_only: bool = False
+    n_pred_weight: float = 0.0
+    n_pred_arch: str = "mlp"
 
     # ------------------------------------------------------------------ baseline norm configs
     # RevIN
@@ -512,6 +516,9 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             n_ratio_max=cfg.n_ratio_max,
             n_ratio_weight=cfg.n_ratio_weight,
             n_ratio_power=cfg.n_ratio_power,
+            teacher_mask_only=cfg.teacher_mask_only,
+            n_pred_weight=cfg.n_pred_weight,
+            n_pred_arch=cfg.n_pred_arch,
         )
     label_len = cfg.label_len or (cfg.window // 2)
     label_len = min(label_len, cfg.window)
@@ -863,6 +870,27 @@ def collect_and_print_debug(
         f" loss_n_ratio_budget={loss_n_ratio_budget:.6e}"
     )
 
+    # ------------------------------------------------------------------ NPRED
+    pred_n_loss_dbg = aux_stats.get("pred_n_loss", nan)
+    n_pred_fut = getattr(nm, "_last_n_pred_future", None) if nm is not None else None
+    n_hist_time = getattr(nm, "_last_n_hist_time", None) if nm is not None else None
+    n_true_ref  = getattr(nm, "_last_n_time", None) if nm is not None else None
+    x_ref       = getattr(nm, "_last_x_time", None) if nm is not None else None
+    ratio_n_pred = nan
+    ratio_n_true_pred = nan
+    if n_pred_fut is not None and x_ref is not None:
+        x_e = float(x_ref.pow(2).mean().item()) + eps
+        ratio_n_pred = float(n_pred_fut.detach().pow(2).mean().item()) / x_e
+    if n_hist_time is not None and x_ref is not None:
+        x_e = float(x_ref.pow(2).mean().item()) + eps
+        ratio_n_true_pred = float(n_hist_time.detach().pow(2).mean().item()) / x_e
+    print(
+        f"[{prefix}][NPRED]"
+        f" pred_n_loss={pred_n_loss_dbg:.6e}"
+        f" ratio_n_pred={ratio_n_pred:.4f}"
+        f" ratio_n_hist={ratio_n_true_pred:.4f}"
+    )
+
     # ------------------------------------------------------------------ GRAD
     gi = grad_info or {}
     print(
@@ -939,7 +967,8 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
     aux_losses = []
     # Aux stats accumulators
     aux_stat_keys = ["aux_total", "L_easy", "L_white", "L_js", "L_w1", "L_min", "L_e_tv",
-                     "ratio_n_bc_mean", "ratio_n_bc_min", "ratio_n_bc_max", "loss_n_ratio_budget"]
+                     "ratio_n_bc_mean", "ratio_n_bc_min", "ratio_n_bc_max", "loss_n_ratio_budget",
+                     "pred_n_loss"]
     aux_stat_vals: dict[str, list[float]] = {k: [] for k in aux_stat_keys}
 
     has_nm_aux = (
@@ -982,6 +1011,21 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
                 aux_loss = model.nm.loss(true)
 
             loss = task_loss + aux_loss * aux_scale
+
+            # pred_N_loss: hard term, NOT scaled by aux_loss_scale
+            if (
+                cfg.future_mode == "pred"
+                and cfg.n_pred_weight > 0.0
+                and hasattr(model, "nm")
+                and model.nm is not None
+                and hasattr(model.nm, "get_last_n_pred_future")
+            ):
+                n_pred_future = model.nm.get_last_n_pred_future()
+                if n_pred_future is not None:
+                    n_true_future = model.nm.teacher_n_future(batch_x, batch_y)
+                    pred_n_loss_t = ((n_pred_future - n_true_future) ** 2).mean()
+                    loss = loss + cfg.n_pred_weight * pred_n_loss_t
+                    model.nm._last_pred_n_loss = float(pred_n_loss_t.detach().item())
 
             # First-batch gradient collection
             if not first_batch_done:
@@ -1061,7 +1105,8 @@ def evaluate(model, loader, cfg, scaler, debug_prefix: str | None = None):
         and hasattr(model.nm, "get_last_aux_stats")
     )
     aux_stat_keys = ["aux_total", "L_easy", "L_white", "L_js", "L_w1", "L_min", "L_e_tv",
-                     "ratio_n_bc_mean", "ratio_n_bc_min", "ratio_n_bc_max", "loss_n_ratio_budget"]
+                     "ratio_n_bc_mean", "ratio_n_bc_min", "ratio_n_bc_max", "loss_n_ratio_budget",
+                     "pred_n_loss"]
     aux_stat_vals: dict[str, list[float]] = {k: [] for k in aux_stat_keys}
 
     first_batch_done = False
