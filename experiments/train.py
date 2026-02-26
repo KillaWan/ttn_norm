@@ -414,6 +414,13 @@ class TrainConfig:
     n_pred_weight: float = 0.0
     n_pred_arch: str = "mlp"
 
+    # LocalGainNorm params
+    gain_alpha: float = 0.98          # EMA smoothing coefficient (closer to 1 → slower gain)
+    gain_eps: float = 1e-6            # numerical stability
+    gain_pred_weight: float = 1.0     # weight for gain prediction loss (hard, not aux-scaled)
+    gain_pred_arch: str = "linear"    # "linear" or "mlp"
+    gain_loss_log: bool = True        # use log-domain MSE for gain loss
+
     # ------------------------------------------------------------------ baseline norm configs
     # RevIN
     revin_affine: bool = True
@@ -464,6 +471,16 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             pred_len=cfg.pred_len,
             period_len=cfg.san_period_len,
             enc_in=num_features,
+        )
+
+    elif _nt == "localgain":
+        from ttn_norm.models.local_gain_norm import LocalGainNorm
+        norm_model = LocalGainNorm(
+            seq_len=cfg.window,
+            pred_len=cfg.pred_len,
+            gain_alpha=cfg.gain_alpha,
+            gain_eps=cfg.gain_eps,
+            gain_pred_arch=cfg.gain_pred_arch,
         )
 
     else:
@@ -904,6 +921,25 @@ def collect_and_print_debug(
             f" mask_full_rate={mask_full_rate:.4f}"
         )
 
+    # ------------------------------------------------------------------ GAIN (localgain only)
+    if nm is not None and cfg.norm_type.lower() == "localgain":
+        g_hist_dbg = getattr(nm, "_last_gain_hist", None)
+        g_pred_dbg = getattr(nm, "_last_gain_pred_future", None)
+        gain_pred_loss_dbg2 = getattr(nm, "_last_gain_pred_loss", nan)
+        g_hist_mean = float(g_hist_dbg.mean().item()) if g_hist_dbg is not None else nan
+        g_hist_min  = float(g_hist_dbg.min().item())  if g_hist_dbg is not None else nan
+        g_hist_max  = float(g_hist_dbg.max().item())  if g_hist_dbg is not None else nan
+        _gp = g_pred_dbg.detach() if g_pred_dbg is not None else None
+        g_pred_mean = float(_gp.mean().item()) if _gp is not None else nan
+        g_pred_min  = float(_gp.min().item())  if _gp is not None else nan
+        g_pred_max  = float(_gp.max().item())  if _gp is not None else nan
+        print(
+            f"[{prefix}][GAIN]"
+            f" gain_pred_loss={gain_pred_loss_dbg2:.6e}"
+            f" g_hist_mean={g_hist_mean:.6f} g_hist_min={g_hist_min:.6f} g_hist_max={g_hist_max:.6f}"
+            f" g_pred_mean={g_pred_mean:.6f} g_pred_min={g_pred_min:.6f} g_pred_max={g_pred_max:.6f}"
+        )
+
     # ------------------------------------------------------------------ GRAD
     gi = grad_info or {}
     print(
@@ -978,6 +1014,7 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
     losses = []
     task_losses = []
     aux_losses = []
+    gain_losses: list[float] = []
     # Aux stats accumulators
     aux_stat_keys = ["aux_total", "L_easy", "L_white", "L_js", "L_w1", "L_min", "L_e_tv",
                      "ratio_n_bc_mean", "ratio_n_bc_min", "ratio_n_bc_max", "loss_n_ratio_budget",
@@ -1040,6 +1077,27 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
                     loss = loss + cfg.n_pred_weight * pred_n_loss_t
                     model.nm._last_pred_n_loss = float(pred_n_loss_t.detach().item())
 
+            # Gain pred loss: hard term, NOT scaled by aux_loss_scale
+            if (
+                cfg.norm_type.lower() == "localgain"
+                and cfg.gain_pred_weight > 0.0
+                and hasattr(model, "nm")
+                and model.nm is not None
+                and hasattr(model.nm, "get_last_gain_pred_future")
+            ):
+                g_pred = model.nm.get_last_gain_pred_future()
+                if g_pred is not None:
+                    g_true = model.nm.teacher_gain_future(batch_x, batch_y)
+                    if cfg.gain_loss_log:
+                        loss_gain_t = (
+                            (torch.log(g_pred + 1e-8) - torch.log(g_true + 1e-8)) ** 2
+                        ).mean()
+                    else:
+                        loss_gain_t = ((g_pred - g_true) ** 2).mean()
+                    loss = loss + cfg.gain_pred_weight * loss_gain_t
+                    model.nm._last_gain_pred_loss = float(loss_gain_t.detach().item())
+                    gain_losses.append(model.nm._last_gain_pred_loss)
+
             # First-batch gradient collection
             if not first_batch_done:
                 gate_snap_norms = [p.data.norm().item() for p in gate_params]
@@ -1100,6 +1158,8 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
     if has_nm_aux and aux_stat_vals["aux_total"]:
         for k in aux_stat_keys:
             train_stat[k] = float(np.mean(aux_stat_vals[k]))
+    if gain_losses:
+        train_stat["gain_pred_loss"] = float(np.mean(gain_losses))
 
     return float(np.mean(losses)) if losses else 0.0, gate_stats_str, train_stat
 
@@ -1191,6 +1251,29 @@ def main(argv: list[str] | None = None):
         parser.add_argument(arg_name, type=arg_type, default=value)
     args = parser.parse_args(argv)
     cfg = TrainConfig(**vars(args))
+
+    # Validate localgain: forbid old nonstat codepaths that conflict with it
+    if cfg.norm_type.lower() == "localgain":
+        _conflicts = []
+        if cfg.teacher_mask_only:
+            _conflicts.append("--teacher-mask-only (must be False for localgain)")
+        if cfg.future_mode == "pred":
+            _conflicts.append("--future-mode pred (localgain has its own gain predictor)")
+        if cfg.n_pred_weight > 0:
+            _conflicts.append(f"--n-pred-weight {cfg.n_pred_weight} (must be 0 for localgain)")
+        if cfg.n_ratio_weight > 0:
+            _conflicts.append(f"--n-ratio-weight {cfg.n_ratio_weight} (must be 0 for localgain)")
+        for _f in ("easy_ar_weight", "white_acf_weight", "shape_js_weight",
+                   "shape_w1_weight", "min_remove_weight", "energy_tv_weight"):
+            _v = getattr(cfg, _f, 0.0)
+            if _v > 0:
+                _conflicts.append(f"--{_f.replace('_', '-')} {_v} (must be 0 for localgain)")
+        if _conflicts:
+            raise ValueError(
+                "norm_type='localgain' is incompatible with the following flags:\n  "
+                + "\n  ".join(_conflicts)
+                + "\nRemove them or set them to their defaults before using localgain."
+            )
 
     _set_seed(cfg.seed)
     dataloader, dataset, scaler, split_info = _build_dataloader(cfg)
@@ -1290,6 +1373,8 @@ def main(argv: list[str] | None = None):
                     f" L_min={train_stat.get('L_min', 0.0):.3e}"
                     f" L_e_tv={train_stat.get('L_e_tv', 0.0):.3e})"
                 )
+            if "gain_pred_loss" in train_stat:
+                train_stat_str += f" gain_pred_loss={train_stat['gain_pred_loss']:.6e}"
         val_stat_str = ""
         if "aux_total" in val_metrics:
             val_stat_str = f" | aux_total={val_metrics['aux_total']:.6e}"
