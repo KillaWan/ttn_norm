@@ -21,14 +21,18 @@ class FTSep5Proj(nn.Module):
       6. head: group conv (h*C→C, groups=C) — h→1 logit per variable.
     """
 
-    def __init__(self, channels: int, h: int = 8):
+    def __init__(self, channels: int, h: int = 8, feat_mode: str = "mdm"):
+        if feat_mode not in ("mdm", "mdm_pdp"):
+            raise ValueError(f"feat_mode must be 'mdm' or 'mdm_pdp', got {feat_mode!r}")
         super().__init__()
         self.channels = channels
         self.h = h
+        self.feat_mode = feat_mode
+        self.n_feat = 2 if feat_mode == "mdm" else 4
         C, hC = channels, h * channels
 
-        # stem: 2 features per variable → h hidden channels
-        self.stem = nn.Conv2d(2 * C, hC, kernel_size=1, groups=C, bias=True)
+        # stem: n_feat features per variable → h hidden channels
+        self.stem = nn.Conv2d(self.n_feat * C, hC, kernel_size=1, groups=C, bias=True)
 
         # block 1
         self.dw_freq1 = nn.Conv2d(hC, hC, kernel_size=(5, 1), padding=(2, 0), groups=hC, bias=True)
@@ -56,10 +60,21 @@ class FTSep5Proj(nn.Module):
         m_norm = _bc_standardize(m)    # (B, C, F, T)
         dm_norm = _bc_standardize(dm)  # (B, C, F, T)
 
-        # Interleave: [m_0, dm_0, m_1, dm_1, ...] → (B, 2C, F, T)
-        # stack along new dim then reshape preserves per-variable grouping
-        x = torch.stack([m_norm, dm_norm], dim=2)  # (B, C, 2, F, T)
-        x = x.reshape(B, 2 * C, F, T)             # (B, 2C, F, T)
+        if self.feat_mode == "mdm":
+            features = [m_norm, dm_norm]
+        else:  # mdm_pdp
+            # Probability over freq bins, normalised per (B,C,T)
+            P = m ** 2 + 1e-8                                          # (B, C, F, T)
+            p = P / (P.sum(dim=2, keepdim=True) + 1e-8)               # (B, C, F, T)
+            dp = F_.diff_t(p)                                          # (B, C, F, T)
+            p_norm = _bc_standardize(p)                                # (B, C, F, T)
+            dp_norm = _bc_standardize(dp)                              # (B, C, F, T)
+            features = [m_norm, dm_norm, p_norm, dp_norm]
+
+        # Interleave: per-variable grouping [feat0_var0, feat1_var0, ..., feat0_var1, ...]
+        # stack along new dim=2 then reshape preserves per-variable grouping
+        x = torch.stack(features, dim=2)              # (B, C, n_feat, F, T)
+        x = x.reshape(B, self.n_feat * C, F, T)      # (B, n_feat*C, F, T)
 
         # stem
         x = torch.nn.functional.gelu(self.stem(x))  # (B, hC, F, T)
@@ -125,6 +140,7 @@ class LocalTFGate(nn.Module):
         gate_ratio_target: float = 0.3,
         gate_arch: str = "pointwise",
         gate_threshold_mode: str = "shift",
+        ftsep5_feat_mode: str = "mdm",
     ):
         super().__init__()
         # Build projection depending on requested gate architecture
@@ -149,7 +165,7 @@ class LocalTFGate(nn.Module):
             )
         elif gate_arch == "ftsep5":
             # TF-separable gate with per-variable time-diff features
-            self.proj = FTSep5Proj(channels, h=8)
+            self.proj = FTSep5Proj(channels, h=8, feat_mode=ftsep5_feat_mode)
         else:
             raise ValueError(f"Unsupported gate_arch: {gate_arch}")
         self.use_threshold = use_threshold

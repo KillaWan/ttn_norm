@@ -336,7 +336,6 @@ class TrainConfig:
     max_grad_norm: float = 5.0
     weight_decay: float = 5e-4
     gate_weight_decay: float = 2e-3
-    predictor_weight_decay: float = 2e-3
     early_stop: bool = True
     early_stop_patience: int = 5
     early_stop_min_epochs: int = 1
@@ -375,32 +374,13 @@ class TrainConfig:
     gate_log_mag: bool = True
     gate_arch: str = "pointwise"
     gate_threshold_mode: str = "shift"
-    gate_entropy_weight: float = 0.0
     gate_use_log_mag: bool = True
-    stationarity_loss_weight: float = 0.0
-    stationarity_chunks: int = 4
     future_mode: str = "repeat_last"
-    predict_n_time: bool = False
-    pred_hidden_dim: int = 64
-    pred_dropout: float = 0.1
-    pred_loss_weight: float = 0.0
     gate_threshold: float = 0.0
     gate_temperature: float = 1.0
-    gate_smooth_weight: float = 0.0
-    gate_temporal_smooth_weight: float = 0.0
-    gate_ratio_weight: float = 0.0
-    gate_ratio_target: float = 0.3
-    gate_mode: str = "sigmoid"
-    gate_budget_dim: str = "freq"
-    pred_input: str = "n_tf"
     gate_lr: float = 0.0
-    predictor_lr: float = 0.0
     use_instance_norm: bool = True
-    lambda_E: float = 1.0
-    lambda_P: float = 1.0
     eps_E: float = 1e-6
-    delta_E: float = 0.0
-    delta_P: float = 0.0
     auto_thresholds: bool = True
     trigger_q: float = 0.99
     target_frames: int = 24
@@ -408,22 +388,23 @@ class TrainConfig:
     trigger_mask: bool = True
     delta_E_mask: float = 0.0
     delta_P_mask: float = 0.0
-    shape_loss_mode: str = "meanF"
     trigger_mask_mode: str = "time"
-    gate_sup_enable: bool = True
-    gate_sup_weight: float = 0.2
-    gate_sup_tau: float = 0.3
-    gate_sup_loss: str = "bce"
-    gate_sup_pos_weight: float = 5.0
-    gate_sup_on: str = "raw"
-    gate_sup_target: str = "soft"
-    gate_sup_source: str = "P_only"
-    gate_sup_wE: float = 0.0
     trigger_soft: bool = True
     trigger_soft_tau: float = 0.25
-    n_energy_reg_enable: bool = True
-    n_energy_reg_weight: float = 0.05
-    n_energy_reg_mode: str = "ntf_l2"
+    ftsep5_feat_mode: str = "mdm"
+
+    # New aux loss hyperparams
+    easy_ar_weight: float = 0.0
+    easy_ar_k: int = 8
+    easy_ar_ridge: float = 1e-3
+    white_acf_weight: float = 0.0
+    white_acf_lags: int = 8
+    shape_js_weight: float = 0.0
+    shape_w1_weight: float = 0.0
+    shape_weighting: str = "trigger"
+    min_remove_weight: float = 0.0
+    min_remove_mode: str = "ntf_l2"
+    energy_tv_weight: float = 0.0
 
     # ------------------------------------------------------------------ baseline norm configs
     # RevIN
@@ -499,49 +480,30 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             gate_log_mag=cfg.gate_log_mag,
             gate_arch=cfg.gate_arch,
             gate_threshold_mode=cfg.gate_threshold_mode,
-            gate_entropy_weight=cfg.gate_entropy_weight,
             gate_use_log_mag=cfg.gate_use_log_mag,
-            stationarity_loss_weight=cfg.stationarity_loss_weight,
-            stationarity_chunks=cfg.stationarity_chunks,
             future_mode=cfg.future_mode,
-            predict_n_time=cfg.predict_n_time,
-            pred_hidden_dim=cfg.pred_hidden_dim,
-            pred_dropout=cfg.pred_dropout,
-            pred_loss_weight=cfg.pred_loss_weight,
             gate_threshold=cfg.gate_threshold,
             gate_temperature=cfg.gate_temperature,
-            gate_smooth_weight=cfg.gate_smooth_weight,
-            gate_temporal_smooth_weight=cfg.gate_temporal_smooth_weight,
-            gate_ratio_weight=cfg.gate_ratio_weight,
-            gate_ratio_target=cfg.gate_ratio_target,
-            gate_mode=cfg.gate_mode,
-            gate_budget_dim=cfg.gate_budget_dim,
-            pred_input=cfg.pred_input,
             use_instance_norm=cfg.use_instance_norm,
-            lambda_E=cfg.lambda_E,
-            lambda_P=cfg.lambda_P,
             eps_E=cfg.eps_E,
-            delta_E=cfg.delta_E,
-            delta_P=cfg.delta_P,
             trigger_mask=cfg.trigger_mask,
             delta_E_mask=cfg.delta_E_mask,
             delta_P_mask=cfg.delta_P_mask,
-            shape_loss_mode=cfg.shape_loss_mode,
             trigger_mask_mode=cfg.trigger_mask_mode,
-            gate_sup_enable=cfg.gate_sup_enable,
-            gate_sup_weight=cfg.gate_sup_weight,
-            gate_sup_tau=cfg.gate_sup_tau,
-            gate_sup_loss=cfg.gate_sup_loss,
-            gate_sup_pos_weight=cfg.gate_sup_pos_weight,
-            gate_sup_on=cfg.gate_sup_on,
-            gate_sup_target=cfg.gate_sup_target,
-            gate_sup_source=cfg.gate_sup_source,
-            gate_sup_wE=cfg.gate_sup_wE,
             trigger_soft=cfg.trigger_soft,
             trigger_soft_tau=cfg.trigger_soft_tau,
-            n_energy_reg_enable=cfg.n_energy_reg_enable,
-            n_energy_reg_weight=cfg.n_energy_reg_weight,
-            n_energy_reg_mode=cfg.n_energy_reg_mode,
+            ftsep5_feat_mode=cfg.ftsep5_feat_mode,
+            easy_ar_weight=cfg.easy_ar_weight,
+            easy_ar_k=cfg.easy_ar_k,
+            easy_ar_ridge=cfg.easy_ar_ridge,
+            white_acf_weight=cfg.white_acf_weight,
+            white_acf_lags=cfg.white_acf_lags,
+            shape_js_weight=cfg.shape_js_weight,
+            shape_w1_weight=cfg.shape_w1_weight,
+            shape_weighting=cfg.shape_weighting,
+            min_remove_weight=cfg.min_remove_weight,
+            min_remove_mode=cfg.min_remove_mode,
+            energy_tv_weight=cfg.energy_tv_weight,
         )
     label_len = cfg.label_len or (cfg.window // 2)
     label_len = min(label_len, cfg.window)
@@ -577,18 +539,20 @@ def calibrate_thresholds(
     train_loader,
     cfg: TrainConfig,
     max_batches: int = 200,
-) -> tuple[float, float, float, float]:
-    """Estimate delta_E, delta_P, delta_E_mask, and delta_P_mask from training data.
+) -> tuple[float, float]:
+    """Estimate delta_E_mask and delta_P_mask from training data.
 
-    Runs up to *max_batches* forward passes, collects per-transition log-energy
-    differences (dE) and per-transition mean spectral-shape differences (dP)
-    from both the residual r_tf (for stationarity loss thresholds) and the raw
-    input x_tf (for trigger mask thresholds), then returns the trigger_q quantile
-    of each as the margin thresholds.
+    Runs up to *max_batches* forward passes, collects per-transition
+    log-energy differences (dE) and spectral-shape differences (dP)
+    from the raw input x_tf, then returns the trigger_q quantile of
+    each as the trigger mask thresholds.
+
+    Returns:
+        (delta_E_mask, delta_P_mask)
     """
     nm = getattr(model, "nm", None)
-    if nm is None or not hasattr(nm, "_last_r_tf"):
-        return 0.0, 0.0, 0.0, 0.0
+    if nm is None or not hasattr(nm, "_last_x_tf"):
+        return 0.0, 0.0
 
     model.eval()
     eps = 1e-8
@@ -598,8 +562,6 @@ def calibrate_thresholds(
     _orig_trigger_mask = getattr(nm, "trigger_mask", False)
     nm.trigger_mask = False
 
-    all_dE: list[torch.Tensor] = []
-    all_dP: list[torch.Tensor] = []
     all_dE_mask: list[torch.Tensor] = []
     all_dP_mask: list[torch.Tensor] = []
 
@@ -620,55 +582,37 @@ def calibrate_thresholds(
 
         model(batch_x, batch_x_enc, dec_inp, dec_inp_enc)
 
-        # --- dE/dP from residual r_tf (for stationarity loss thresholds) ---
-        r_tf = nm._last_r_tf  # (B, C, F, T) complex
-        if r_tf is None:
+        # dE/dP from raw input x_tf (for trigger mask thresholds)
+        x_tf = nm._last_x_tf  # (B, C, F, T) complex, detached
+        if x_tf is None:
             continue
 
-        P = r_tf.abs() ** 2                              # (B, C, F, T)
-        E = P.mean(dim=2)                                # (B, C, T)
-        p = P / (P.sum(dim=2, keepdim=True) + eps)      # (B, C, F, T)
+        P_x = x_tf.abs() ** 2                                      # (B, C, F, T)
+        E_x = P_x.mean(dim=2)                                      # (B, C, T)
+        p_x = P_x / (P_x.sum(dim=2, keepdim=True) + eps)           # (B, C, F, T)
+        logE_x = torch.log(E_x + eps_E)
+        dE_x = torch.abs(logE_x[..., 1:] - logE_x[..., :-1])      # (B, C, T-1)
+        dP_f_x = torch.abs(p_x[..., :, 1:] - p_x[..., :, :-1])    # (B, C, F, T-1)
+        dP_mean_x = dP_f_x.mean(dim=2)                             # (B, C, T-1)
 
-        logE = torch.log(E + eps_E)
-        dE = torch.abs(logE[..., 1:] - logE[..., :-1])  # (B, C, T-1)
-        dP_f = torch.abs(p[..., :, 1:] - p[..., :, :-1])  # (B, C, F, T-1)
-        dP_mean = dP_f.mean(dim=2)                          # (B, C, T-1)
-
-        all_dE.append(dE.cpu().flatten())
-        # For delta_P threshold: use perF elements if shape_loss_mode=="perF"
-        if getattr(cfg, "shape_loss_mode", "meanF") == "perF":
-            all_dP.append(dP_f.cpu().flatten())
+        all_dE_mask.append(dE_x.cpu().flatten())
+        # For delta_P_mask: use per-F elements if trigger_mask_mode=="tf"
+        if cfg.trigger_mask_mode == "tf":
+            all_dP_mask.append(dP_f_x.cpu().flatten())
         else:
-            all_dP.append(dP_mean.cpu().flatten())
-
-        # --- dE/dP from raw input x_tf (for trigger mask thresholds) ---
-        x_tf = nm._last_x_tf  # (B, C, F, T) complex
-        if x_tf is not None:
-            P_x = x_tf.abs() ** 2                               # (B, C, F, T)
-            E_x = P_x.mean(dim=2)                               # (B, C, T)
-            p_x = P_x / (P_x.sum(dim=2, keepdim=True) + eps)   # (B, C, F, T)
-            logE_x = torch.log(E_x + eps_E)
-            dE_x = torch.abs(logE_x[..., 1:] - logE_x[..., :-1])          # (B, C, T-1)
-            dP_f_x = torch.abs(p_x[..., :, 1:] - p_x[..., :, :-1])        # (B, C, F, T-1)
-            dP_mean_x = dP_f_x.mean(dim=2)                                 # (B, C, T-1)
-            all_dE_mask.append(dE_x.cpu().flatten())
-            # For delta_P_mask: use perF elements if trigger_mask_mode=="tf"
-            if getattr(cfg, "trigger_mask_mode", "time") == "tf":
-                all_dP_mask.append(dP_f_x.cpu().flatten())
-            else:
-                all_dP_mask.append(dP_mean_x.cpu().flatten())
+            all_dP_mask.append(dP_mean_x.cpu().flatten())
 
     # Restore original trigger_mask setting
     nm.trigger_mask = _orig_trigger_mask
 
-    if not all_dE:
-        return 0.0, 0.0, 0.0, 0.0
+    if not all_dE_mask:
+        return 0.0, 0.0
 
-    cat_dE = torch.cat(all_dE)
-    cat_dP = torch.cat(all_dP)
+    cat_dE = torch.cat(all_dE_mask)
+    cat_dP = torch.cat(all_dP_mask)
     q = float(cfg.trigger_q)
-    delta_E = float(torch.quantile(cat_dE, q).item())
-    delta_P = float(torch.quantile(cat_dP, q).item())
+    delta_E_mask = float(torch.quantile(cat_dE, q).item())
+    delta_P_mask = float(torch.quantile(cat_dP, q).item())
 
     def _qs(t: torch.Tensor, qs: list[float]) -> list[float]:
         return [float(torch.quantile(t, qi).item()) for qi in qs]
@@ -681,7 +625,7 @@ def calibrate_thresholds(
     heavy_E = e99 / e95 if e95 > 1e-15 else float("nan")
     heavy_P = p99 / p95 if p95 > 1e-15 else float("nan")
     print(
-        f"[Calibration][dE_dist]"
+        f"[Calibration][dE_mask_dist]"
         f" n={cat_dE.numel()}"
         f" mean={cat_dE.mean():.6f} std={cat_dE.std():.6f}"
         f" p50={eqs[0]:.6f} p90={eqs[1]:.6f} p95={eqs[2]:.6f}"
@@ -689,7 +633,7 @@ def calibrate_thresholds(
         f" heavy_tail_ratio={heavy_E:.4f}"
     )
     print(
-        f"[Calibration][dP_dist]"
+        f"[Calibration][dP_mask_dist]"
         f" n={cat_dP.numel()}"
         f" mean={cat_dP.mean():.6f} std={cat_dP.std():.6f}"
         f" p50={pqs[0]:.6f} p90={pqs[1]:.6f} p95={pqs[2]:.6f}"
@@ -697,39 +641,7 @@ def calibrate_thresholds(
         f" heavy_tail_ratio={heavy_P:.4f}"
     )
 
-    # --- mask thresholds from x_tf distribution ---
-    if all_dE_mask:
-        cat_dE_mask = torch.cat(all_dE_mask)
-        cat_dP_mask = torch.cat(all_dP_mask)
-        delta_E_mask = float(torch.quantile(cat_dE_mask, q).item())
-        delta_P_mask = float(torch.quantile(cat_dP_mask, q).item())
-        meqs = _qs(cat_dE_mask, qs)
-        mpqs = _qs(cat_dP_mask, qs)
-        me99, me95 = meqs[3], meqs[2]
-        mp99, mp95 = mpqs[3], mpqs[2]
-        heavy_mE = me99 / me95 if me95 > 1e-15 else float("nan")
-        heavy_mP = mp99 / mp95 if mp95 > 1e-15 else float("nan")
-        print(
-            f"[Calibration][dE_mask_dist]"
-            f" n={cat_dE_mask.numel()}"
-            f" mean={cat_dE_mask.mean():.6f} std={cat_dE_mask.std():.6f}"
-            f" p50={meqs[0]:.6f} p90={meqs[1]:.6f} p95={meqs[2]:.6f}"
-            f" p99={meqs[3]:.6f} p999={meqs[4]:.6f}"
-            f" heavy_tail_ratio={heavy_mE:.4f}"
-        )
-        print(
-            f"[Calibration][dP_mask_dist]"
-            f" n={cat_dP_mask.numel()}"
-            f" mean={cat_dP_mask.mean():.6f} std={cat_dP_mask.std():.6f}"
-            f" p50={mpqs[0]:.6f} p90={mpqs[1]:.6f} p95={mpqs[2]:.6f}"
-            f" p99={mpqs[3]:.6f} p999={mpqs[4]:.6f}"
-            f" heavy_tail_ratio={heavy_mP:.4f}"
-        )
-    else:
-        delta_E_mask = 0.0
-        delta_P_mask = 0.0
-
-    return delta_E, delta_P, delta_E_mask, delta_P_mask
+    return delta_E_mask, delta_P_mask
 
 
 def _sq(t: torch.Tensor, q: float) -> float:
@@ -785,6 +697,11 @@ def collect_and_print_debug(
     nan = float("nan")
     eps = 1e-12
 
+    # Fetch summary dicts once
+    gate_stats = nm.get_last_gate_stats() if nm is not None and hasattr(nm, "get_last_gate_stats") else {}
+    decomp_stats = nm.get_last_decomp_stats() if nm is not None and hasattr(nm, "get_last_decomp_stats") else {}
+    aux_stats = nm.get_last_aux_stats() if nm is not None and hasattr(nm, "get_last_aux_stats") else {}
+
     # ------------------------------------------------------------------ RECON
     x = getattr(nm, "_last_x_time", None)
     r = getattr(nm, "_last_r_time", None)
@@ -794,13 +711,13 @@ def collect_and_print_debug(
         x_norm = x.norm().clamp(min=eps)
         recon_rel = float(recon.norm() / x_norm)
         recon_max_abs = float(recon.abs().max())
-        ratio_n_time = float(n.pow(2).mean() / (x.pow(2).mean() + eps))
         ratio_r_time = float(r.pow(2).mean() / (x.pow(2).mean() + eps))
-        corr_x_r = _pearson(x, r)
         corr_x_n = _pearson(x, n)
     else:
-        recon_rel = recon_max_abs = ratio_n_time = ratio_r_time = nan
-        corr_x_r = corr_x_n = nan
+        recon_rel = recon_max_abs = ratio_r_time = nan
+        corr_x_n = nan
+    ratio_n_time = decomp_stats.get("ratio_n_time", nan)
+    corr_x_r = decomp_stats.get("corr_x_r", nan)
     print(
         f"[{prefix}][RECON]"
         f" recon_rel={recon_rel:.6f} recon_max_abs={recon_max_abs:.6e}"
@@ -808,41 +725,8 @@ def collect_and_print_debug(
         f" corr_x_r={corr_x_r:.6f} corr_x_n={corr_x_n:.6f}"
     )
 
-    # ------------------------------------------------------------------ STAT
-    dE = getattr(nm, "_last_dE", None)
-    dP = getattr(nm, "_last_dP", None)
-    delta_E = float(cfg.delta_E) if nm is None else float(getattr(nm, "delta_E", cfg.delta_E))
-    delta_P = float(cfg.delta_P) if nm is None else float(getattr(nm, "delta_P", cfg.delta_P))
-    if dE is not None:
-        dE_f = dE.float().flatten()
-        mask_E = dE_f > delta_E
-        trigger_E = float(mask_E.float().mean())
-        excess_E = float((dE_f[mask_E] - delta_E).mean()) if mask_E.any() else nan
-        mean_dE = float(dE_f.mean())
-        p95_dE, p99_dE = _sq(dE_f, 0.95), _sq(dE_f, 0.99)
-    else:
-        trigger_E = excess_E = mean_dE = p95_dE = p99_dE = nan
-    if dP is not None:
-        dP_f = dP.float().flatten()
-        mask_P = dP_f > delta_P
-        trigger_P = float(mask_P.float().mean())
-        excess_P = float((dP_f[mask_P] - delta_P).mean()) if mask_P.any() else nan
-        mean_dP = float(dP_f.mean())
-        p95_dP, p99_dP = _sq(dP_f, 0.95), _sq(dP_f, 0.99)
-    else:
-        trigger_P = excess_P = mean_dP = p95_dP = p99_dP = nan
-    print(
-        f"[{prefix}][STAT]"
-        f" delta_E={delta_E:.6f} delta_P={delta_P:.6f}"
-        f" trigger_E={trigger_E:.6f} trigger_P={trigger_P:.6f}"
-        f" excess_E={excess_E:.6e} excess_P={excess_P:.6e}"
-        f" mean_dE={mean_dE:.6f} mean_dP={mean_dP:.6f}"
-        f" p95_dE={p95_dE:.6f} p99_dE={p99_dE:.6f}"
-        f" p95_dP={p95_dP:.6f} p99_dP={p99_dP:.6f}"
-    )
-
     # ------------------------------------------------------------------ REVIN
-    inst_std = getattr(nm, "_last_inst_std", None)
+    inst_std = getattr(nm, "_last_inst_std", None) if nm is not None else None
     if inst_std is not None:
         s = inst_std.float().flatten()
         std_min = float(s.min())
@@ -860,14 +744,13 @@ def collect_and_print_debug(
     )
 
     # ------------------------------------------------------------------ GATE
-    g = getattr(nm, "_last_gate", None)
-    gate_stats = nm.get_last_gate_stats() if nm is not None and hasattr(nm, "get_last_gate_stats") else {}
     gate_mean = gate_stats.get("gate_mean", nan)
     gate_maxF = gate_stats.get("gate_max_f", nan)
     gate_sumF = gate_stats.get("gate_sum_f", nan)
     gate_entF = gate_stats.get("gate_ent_f", nan)
-    if g is not None:
-        g_f = g.float().flatten()
+    g_eff = getattr(nm, "_last_gate_eff", None) if nm is not None else None
+    if g_eff is not None:
+        g_f = g_eff.detach().float().flatten()
         gate_sat0 = float((g_f < 0.01).float().mean())
         gate_sat1 = float((g_f > 0.99).float().mean())
     else:
@@ -901,33 +784,21 @@ def collect_and_print_debug(
     )
 
     # ------------------------------------------------------------------ MASK (trigger mask)
-    trigger_mask_on = bool(getattr(cfg, "trigger_mask", False))
-    if nm is not None and trigger_mask_on:
-        m_rate = float(getattr(nm, "_last_mask_rate", nan))
-        m_trig_rate = float(getattr(nm, "_last_mask_trig_rate", nan))
-        m_delta_E = float(getattr(nm, "_last_mask_delta_E", nan))
-        m_delta_P = float(getattr(nm, "_last_mask_delta_P", nan))
-    else:
-        m_rate = 1.0
-        m_trig_rate = 0.0
-        m_delta_E = nan
-        m_delta_P = nan
-    m_rate_tf = float(getattr(nm, "_last_mask_rate_tf", nan)) if nm is not None else nan
-    m_trig_rate_tf = float(getattr(nm, "_last_mask_trig_rate_tf", nan)) if nm is not None else nan
+    w_mean = decomp_stats.get("w_mean", nan)
+    w_max = decomp_stats.get("w_max", nan)
+    delta_E_mask = float(getattr(nm, "delta_E_mask", nan)) if nm is not None else nan
+    delta_P_mask = float(getattr(nm, "delta_P_mask", nan)) if nm is not None else nan
     print(
         f"[{prefix}][MASK]"
-        f" mask_rate={m_rate:.6f}"
-        f" mask_trig_rate={m_trig_rate:.6f}"
-        f" delta_E_mask={m_delta_E:.6f}"
-        f" delta_P_mask={m_delta_P:.6f}"
-        f" mask_rate_tf={m_rate_tf:.6f}"
-        f" mask_trig_rate_tf={m_trig_rate_tf:.6f}"
+        f" w_mean={w_mean:.6f} w_max={w_max:.6f}"
+        f" delta_E_mask={delta_E_mask:.6f} delta_P_mask={delta_P_mask:.6f}"
     )
 
     # ------------------------------------------------------------------ GFLK (gate flicker)
-    if g is not None:
-        flicker_t = float(g[..., 1:].sub(g[..., :-1]).abs().mean()) if g.shape[-1] > 1 else nan
-        rough_f = float(g[:, :, 1:, :].sub(g[:, :, :-1, :]).abs().mean()) if g.shape[2] > 1 else nan
+    g_raw = getattr(nm, "_last_g_raw", None) if nm is not None else None
+    if g_raw is not None:
+        flicker_t = float(g_raw[..., 1:].sub(g_raw[..., :-1]).abs().mean()) if g_raw.shape[-1] > 1 else nan
+        rough_f = float(g_raw[:, :, 1:, :].sub(g_raw[:, :, :-1, :]).abs().mean()) if g_raw.shape[2] > 1 else nan
     else:
         flicker_t = rough_f = nan
     print(
@@ -935,43 +806,41 @@ def collect_and_print_debug(
         f" flicker_t={flicker_t:.6f} rough_f={rough_f:.6f}"
     )
 
-    # ------------------------------------------------------------------ PRED (branch usage)
-    pnt_enabled = bool(getattr(cfg, "predict_n_time", False))
-    pred_n_time_cache = getattr(nm, "_last_pred_n_time", None)
-    pred_n_time_exists = pred_n_time_cache is not None
-    denorm_pred = int(getattr(nm, "_denorm_used_pred", 0))
-    denorm_input = int(getattr(nm, "_denorm_used_input", 0))
-    denorm_extrap = int(getattr(nm, "_denorm_used_extrap", 0))
+    # ------------------------------------------------------------------ GQ (gate quality)
     print(
-        f"[{prefix}][PRED]"
-        f" predict_n_time={int(pnt_enabled)}"
-        f" pred_n_time_exists={int(pred_n_time_exists)}"
-        f" denorm_pred={denorm_pred}"
-        f" denorm_input={denorm_input}"
-        f" denorm_extrap={denorm_extrap}"
+        f"[{prefix}][GQ]"
+        f" gate_mean={gate_mean:.4f}"
+        f" gate_entF={gate_entF:.4f}"
+        f" gate_maxF={gate_maxF:.4f}"
+        f" gate_sumF={gate_sumF:.4f}"
     )
 
-    # ------------------------------------------------------------------ PACC (predictor accuracy)
-    if pnt_enabled and pred_n_time_exists and batch_x is not None and batch_y is not None and nm is not None:
-        try:
-            x_full = torch.cat([batch_x.float(), batch_y.float()], dim=1)
-            oracle_n_full = nm.extract_n_time_only(x_full.to(next(nm.parameters()).device))
-            pred_len = cfg.pred_len
-            oracle_n_future = oracle_n_full[:, -pred_len:, :]
-            p_pred = pred_n_time_cache.float()
-            o_gt = oracle_n_future.float()
-            if p_pred.shape == o_gt.shape:
-                mse_n = float(((p_pred - o_gt) ** 2).mean())
-                rel_err_n = float((p_pred - o_gt).norm() / (o_gt.norm().clamp(min=eps)))
-                corr_n = _pearson(p_pred, o_gt)
-            else:
-                mse_n = rel_err_n = corr_n = nan
-        except Exception:
-            mse_n = rel_err_n = corr_n = nan
-        print(
-            f"[{prefix}][PACC]"
-            f" mse_n={mse_n:.6e} rel_err_n={rel_err_n:.6f} corr_n={corr_n:.6f}"
-        )
+    # ------------------------------------------------------------------ WGATE (decomp diagnostics)
+    g_raw_mean = decomp_stats.get("g_raw_mean", nan)
+    g_eff_mean = decomp_stats.get("g_eff_mean", nan)
+    n_energy = decomp_stats.get("n_energy", nan)
+    print(
+        f"[{prefix}][WGATE]"
+        f" w_mean={w_mean:.4f} w_max={w_max:.4f}"
+        f" g_raw_mean={g_raw_mean:.4f} g_eff_mean={g_eff_mean:.4f}"
+        f" n_energy={n_energy:.6e}"
+    )
+
+    # ------------------------------------------------------------------ AUX
+    aux_total = aux_stats.get("aux_total", nan)
+    L_easy = aux_stats.get("L_easy", nan)
+    L_white = aux_stats.get("L_white", nan)
+    L_js = aux_stats.get("L_js", nan)
+    L_w1 = aux_stats.get("L_w1", nan)
+    L_min = aux_stats.get("L_min", nan)
+    L_e_tv = aux_stats.get("L_e_tv", nan)
+    print(
+        f"[{prefix}][AUX]"
+        f" aux_total={aux_total:.6e}"
+        f" L_easy={L_easy:.6e} L_white={L_white:.6e}"
+        f" L_js={L_js:.6e} L_w1={L_w1:.6e}"
+        f" L_min={L_min:.6e} L_e_tv={L_e_tv:.6e}"
+    )
 
     # ------------------------------------------------------------------ GRAD
     gi = grad_info or {}
@@ -979,113 +848,7 @@ def collect_and_print_debug(
         f"[{prefix}][GRAD]"
         f" gate_grad_norm={gi.get('gate_grad_norm', nan):.6e}"
         f" gate_param_norm={gi.get('gate_param_norm', nan):.6f}"
-        f" pred_grad_norm={gi.get('pred_grad_norm', nan):.6e}"
-        f" pred_param_norm={gi.get('pred_param_norm', nan):.6f}"
-        f" update_ratio_predictor={gi.get('update_ratio_predictor', nan):.6e}"
     )
-
-    # ------------------------------------------------------------------ MASKCOV
-    if nm is not None and hasattr(nm, "get_last_mask_coverage_stats"):
-        cov_stats = nm.get_last_mask_coverage_stats()
-        _cov = cov_stats.get("cov", nan)
-        _mr95 = cov_stats.get("min_rate_cov95", nan)
-        _mr99 = cov_stats.get("min_rate_cov99", nan)
-        _mr995 = cov_stats.get("min_rate_cov995", nan)
-    else:
-        _cov = _mr95 = _mr99 = _mr995 = nan
-    print(
-        f"[{prefix}][MASKCOV]"
-        f" cov={_cov:.6f}"
-        f" min_rate@95={_mr95:.6f}"
-        f" min_rate@99={_mr99:.6f}"
-        f" min_rate@995={_mr995:.6f}"
-    )
-
-    # ------------------------------------------------------------------ MASKP
-    if nm is not None and hasattr(nm, "get_last_mask_coverage_stats"):
-        _p_table = nm.get_last_mask_coverage_stats().get("p_table", {})
-        _p950 = _p_table.get(0.95, (nan, nan))
-        _p990 = _p_table.get(0.99, (nan, nan))
-        _p995 = _p_table.get(0.995, (nan, nan))
-        print(
-            f"[{prefix}][MASKP]"
-            f" p=0.950:mr={_p950[0]:.6f},cov={_p950[1]:.6f}"
-            f" | p=0.990:mr={_p990[0]:.6f},cov={_p990[1]:.6f}"
-            f" | p=0.995:mr={_p995[0]:.6f},cov={_p995[1]:.6f}"
-        )
-    else:
-        print(f"[{prefix}][MASKP] p=0.950:mr={nan:.6f},cov={nan:.6f} | p=0.990:mr={nan:.6f},cov={nan:.6f} | p=0.995:mr={nan:.6f},cov={nan:.6f}")
-
-    # ------------------------------------------------------------------ PSUP
-    _pred_sup_mse = float(getattr(nm, "_last_pred_sup_loss", nan)) if nm is not None else nan
-    print(f"[{prefix}][PSUP] pred_sup_mse={_pred_sup_mse:.6e}")
-
-    # ------------------------------------------------------------------ GQ (gate quality diagnostics)
-    if nm is not None and hasattr(nm, "get_last_gq_stats"):
-        _gq = nm.get_last_gq_stats()
-        _gq_entF = _gq.get("entF_norm", nan)
-        _gq_topk = _gq.get("topk_mass", nan)
-        _gq_ratio = _gq.get("maxF_meanF", nan)
-        _gq_corr = _gq.get("corr_mag", nan)
-    else:
-        _gq_entF = _gq_topk = _gq_ratio = _gq_corr = nan
-    print(
-        f"[{prefix}][GQ]"
-        f" entF_norm={_gq_entF:.4f}"
-        f" topk_mass={_gq_topk:.4f}"
-        f" maxF_meanF={_gq_ratio:.4f}"
-        f" corr_mag={_gq_corr:.4f}"
-    )
-
-    # ------------------------------------------------------------------ GRAW / GEFF / GSUP
-    if nm is not None:
-        _graw_stdF = float(getattr(nm, "_dbg_graw_stdF", nan))
-        _graw_entF = float(getattr(nm, "_dbg_graw_entF", nan))
-        _graw_maxF = float(getattr(nm, "_dbg_graw_maxF_meanF", nan))
-        _graw_topk = float(getattr(nm, "_dbg_graw_topk_mass", nan))
-        _geff_stdF = float(getattr(nm, "_dbg_geff_stdF", nan))
-        _geff_entF = float(getattr(nm, "_dbg_geff_entF", nan))
-        _geff_maxF = float(getattr(nm, "_dbg_geff_maxF_meanF", nan))
-        _geff_topk = float(getattr(nm, "_dbg_geff_topk_mass", nan))
-        _sup_bce = float(getattr(nm, "_dbg_sup_bce", nan))
-        _sup_pos = float(getattr(nm, "_dbg_sup_pos_mean", nan))
-        _sup_neg = float(getattr(nm, "_dbg_sup_neg_mean", nan))
-        _sup_ratio = float(getattr(nm, "_dbg_sup_pos_neg_ratio", nan))
-        print(
-            f"[{prefix}][GRAW]"
-            f" stdF={_graw_stdF:.4f} entF={_graw_entF:.4f}"
-            f" maxF_meanF={_graw_maxF:.4f} topk_mass={_graw_topk:.4f}"
-        )
-        print(
-            f"[{prefix}][GEFF]"
-            f" stdF={_geff_stdF:.4f} entF={_geff_entF:.4f}"
-            f" maxF_meanF={_geff_maxF:.4f} topk_mass={_geff_topk:.4f}"
-        )
-        _sup_pos_rate = float(getattr(nm, "_dbg_sup_pos_rate", nan))
-        _sup_mixed_rate = float(getattr(nm, "_dbg_sup_mixed_rate", nan))
-        _sup_y_stdF = float(getattr(nm, "_dbg_sup_y_stdF", nan))
-        print(
-            f"[{prefix}][GSUP]"
-            f" bce={_sup_bce:.6f}"
-            f" pos_mean={_sup_pos:.6f} neg_mean={_sup_neg:.6f}"
-            f" pos_neg_ratio={_sup_ratio:.4f}"
-            f" pos_rate={_sup_pos_rate:.4f}"
-            f" mixed_rate={_sup_mixed_rate:.4f}"
-            f" y_stdF={_sup_y_stdF:.4f}"
-        )
-        # ------------------------------------------------------------------ WGATE (soft trigger + energy reg)
-        _w_mean = float(getattr(nm, "_dbg_w_mean", nan))
-        _w_max = float(getattr(nm, "_dbg_w_max", nan))
-        _g_raw_mean = float(getattr(nm, "_dbg_g_raw_mean", nan))
-        _g_eff_mean = float(getattr(nm, "_dbg_g_eff_mean", nan))
-        _n_energy = float(getattr(nm, "_dbg_n_energy", nan))
-        _n_energy_reg = float(getattr(nm, "_dbg_n_energy_reg", nan))
-        print(
-            f"[{prefix}][WGATE]"
-            f" w_mean={_w_mean:.4f} w_max={_w_max:.4f}"
-            f" g_raw_mean={_g_raw_mean:.4f} g_eff_mean={_g_eff_mean:.4f}"
-            f" n_energy={_n_energy:.6e} n_energy_reg={_n_energy_reg:.6e}"
-        )
 
 
 def _aux_scale(cfg: TrainConfig, epoch_idx: int) -> float:
@@ -1109,29 +872,22 @@ def _aux_scale(cfg: TrainConfig, epoch_idx: int) -> float:
 def _build_optimizer(model: nn.Module, cfg: TrainConfig) -> Adam:
     base_lr = float(cfg.lr)
     gate_wd = float(cfg.gate_weight_decay)
-    pred_wd = float(cfg.predictor_weight_decay)
-    
-    # Separate learning rates (0 means use base_lr)
+
+    # Separate learning rate for gate (0 means use base_lr)
     gate_lr = float(cfg.gate_lr) if cfg.gate_lr > 0 else base_lr
-    predictor_lr = float(cfg.predictor_lr) if cfg.predictor_lr > 0 else base_lr
 
     gate_params: list[torch.nn.Parameter] = []
-    pred_params: list[torch.nn.Parameter] = []
     nm = getattr(model, "nm", None)
     if nm is not None:
         gate_mod = getattr(nm, "gate", None)
         if gate_mod is not None:
             gate_params = [p for p in gate_mod.parameters() if p.requires_grad]
-        pred_mod = getattr(nm, "n_tf_predictor", None)
-        if pred_mod is not None:
-            pred_params = [p for p in pred_mod.parameters() if p.requires_grad]
 
     gate_ids = {id(p) for p in gate_params}
-    pred_ids = {id(p) for p in pred_params}
     remaining = [
         p
         for p in model.parameters()
-        if p.requires_grad and id(p) not in gate_ids and id(p) not in pred_ids
+        if p.requires_grad and id(p) not in gate_ids
     ]
 
     groups: list[dict[str, object]] = []
@@ -1139,25 +895,19 @@ def _build_optimizer(model: nn.Module, cfg: TrainConfig) -> Adam:
         groups.append({"params": remaining, "weight_decay": cfg.weight_decay, "lr": base_lr})
     if gate_params:
         groups.append({"params": gate_params, "weight_decay": gate_wd, "lr": gate_lr})
-    if pred_params:
-        groups.append({"params": pred_params, "weight_decay": pred_wd, "lr": predictor_lr})
 
     return Adam(groups, lr=base_lr)
 
 
-def _get_nm_params(model: nn.Module) -> tuple[list, list]:
-    """Return (gate_params, pred_params) from model.nm."""
+def _get_gate_params(model: nn.Module) -> list:
+    """Return gate params from model.nm."""
     nm = getattr(model, "nm", None)
-    gate_params: list = []
-    pred_params: list = []
-    if nm is not None:
-        gate_mod = getattr(nm, "gate", None)
-        if gate_mod is not None:
-            gate_params = [p for p in gate_mod.parameters() if p.requires_grad]
-        pred_mod = getattr(nm, "n_tf_predictor", None)
-        if pred_mod is not None:
-            pred_params = [p for p in pred_mod.parameters() if p.requires_grad]
-    return gate_params, pred_params
+    if nm is None:
+        return []
+    gate_mod = getattr(nm, "gate", None)
+    if gate_mod is None:
+        return []
+    return [p for p in gate_mod.parameters() if p.requires_grad]
 
 
 def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
@@ -1166,34 +916,20 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
     losses = []
     task_losses = []
     aux_losses = []
-    stat_losses: list[float] = []
-    l_e_vals: list[float] = []
-    l_p_vals: list[float] = []
-    pred_sup_mse_vals: list[float] = []
-    has_nm_stat = (
+    # Aux stats accumulators
+    aux_stat_keys = ["aux_total", "L_easy", "L_white", "L_js", "L_w1", "L_min", "L_e_tv"]
+    aux_stat_vals: dict[str, list[float]] = {k: [] for k in aux_stat_keys}
+
+    has_nm_aux = (
         hasattr(model, "nm")
         and model.nm is not None
-        and hasattr(model.nm, "get_last_stationarity_stats")
+        and hasattr(model.nm, "get_last_aux_stats")
     )
-    # Determine if pred supervision loss should be computed each batch
-    _nm_for_pred = getattr(model, "nm", None)
-    _use_pred_sup = (
-        bool(getattr(cfg, "predict_n_time", False))
-        and float(getattr(cfg, "pred_loss_weight", 0.0)) > 0.0
-        and _nm_for_pred is not None
-        and hasattr(_nm_for_pred, "pred_supervision_loss")
-    )
+
     aux_scale = _aux_scale(cfg, epoch_idx)
     print(f"aux_loss_scale: {aux_scale:.6f}")
 
-    # Reset denorm branch counters at epoch start
-    nm = getattr(model, "nm", None)
-    if nm is not None:
-        nm._denorm_used_pred = 0
-        nm._denorm_used_input = 0
-        nm._denorm_used_extrap = 0
-
-    gate_params, pred_params = _get_nm_params(model)
+    gate_params = _get_gate_params(model)
     first_batch_done = False
 
     with tqdm(total=len(loader.dataset), leave=True) as pbar:
@@ -1220,23 +956,14 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
 
             task_loss = loss_fn(pred, true)
             aux_loss = torch.tensor(0.0, device=task_loss.device)
-            if hasattr(model.nm, "loss_with_target"):
-                aux_loss = model.nm.loss_with_target(true)
-            elif hasattr(model.nm, "loss"):
+            if hasattr(model.nm, "loss"):
                 aux_loss = model.nm.loss(true)
 
-            # Prediction supervision loss (teacher extraction oracle)
-            pred_sup_loss = torch.tensor(0.0, device=task_loss.device)
-            if _use_pred_sup:
-                pred_sup_loss = _nm_for_pred.pred_supervision_loss(batch_y)
-                pred_sup_mse_vals.append(float(_nm_for_pred._last_pred_sup_loss))
+            loss = task_loss + aux_loss * aux_scale
 
-            loss = task_loss + aux_loss * aux_scale + cfg.pred_loss_weight * pred_sup_loss
-
-            # --- First-batch gradient / update-ratio collection ---
+            # First-batch gradient collection
             if not first_batch_done:
-                # Snapshot param values before optimizer.step (for update ratio)
-                pred_snap = [p.data.clone() for p in pred_params]
+                gate_snap_norms = [p.data.norm().item() for p in gate_params]
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
@@ -1244,24 +971,13 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
             if not first_batch_done:
                 gate_grad_norm = _grad_norm_or_nan(gate_params)
                 gate_param_norm = _norm_or_nan(gate_params)
-                pred_grad_norm = _grad_norm_or_nan(pred_params)
-                pred_param_norm = _norm_or_nan(pred_params)
 
             optimizer.step()
 
             if not first_batch_done:
-                if pred_params and pred_snap:
-                    num = float(sum((p.data - s).norm() ** 2 for p, s in zip(pred_params, pred_snap)) ** 0.5)
-                    den = float(sum(s.norm() ** 2 for s in pred_snap) ** 0.5) + 1e-12
-                    update_ratio_pred = num / den
-                else:
-                    update_ratio_pred = float("nan")
                 grad_info = {
                     "gate_grad_norm": gate_grad_norm,
                     "gate_param_norm": gate_param_norm,
-                    "pred_grad_norm": pred_grad_norm,
-                    "pred_param_norm": pred_param_norm,
-                    "update_ratio_predictor": update_ratio_pred,
                 }
                 collect_and_print_debug(
                     "TRAIN_DBG", model, cfg,
@@ -1276,18 +992,18 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
             losses.append(loss.item())
             task_losses.append(task_loss.item())
             aux_losses.append(aux_loss.item())
-            if has_nm_stat:
-                s = model.nm.get_last_stationarity_stats()
-                stat_losses.append(s["stationarity_loss"])
-                l_e_vals.append(s["L_E"])
-                l_p_vals.append(s["L_P"])
+            if has_nm_aux:
+                s = model.nm.get_last_aux_stats()
+                for k in aux_stat_keys:
+                    aux_stat_vals[k].append(float(s.get(k, 0.0)))
+
             pbar.update(batch_x.size(0))
             pbar.set_postfix(
                 task=f"{task_loss.item():.4f}",
                 aux=f"{aux_loss.item():.4f}",
                 total=f"{loss.item():.4f}",
             )
-    
+
     # Get gate statistics from model
     gate_stats_str = ""
     if hasattr(model, "nm") and model.nm is not None and hasattr(model.nm, "get_last_gate_stats"):
@@ -1298,17 +1014,13 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
             f"entF={stats['gate_ent_f']:.4f}"
         )
 
-    train_stat: dict[str, float] = {}
-    if stat_losses:
-        train_stat = {
-            "stationarity_loss": float(np.mean(stat_losses)),
-            "L_E": float(np.mean(l_e_vals)),
-            "L_P": float(np.mean(l_p_vals)),
-            "task_loss": float(np.mean(task_losses)),
-            "aux_loss": float(np.mean(aux_losses)),
-        }
-    if pred_sup_mse_vals:
-        train_stat["pred_sup_mse"] = float(np.mean(pred_sup_mse_vals))
+    train_stat: dict[str, float] = {
+        "task_loss": float(np.mean(task_losses)) if task_losses else 0.0,
+        "aux_loss": float(np.mean(aux_losses)) if aux_losses else 0.0,
+    }
+    if has_nm_aux and aux_stat_vals["aux_total"]:
+        for k in aux_stat_keys:
+            train_stat[k] = float(np.mean(aux_stat_vals[k]))
 
     return float(np.mean(losses)) if losses else 0.0, gate_stats_str, train_stat
 
@@ -1319,23 +1031,16 @@ def evaluate(model, loader, cfg, scaler, debug_prefix: str | None = None):
     metrics = _build_metrics(torch.device(cfg.device))
     for metric in metrics.values():
         metric.reset()
-    has_nm_stat = (
+
+    has_nm_aux = (
         hasattr(model, "nm")
         and model.nm is not None
-        and hasattr(model.nm, "get_last_stationarity_stats")
         and hasattr(model.nm, "loss")
+        and hasattr(model.nm, "get_last_aux_stats")
     )
-    stat_losses: list[float] = []
-    l_e_vals: list[float] = []
-    l_p_vals: list[float] = []
-    pred_sup_mse_vals: list[float] = []
-    _nm_eval = getattr(model, "nm", None)
-    _use_pred_sup_eval = (
-        bool(getattr(cfg, "predict_n_time", False))
-        and float(getattr(cfg, "pred_loss_weight", 0.0)) > 0.0
-        and _nm_eval is not None
-        and hasattr(_nm_eval, "pred_supervision_loss")
-    )
+    aux_stat_keys = ["aux_total", "L_easy", "L_white", "L_js", "L_w1", "L_min", "L_e_tv"]
+    aux_stat_vals: dict[str, list[float]] = {k: [] for k in aux_stat_keys}
+
     first_batch_done = False
     for batch_x, batch_y, origin_y, batch_x_enc, batch_y_enc in loader:
         batch_x = batch_x.to(cfg.device).float()
@@ -1351,18 +1056,12 @@ def evaluate(model, loader, cfg, scaler, debug_prefix: str | None = None):
                 batch_x, batch_y_enc, batch_x_enc, label_len
             )
         pred = model(batch_x, batch_x_enc, dec_inp, dec_inp_enc)
-        if has_nm_stat:
-            # Compute stationarity stats from the forward pass (_last_r_tf is set)
-            model.nm.loss()
-            s = model.nm.get_last_stationarity_stats()
-            stat_losses.append(s["stationarity_loss"])
-            l_e_vals.append(s["L_E"])
-            l_p_vals.append(s["L_P"])
 
-        # Prediction supervision tracking (no grad; updates _last_pred_sup_loss cache)
-        if _use_pred_sup_eval:
-            _nm_eval.pred_supervision_loss(batch_y)
-            pred_sup_mse_vals.append(float(_nm_eval._last_pred_sup_loss))
+        if has_nm_aux:
+            model.nm.loss()
+            s = model.nm.get_last_aux_stats()
+            for k in aux_stat_keys:
+                aux_stat_vals[k].append(float(s.get(k, 0.0)))
 
         # First-batch debug print for val/test
         if debug_prefix is not None and not first_batch_done:
@@ -1390,12 +1089,9 @@ def evaluate(model, loader, cfg, scaler, debug_prefix: str | None = None):
             metric.update(pred, true)
 
     results = {name: float(metric.compute()) for name, metric in metrics.items()}
-    if stat_losses:
-        results["stationarity_loss"] = float(np.mean(stat_losses))
-        results["L_E"] = float(np.mean(l_e_vals))
-        results["L_P"] = float(np.mean(l_p_vals))
-    if pred_sup_mse_vals:
-        results["pred_sup_mse"] = float(np.mean(pred_sup_mse_vals))
+    if has_nm_aux and aux_stat_vals["aux_total"]:
+        for k in aux_stat_keys:
+            results[k] = float(np.mean(aux_stat_vals[k]))
     return results
 
 
@@ -1433,25 +1129,20 @@ def main(argv: list[str] | None = None):
 
     model = build_model(cfg, dataset.num_features).to(cfg.device)
 
-    # Auto-calibrate stationarity margin thresholds from training data
-    # Skipped when user explicitly supplied non-zero delta_E or delta_P
-    if cfg.auto_thresholds and cfg.delta_E == 0.0 and cfg.delta_P == 0.0:
+    # Auto-calibrate trigger mask thresholds from training data
+    # Only run when both delta_E_mask and delta_P_mask are unset (== 0)
+    if cfg.auto_thresholds and cfg.delta_E_mask == 0.0 and cfg.delta_P_mask == 0.0:
         nm = getattr(model, "nm", None)
-        if nm is not None and hasattr(nm, "delta_E"):
-            delta_E, delta_P, delta_E_mask, delta_P_mask = calibrate_thresholds(
+        if nm is not None and hasattr(nm, "delta_E_mask"):
+            delta_E_mask, delta_P_mask = calibrate_thresholds(
                 model, dataloader.train_loader, cfg, max_batches=200
             )
-            cfg.delta_E = delta_E
-            cfg.delta_P = delta_P
             cfg.delta_E_mask = delta_E_mask
             cfg.delta_P_mask = delta_P_mask
-            nm.delta_E = delta_E
-            nm.delta_P = delta_P
             nm.delta_E_mask = delta_E_mask
             nm.delta_P_mask = delta_P_mask
             print(
                 f"[Calibration] trigger_q={cfg.trigger_q}"
-                f"  delta_E={delta_E:.6f}  delta_P={delta_P:.6f}"
                 f"  delta_E_mask={delta_E_mask:.6f}  delta_P_mask={delta_P_mask:.6f}"
                 f"  trigger_mask={cfg.trigger_mask}"
             )
@@ -1504,24 +1195,23 @@ def main(argv: list[str] | None = None):
         val_metrics = evaluate(model, dataloader.val_loader, cfg, scaler, debug_prefix="VAL_DBG")
         test_metrics = evaluate(model, dataloader.test_loader, cfg, scaler)
 
-        # Build stationarity info strings
+        # Build aux info strings
         train_stat_str = ""
         if train_stat:
-            train_stat_str = (
-                f" | task_loss={train_stat['task_loss']:.6f}"
-                f", stat_loss={train_stat['stationarity_loss']:.6f}"
-                f" (L_E={train_stat['L_E']:.6f}, L_P={train_stat['L_P']:.6f})"
-            )
-            if "pred_sup_mse" in train_stat:
-                train_stat_str += f", pred_sup_mse={train_stat['pred_sup_mse']:.6e}"
+            train_stat_str = f" | task={train_stat.get('task_loss', 0.0):.6f}"
+            if "aux_total" in train_stat:
+                train_stat_str += (
+                    f" aux_total={train_stat['aux_total']:.6e}"
+                    f" (L_easy={train_stat.get('L_easy', 0.0):.3e}"
+                    f" L_white={train_stat.get('L_white', 0.0):.3e}"
+                    f" L_js={train_stat.get('L_js', 0.0):.3e}"
+                    f" L_w1={train_stat.get('L_w1', 0.0):.3e}"
+                    f" L_min={train_stat.get('L_min', 0.0):.3e}"
+                    f" L_e_tv={train_stat.get('L_e_tv', 0.0):.3e})"
+                )
         val_stat_str = ""
-        if "stationarity_loss" in val_metrics:
-            val_stat_str = (
-                f" | stat_loss={val_metrics['stationarity_loss']:.6f}"
-                f" (L_E={val_metrics['L_E']:.6f}, L_P={val_metrics['L_P']:.6f})"
-            )
-        if "pred_sup_mse" in val_metrics:
-            val_stat_str += f", pred_sup_mse={val_metrics['pred_sup_mse']:.6e}"
+        if "aux_total" in val_metrics:
+            val_stat_str = f" | aux_total={val_metrics['aux_total']:.6e}"
 
         print(f"Epoch: {epoch + 1} Training loss: {train_loss:.6f}{gate_info}{train_stat_str}")
         print(
