@@ -199,6 +199,12 @@ class LocalTFNorm(nn.Module):
         self._last_n_hist_time: Optional[torch.Tensor] = None   # (B, C, window) detached
         self._last_n_pred_future: Optional[torch.Tensor] = None # (B, C, pred_len) w/ grad
 
+        # Teacher debug caches (set by teacher_n_future())
+        self._last_teacher_T_hist: int = 0
+        self._last_teacher_T_full: int = 0
+        self._last_teacher_mask_hist_rate: float = 0.0
+        self._last_teacher_mask_full_rate: float = 0.0
+
         # Aux loss scalar caches (detached, for logging)
         self._last_aux_total: float = 0.0
         self._last_L_easy: float = 0.0
@@ -474,10 +480,11 @@ class LocalTFNorm(nn.Module):
                 sE_t = dE_x / (de + 1e-8)                          # (B, C, T-1)
                 sP_t = dP_mean_x / (dp + 1e-8)
                 s_t = torch.maximum(sE_t, sP_t)
-                if self.trigger_soft:
-                    w_trans = torch.sigmoid((s_t - 1.0) / self.trigger_soft_tau)
-                else:
+                # Force hard binary mask when teacher_mask_only (align decomp with causal teacher)
+                if self.teacher_mask_only or not self.trigger_soft:
                     w_trans = (s_t > 1.0).float()
+                else:
+                    w_trans = torch.sigmoid((s_t - 1.0) / self.trigger_soft_tau)
                 # Spread transition weights to frame weights
                 w_frame = torch.zeros(B, C, T, device=x_tf.device, dtype=w_trans.dtype)
                 w_frame[..., :-1] = torch.maximum(w_frame[..., :-1], w_trans)
@@ -490,10 +497,11 @@ class LocalTFNorm(nn.Module):
                 sE_tf = dE_x / (de + 1e-8)                         # (B, C, T-1)
                 sP_tf = dP_f_x / (dp + 1e-8)                       # (B, C, F, T-1)
                 s_tf = torch.maximum(sE_tf.unsqueeze(2), sP_tf)    # (B, C, F, T-1)
-                if self.trigger_soft:
-                    w_trans = torch.sigmoid((s_tf - 1.0) / self.trigger_soft_tau)
-                else:
+                # Force hard binary mask when teacher_mask_only (align decomp with causal teacher)
+                if self.teacher_mask_only or not self.trigger_soft:
                     w_trans = (s_tf > 1.0).float()
+                else:
+                    w_trans = torch.sigmoid((s_tf - 1.0) / self.trigger_soft_tau)
                 w_frame = torch.zeros(B, C, F, T, device=x_tf.device, dtype=w_trans.dtype)
                 w_frame[..., :-1] = torch.maximum(w_frame[..., :-1], w_trans)
                 w_frame[..., 1:] = torch.maximum(w_frame[..., 1:], w_trans)
@@ -562,8 +570,8 @@ class LocalTFNorm(nn.Module):
             # Use learned N_predictor to add back the predicted future N component
             n_hist = self._last_n_hist_time              # (B, C, window) detached
             n_pred_future = self.n_predictor(n_hist)     # (B, C, pred_len)
-            self._last_n_pred_future = n_pred_future
-            n_time = n_pred_future.transpose(1, 2)       # (B, pred_len, C)
+            self._last_n_pred_future = n_pred_future     # w/ grad for pred_n_loss
+            n_time = n_pred_future.detach().transpose(1, 2)  # detached: task_loss must not train predictor
         elif target_len == state.length:
             n_time = state.n_time
         else:
@@ -589,32 +597,20 @@ class LocalTFNorm(nn.Module):
     def teacher_n_future(
         self, x_hist_raw: torch.Tensor, y_true_raw: torch.Tensor
     ) -> torch.Tensor:
-        """Compute ground-truth N future via teacher (trigger-mask) decomposition.
+        """Compute causal ground-truth N future via teacher (trigger-mask) decomposition.
 
-        The computation mirrors normalize() but runs over the full history+future
-        window under no_grad, using history stats for instance norm.
+        The future mask is derived ONLY from history frames (causal). The history mask is
+        expanded to cover future STFT frames by repeating the last history frame.
+        Always uses a hard binary trigger (no soft sigmoid), aligned with the
+        teacher_mask_only hard-mask decomposition in normalize().
 
         Args:
-            x_hist_raw: (B, window, C) — in the same space as model input
+            x_hist_raw: (B, window, C) — raw history in the same space as model input
             y_true_raw: (B, pred_len, C) — ground-truth future in the same space
 
         Returns:
             (B, C, pred_len) N future in per-sample instance-normed space
         """
-        x_full_raw = torch.cat([x_hist_raw, y_true_raw], dim=1)   # (B, window+pred_len, C)
-        full_len = x_full_raw.shape[1]
-
-        # Instance norm using HISTORY stats only (mirrors normalize())
-        if self.use_instance_norm:
-            inst_mean = x_hist_raw.mean(dim=1, keepdim=True)        # (B, 1, C)
-            inst_std  = x_hist_raw.std(dim=1, keepdim=True) + 1e-8  # (B, 1, C)
-            x_full = (x_full_raw - inst_mean) / inst_std
-        else:
-            x_full = x_full_raw
-
-        x_full_tf = self.stft(x_full)                               # (B, C, F, T_full)
-        B, C, F, T_full = x_full_tf.shape
-
         if self.delta_E_mask <= 0.0 or self.delta_P_mask <= 0.0:
             raise RuntimeError(
                 "teacher_n_future() requires delta_E_mask > 0 and delta_P_mask > 0"
@@ -622,37 +618,67 @@ class LocalTFNorm(nn.Module):
         de = self.delta_E_mask
         dp = self.delta_P_mask
 
-        dE_full, dP_mean_full = self._dE_dP_from_tf(x_full_tf)    # (B, C, T_full-1)
-        if self.trigger_mask_mode == "tf":
-            dP_f_full, _ = self._dP_mean_and_perF(x_full_tf)      # (B, C, F, T_full-1)
+        # Instance norm using HISTORY stats only (mirrors normalize()); clamp std
+        if self.use_instance_norm:
+            inst_mean = x_hist_raw.mean(dim=1, keepdim=True)                   # (B, 1, C)
+            inst_std  = x_hist_raw.std(dim=1, keepdim=True).clamp_min(1e-6)    # (B, 1, C)
+            x_hist = (x_hist_raw - inst_mean) / inst_std
+            y_true = (y_true_raw - inst_mean) / inst_std
+        else:
+            x_hist = x_hist_raw
+            y_true = y_true_raw
+
+        x_full = torch.cat([x_hist, y_true], dim=1)                            # (B, window+pred_len, C)
+        full_len = x_full.shape[1]
+
+        # STFT history (for causal mask) and full sequence (for N extraction)
+        x_hist_tf = self.stft(x_hist)                                          # (B, C, F, T_hist)
+        x_full_tf = self.stft(x_full)                                          # (B, C, F, T_full)
+        B, C, F, T_hist = x_hist_tf.shape
+        T_full = x_full_tf.shape[-1]
+
+        # Causal hard-binary mask from history frames ONLY
+        dE_hist, dP_mean_hist = self._dE_dP_from_tf(x_hist_tf)                # (B, C, T_hist-1)
 
         if self.trigger_mask_mode == "time":
-            s_t = torch.maximum(dE_full / (de + 1e-8), dP_mean_full / (dp + 1e-8))
-            if self.trigger_soft:
-                w_trans = torch.sigmoid((s_t - 1.0) / self.trigger_soft_tau)
-            else:
-                w_trans = (s_t > 1.0).float()
-            w_frame = torch.zeros(B, C, T_full, device=x_full_tf.device, dtype=w_trans.dtype)
-            w_frame[..., :-1] = torch.maximum(w_frame[..., :-1], w_trans)
-            w_frame[..., 1:]  = torch.maximum(w_frame[..., 1:],  w_trans)
-            mask = w_frame.unsqueeze(2)                             # (B, C, 1, T_full)
+            # Hard trigger: (dE > de) OR (dP_mean > dp)  [equiv. to max(dE/de, dP/dp) > 1]
+            trig_hist = (dE_hist > de) | (dP_mean_hist > dp)                  # (B, C, T_hist-1)
+            mask_hist_t = torch.zeros(B, C, T_hist, device=x_hist_tf.device, dtype=torch.float32)
+            mask_hist_t[..., :-1] = torch.maximum(mask_hist_t[..., :-1], trig_hist.float())
+            mask_hist_t[..., 1:]  = torch.maximum(mask_hist_t[..., 1:],  trig_hist.float())
+            # Expand to full length: repeat last history STFT frame for future frames
+            last         = mask_hist_t[..., -1:]                              # (B, C, 1)
+            tail         = last.expand(-1, -1, T_full - T_hist)              # (B, C, T_full-T_hist)
+            mask_full_t  = torch.cat([mask_hist_t, tail], dim=-1)            # (B, C, T_full)
+            mask_full_tf = mask_full_t.unsqueeze(2)                          # (B, C, 1, T_full) -> bcast F
+            # Cache debug stats
+            self._last_teacher_T_hist = T_hist
+            self._last_teacher_T_full = T_full
+            self._last_teacher_mask_hist_rate = float(mask_hist_t.mean().item())
+            self._last_teacher_mask_full_rate = float(mask_full_t.mean().item())
         else:  # "tf"
-            sE_tf = dE_full / (de + 1e-8)
-            sP_tf = dP_f_full / (dp + 1e-8)
-            s_tf  = torch.maximum(sE_tf.unsqueeze(2), sP_tf)      # (B, C, F, T_full-1)
-            if self.trigger_soft:
-                w_trans = torch.sigmoid((s_tf - 1.0) / self.trigger_soft_tau)
-            else:
-                w_trans = (s_tf > 1.0).float()
-            w_frame = torch.zeros(B, C, F, T_full, device=x_full_tf.device, dtype=w_trans.dtype)
-            w_frame[..., :-1] = torch.maximum(w_frame[..., :-1], w_trans)
-            w_frame[..., 1:]  = torch.maximum(w_frame[..., 1:],  w_trans)
-            mask = w_frame                                          # (B, C, F, T_full)
+            dP_f_hist, _ = self._dP_mean_and_perF(x_hist_tf)                 # (B, C, F, T_hist-1)
+            # Hard trigger per (freq, time) cell; energy trigger broadcast across freq
+            trig_E       = (dE_hist > de).unsqueeze(2)                       # (B, C, 1, T_hist-1)
+            trig_P       = (dP_f_hist > dp)                                  # (B, C, F, T_hist-1)
+            trig_hist_tf = (trig_E | trig_P).float()                         # (B, C, F, T_hist-1)
+            mask_hist_tf = torch.zeros(B, C, F, T_hist, device=x_hist_tf.device, dtype=torch.float32)
+            mask_hist_tf[..., :-1] = torch.maximum(mask_hist_tf[..., :-1], trig_hist_tf)
+            mask_hist_tf[..., 1:]  = torch.maximum(mask_hist_tf[..., 1:],  trig_hist_tf)
+            # Expand to full length: repeat last history STFT frame for future frames
+            last         = mask_hist_tf[..., -1:]                            # (B, C, F, 1)
+            tail         = last.expand(-1, -1, -1, T_full - T_hist)         # (B, C, F, T_full-T_hist)
+            mask_full_tf = torch.cat([mask_hist_tf, tail], dim=-1)          # (B, C, F, T_full)
+            # Cache debug stats
+            self._last_teacher_T_hist = T_hist
+            self._last_teacher_T_full = T_full
+            self._last_teacher_mask_hist_rate = float(mask_hist_tf.mean().item())
+            self._last_teacher_mask_full_rate = float(mask_full_tf.mean().item())
 
-        n_full_tf   = mask * x_full_tf                             # (B, C, F, T_full)
-        n_full_time = self.stft.inverse(n_full_tf, length=full_len) # (B, window+pred_len, C)
-        n_future_true = n_full_time[:, -self.pred_len:, :]         # (B, pred_len, C)
-        return n_future_true.permute(0, 2, 1)                      # (B, C, pred_len)
+        n_full_tf   = mask_full_tf * x_full_tf                                # (B, C, F, T_full)
+        n_full_time = self.stft.inverse(n_full_tf, length=full_len)           # (B, window+pred_len, C)
+        n_future_true = n_full_time[:, -self.pred_len:, :]                    # (B, pred_len, C)
+        return n_future_true.permute(0, 2, 1)                                 # (B, C, pred_len)
 
     # ------------------------------------------------------------------
     # Loss

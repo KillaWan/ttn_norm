@@ -891,6 +891,19 @@ def collect_and_print_debug(
         f" ratio_n_hist={ratio_n_true_pred:.4f}"
     )
 
+    # ------------------------------------------------------------------ NPRED_TEACHER
+    if nm is not None and cfg.future_mode == "pred":
+        t_hist          = getattr(nm, "_last_teacher_T_hist", 0)
+        t_full          = getattr(nm, "_last_teacher_T_full", 0)
+        mask_hist_rate  = getattr(nm, "_last_teacher_mask_hist_rate", nan)
+        mask_full_rate  = getattr(nm, "_last_teacher_mask_full_rate", nan)
+        print(
+            f"[{prefix}][NPRED_TEACHER]"
+            f" T_hist={t_hist} T_full={t_full}"
+            f" mask_hist_rate={mask_hist_rate:.4f}"
+            f" mask_full_rate={mask_full_rate:.4f}"
+        )
+
     # ------------------------------------------------------------------ GRAD
     gi = grad_info or {}
     print(
