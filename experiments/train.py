@@ -419,6 +419,11 @@ class TrainConfig:
     gate_sup_target: str = "soft"
     gate_sup_source: str = "P_only"
     gate_sup_wE: float = 0.0
+    trigger_soft: bool = True
+    trigger_soft_tau: float = 0.25
+    n_energy_reg_enable: bool = True
+    n_energy_reg_weight: float = 0.05
+    n_energy_reg_mode: str = "ntf_l2"
 
     # ------------------------------------------------------------------ baseline norm configs
     # RevIN
@@ -532,6 +537,11 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             gate_sup_target=cfg.gate_sup_target,
             gate_sup_source=cfg.gate_sup_source,
             gate_sup_wE=cfg.gate_sup_wE,
+            trigger_soft=cfg.trigger_soft,
+            trigger_soft_tau=cfg.trigger_soft_tau,
+            n_energy_reg_enable=cfg.n_energy_reg_enable,
+            n_energy_reg_weight=cfg.n_energy_reg_weight,
+            n_energy_reg_mode=cfg.n_energy_reg_mode,
         )
     label_len = cfg.label_len or (cfg.window // 2)
     label_len = min(label_len, cfg.window)
@@ -1062,6 +1072,19 @@ def collect_and_print_debug(
             f" pos_rate={_sup_pos_rate:.4f}"
             f" mixed_rate={_sup_mixed_rate:.4f}"
             f" y_stdF={_sup_y_stdF:.4f}"
+        )
+        # ------------------------------------------------------------------ WGATE (soft trigger + energy reg)
+        _w_mean = float(getattr(nm, "_dbg_w_mean", nan))
+        _w_max = float(getattr(nm, "_dbg_w_max", nan))
+        _g_raw_mean = float(getattr(nm, "_dbg_g_raw_mean", nan))
+        _g_eff_mean = float(getattr(nm, "_dbg_g_eff_mean", nan))
+        _n_energy = float(getattr(nm, "_dbg_n_energy", nan))
+        _n_energy_reg = float(getattr(nm, "_dbg_n_energy_reg", nan))
+        print(
+            f"[{prefix}][WGATE]"
+            f" w_mean={_w_mean:.4f} w_max={_w_max:.4f}"
+            f" g_raw_mean={_g_raw_mean:.4f} g_eff_mean={_g_eff_mean:.4f}"
+            f" n_energy={_n_energy:.6e} n_energy_reg={_n_energy_reg:.6e}"
         )
 
 

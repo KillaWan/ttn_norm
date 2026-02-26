@@ -145,6 +145,11 @@ class LocalTFNorm(nn.Module):
         gate_sup_target: str = "soft",
         gate_sup_source: str = "P_only",
         gate_sup_wE: float = 0.0,
+        trigger_soft: bool = True,
+        trigger_soft_tau: float = 0.25,
+        n_energy_reg_enable: bool = True,
+        n_energy_reg_weight: float = 0.05,
+        n_energy_reg_mode: str = "ntf_l2",
         **kwargs,
     ):
         super().__init__()
@@ -162,6 +167,12 @@ class LocalTFNorm(nn.Module):
             raise ValueError(f"gate_sup_source must be 'P_only' or 'EP_max', got {gate_sup_source!r}")
         if gate_sup_wE < 0:
             raise ValueError(f"gate_sup_wE must be >= 0, got {gate_sup_wE}")
+        if trigger_soft_tau <= 0:
+            raise ValueError(f"trigger_soft_tau must be > 0, got {trigger_soft_tau}")
+        if n_energy_reg_weight < 0:
+            raise ValueError(f"n_energy_reg_weight must be >= 0, got {n_energy_reg_weight}")
+        if n_energy_reg_mode not in ("ntf_l2", "ntf_l1", "g_l1"):
+            raise ValueError(f"n_energy_reg_mode must be 'ntf_l2', 'ntf_l1', or 'g_l1', got {n_energy_reg_mode!r}")
         self.shape_loss_mode = shape_loss_mode
         self.trigger_mask_mode = trigger_mask_mode
         self.seq_len = seq_len
@@ -202,6 +213,11 @@ class LocalTFNorm(nn.Module):
         self.gate_sup_target = gate_sup_target
         self.gate_sup_source = gate_sup_source
         self.gate_sup_wE = float(gate_sup_wE)
+        self.trigger_soft = bool(trigger_soft)
+        self.trigger_soft_tau = float(trigger_soft_tau)
+        self.n_energy_reg_enable = bool(n_energy_reg_enable)
+        self.n_energy_reg_weight = float(n_energy_reg_weight)
+        self.n_energy_reg_mode = n_energy_reg_mode
 
         if n_fft is None:
             n_fft = min(64, max(16, seq_len // 4))
@@ -322,6 +338,16 @@ class LocalTFNorm(nn.Module):
 
         # Gate supervision loss tensor (with grad) for loss() aggregation
         self._last_L_sup_tensor: Optional[torch.Tensor] = None
+        # Non-stationary energy regularization loss tensor (with grad) for loss() aggregation
+        self._last_L_n_tensor: Optional[torch.Tensor] = None
+
+        # Trigger-soft and energy diagnostic caches
+        self._dbg_w_mean: float = float("nan")
+        self._dbg_w_max: float = float("nan")
+        self._dbg_n_energy: float = float("nan")
+        self._dbg_g_eff_mean: float = float("nan")
+        self._dbg_g_raw_mean: float = float("nan")
+        self._dbg_n_energy_reg: float = float("nan")
 
     def _dE_dP_from_tf(
         self, tf_complex: torch.Tensor
@@ -636,6 +662,8 @@ class LocalTFNorm(nn.Module):
         # Supervision targets — computed unconditionally after the if/else block
         y_tf_sup: Optional[torch.Tensor] = None
         trig_tf_sup: Optional[torch.Tensor] = None
+        # w_frame for diagnostics (None when trigger_mask=False)
+        _w_frame_for_diag: Optional[torch.Tensor] = None
 
         # Trigger mask: restrict effective gate to boundary frames only
         if self.trigger_mask:
@@ -653,16 +681,28 @@ class LocalTFNorm(nn.Module):
             self._last_mask_delta_P = float(dp)
 
             if self.trigger_mask_mode == "time":
-                # ---- TIME mode: existing behaviour (broadcast over freq) ----
-                trig = (dE_x > de) | (dP_mean_x > dp)           # (B, C, T-1)
+                # ---- TIME mode ----
+                trig = (dE_x > de) | (dP_mean_x > dp)           # (B, C, T-1) hard trigger (diagnostic ref)
                 mask_t = torch.zeros(B_sz, C_sz, T, dtype=torch.bool, device=x_tf.device)
                 mask_t[..., :-1] |= trig
                 mask_t[..., 1:] |= trig
-                mask_f = mask_t.unsqueeze(2).float()             # (B, C, 1, T)
-                g_eff = g_local * mask_f                         # (B, C, F, T)
 
-                self._last_trigger_mask_t = mask_t.detach()
-                self._last_mask_rate = float(mask_t.float().mean().cpu().item())
+                # Soft (or hard) per-frame gate weight from excess strength
+                sE_t = dE_x / (de + 1e-8)                       # (B, C, T-1)
+                sP_t = dP_mean_x / (dp + 1e-8)                  # (B, C, T-1)
+                s_t = torch.maximum(sE_t, sP_t)                  # (B, C, T-1)
+                if self.trigger_soft:
+                    w_trans = torch.sigmoid((s_t - 1.0) / self.trigger_soft_tau)
+                else:
+                    w_trans = (s_t > 1.0).float()
+                w_t = torch.zeros(B_sz, C_sz, T, device=x_tf.device, dtype=w_trans.dtype)
+                w_t[..., :-1] = torch.maximum(w_t[..., :-1], w_trans)
+                w_t[..., 1:] = torch.maximum(w_t[..., 1:], w_trans)
+                g_eff = g_raw * w_t.unsqueeze(2)                 # (B, C, F, T)
+                _w_frame_for_diag = w_t.detach().unsqueeze(2)    # (B, C, 1, T)
+
+                self._last_trigger_mask_t = (w_t > 0.5).detach()
+                self._last_mask_rate = float((w_t > 0.5).float().mean().cpu().item())
                 self._last_mask_trig_rate = float(trig.float().mean().cpu().item())
                 self._last_mask_rate_tf = float("nan")
                 self._last_mask_trig_rate_tf = float("nan")
@@ -704,20 +744,33 @@ class LocalTFNorm(nn.Module):
                 _sf_total = float(_sf_flat.sum().item())
 
             else:
-                # ---- TF mode: frequency-aware mask ----
-                trig_tf = (dE_x.unsqueeze(2) > de) | (dP_f_x > dp)  # (B, C, F, T-1)
+                # ---- TF mode ----
+                trig_tf = (dE_x.unsqueeze(2) > de) | (dP_f_x > dp)  # (B, C, F, T-1) hard trigger (diagnostic ref)
                 mask_tf = torch.zeros(B_sz, C_sz, F_sz, T, dtype=torch.bool, device=x_tf.device)
                 mask_tf[..., :-1] |= trig_tf
                 mask_tf[..., 1:] |= trig_tf
-                g_eff = g_local * mask_tf.float()                    # (B, C, F, T)
+
+                # Soft (or hard) per-(freq,frame) gate weight from excess strength
+                sE_tf = dE_x / (de + 1e-8)                               # (B, C, T-1)
+                sP_tf = dP_f_x / (dp + 1e-8)                             # (B, C, F, T-1)
+                s_tf = torch.maximum(sE_tf.unsqueeze(2), sP_tf)          # (B, C, F, T-1)
+                if self.trigger_soft:
+                    w_trans = torch.sigmoid((s_tf - 1.0) / self.trigger_soft_tau)
+                else:
+                    w_trans = (s_tf > 1.0).float()
+                w_tf = torch.zeros(B_sz, C_sz, F_sz, T, device=x_tf.device, dtype=w_trans.dtype)
+                w_tf[..., :-1] = torch.maximum(w_tf[..., :-1], w_trans)
+                w_tf[..., 1:] = torch.maximum(w_tf[..., 1:], w_trans)
+                g_eff = g_raw * w_tf                                      # (B, C, F, T)
+                _w_frame_for_diag = w_tf.detach()                         # (B, C, F, T)
 
                 # Legacy (B,C,T) fields for GQ and existing logging
-                mask_t_any = mask_tf.any(dim=2)                      # (B, C, T)
-                self._last_trigger_mask_t = mask_t_any.detach()
-                self._last_mask_rate = float(mask_t_any.float().mean().cpu().item())
-                trig_t_any = trig_tf.any(dim=2)                      # (B, C, T-1)
+                mask_t_any = mask_tf.any(dim=2)                           # (B, C, T) hard ref
+                self._last_trigger_mask_t = (w_tf.max(dim=2).values > 0.5).detach()
+                self._last_mask_rate = float((w_tf.max(dim=2).values > 0.5).float().mean().cpu().item())
+                trig_t_any = trig_tf.any(dim=2)                           # (B, C, T-1)
                 self._last_mask_trig_rate = float(trig_t_any.float().mean().cpu().item())
-                # TF-specific rates
+                # TF-specific rates (hard mask for reference)
                 self._last_mask_rate_tf = float(mask_tf.float().mean().cpu().item())
                 self._last_mask_trig_rate_tf = float(trig_tf.float().mean().cpu().item())
 
@@ -779,6 +832,7 @@ class LocalTFNorm(nn.Module):
 
         else:
             g_eff = g_local
+            _w_frame_for_diag = None
             self._last_trigger_mask_t = None
             self._last_mask_rate = 1.0
             self._last_mask_trig_rate = 0.0
@@ -824,6 +878,18 @@ class LocalTFNorm(nn.Module):
         n_tf = g_eff * x_tf
         r_tf = x_tf - n_tf
         self._last_r_tf = r_tf
+
+        # Non-stationary energy regularization (1.6)
+        _L_n_raw = torch.tensor(0.0, device=x_tf.device)
+        if self.n_energy_reg_enable and self.n_energy_reg_weight > 0.0:
+            if self.n_energy_reg_mode == "ntf_l2":
+                _L_n_raw = n_tf.abs().pow(2).mean()
+            elif self.n_energy_reg_mode == "ntf_l1":
+                _L_n_raw = n_tf.abs().mean()
+            else:  # "g_l1"
+                _L_n_raw = g_eff.mean()
+        self._last_L_n_tensor = _L_n_raw * self.n_energy_reg_weight
+
         length = batch_x.shape[1]
         residual = self.stft.inverse(r_tf, length=length)
         n_time = self.stft.inverse(n_tf, length=length)
@@ -911,6 +977,18 @@ class LocalTFNorm(nn.Module):
                     self._dbg_sup_neg_mean + 1e-8
                 )
             self._dbg_sup_bce = _bce_scalar
+
+            # Trigger-soft weight and energy diagnostics (1.7)
+            if _w_frame_for_diag is not None:
+                self._dbg_w_mean = float(_w_frame_for_diag.mean().item())
+                self._dbg_w_max = float(_w_frame_for_diag.max().item())
+            else:
+                self._dbg_w_mean = 1.0
+                self._dbg_w_max = 1.0
+            self._dbg_g_raw_mean = float(g_raw.detach().mean().item())
+            self._dbg_g_eff_mean = float(g_eff.detach().mean().item())
+            self._dbg_n_energy = float((n_tf.detach().abs() ** 2).mean().item())
+            self._dbg_n_energy_reg = float(_L_n_raw.detach().item())
 
         if return_state:
             return residual, state
@@ -1004,6 +1082,8 @@ class LocalTFNorm(nn.Module):
         L_total = L_stat
         if self._last_L_sup_tensor is not None:
             L_total = L_total + self._last_L_sup_tensor
+        if self._last_L_n_tensor is not None:
+            L_total = L_total + self._last_L_n_tensor
 
         return L_total
 
