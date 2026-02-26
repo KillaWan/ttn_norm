@@ -116,6 +116,19 @@ class LocalTFNorm(nn.Module):
                 f"gate_sparse_l1_weight > 0 requires gate_arch='lowrank_sparse', "
                 f"got gate_arch={gate_arch!r}"
             )
+        if gate_arch == "lowrank_sparse" and gate_sparse_l1_weight <= 0.0:
+            raise ValueError(
+                "gate_arch='lowrank_sparse' requires gate_sparse_l1_weight > 0 "
+                "(e.g., 1e-3) to constrain the sparse residual. "
+                "Without it the sparse conv becomes an unconstrained free 2D gate."
+            )
+        if gate_arch in ("lowrank", "lowrank_sparse") and (
+            gate_lowrank_time_ks % 2 == 0 or gate_lowrank_freq_ks % 2 == 0
+        ):
+            raise ValueError(
+                f"gate_lowrank_time_ks and gate_lowrank_freq_ks must be odd for symmetric padding. "
+                f"Got time_ks={gate_lowrank_time_ks}, freq_ks={gate_lowrank_freq_ks}."
+            )
         if gate_lowrank_u_tv_weight > 0.0 and gate_arch not in ("lowrank", "lowrank_sparse"):
             raise ValueError(
                 f"gate_lowrank_u_tv_weight > 0 requires gate_arch in ('lowrank', 'lowrank_sparse'), "
