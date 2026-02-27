@@ -431,6 +431,10 @@ class TrainConfig:
     dish_init: str = "uniform"   # "standard" | "avg" | "uniform"
     # SAN (seasonal adaptive normalization)
     san_period_len: int = 12
+    # SAN spike-robust stat estimation (used by norm_type="san_spike")
+    spike_q: float = 0.99
+    spike_dilate: int = 1
+    spike_mode: str = "mad"
 
 
 def _next_power_of_two(n: int) -> int:
@@ -471,6 +475,18 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             pred_len=cfg.pred_len,
             period_len=cfg.san_period_len,
             enc_in=num_features,
+        )
+
+    elif _nt == "san_spike":
+        norm_model = SAN(
+            seq_len=cfg.window,
+            pred_len=cfg.pred_len,
+            period_len=cfg.san_period_len,
+            enc_in=num_features,
+            spike_stats=True,
+            spike_q=cfg.spike_q,
+            spike_dilate=cfg.spike_dilate,
+            spike_mode=cfg.spike_mode,
         )
 
     else:
@@ -918,6 +934,15 @@ def collect_and_print_debug(
             f" T_hist={t_hist} T_full={t_full}"
             f" mask_hist_rate={mask_hist_rate:.4f}"
             f" mask_full_rate={mask_full_rate:.4f}"
+        )
+
+    # ------------------------------------------------------------------ SPIKE (SAN spike-robust stats)
+    if nm is not None and hasattr(nm, "get_last_spike_stats"):
+        spike_stats = nm.get_last_spike_stats()
+        print(
+            f"[{prefix}][SPIKE]"
+            f" spike_rate={spike_stats['spike_rate']:.6f}"
+            f" spike_thr_mean={spike_stats['spike_thr_mean']:.6e}"
         )
 
     # ------------------------------------------------------------------ GRAD
