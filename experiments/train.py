@@ -943,6 +943,8 @@ def collect_and_print_debug(
             f"[{prefix}][SPIKE]"
             f" spike_rate={spike_stats['spike_rate']:.6f}"
             f" spike_thr_mean={spike_stats['spike_thr_mean']:.6e}"
+            f" clip_frac={spike_stats['clip_frac']:.6f}"
+            f" sigma_min_frac={spike_stats['sigma_min_frac']:.6f}"
         )
 
     # ------------------------------------------------------------------ GRAD
