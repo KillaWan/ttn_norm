@@ -441,6 +441,11 @@ class TrainConfig:
     tfbg_time_kernel: int = 9
     tfbg_freq_kernel: int = 5
     tfbg_bmax: float = 2.0
+    # Oracle gate ablation (LocalTFNorm only)
+    gate_mode: str = "learned"       # "learned" | "oracle_train" | "oracle_eval"
+    oracle_q: float = 0.99           # quantile for oracle trigger
+    oracle_lambda_p: float = 0.25    # phase-change weight in proxy score
+    oracle_dilate: int = 1           # temporal dilation passes (1 = base mask only)
 
 
 def _next_power_of_two(n: int) -> int:
@@ -563,6 +568,10 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             gate_lowrank_use_bias=cfg.gate_lowrank_use_bias,
             gate_sparse_l1_weight=cfg.gate_sparse_l1_weight,
             gate_lowrank_u_tv_weight=cfg.gate_lowrank_u_tv_weight,
+            gate_mode=cfg.gate_mode,
+            oracle_q=cfg.oracle_q,
+            oracle_lambda_p=cfg.oracle_lambda_p,
+            oracle_dilate=cfg.oracle_dilate,
         )
     label_len = cfg.label_len or (cfg.window // 2)
     label_len = min(label_len, cfg.window)
@@ -960,6 +969,18 @@ def collect_and_print_debug(
             f" spike_thr_mean={spike_stats['spike_thr_mean']:.6e}"
             f" clip_frac={spike_stats['clip_frac']:.6f}"
             f" sigma_min_frac={spike_stats['sigma_min_frac']:.6f}"
+        )
+
+    # ------------------------------------------------------------------ ORACLE (oracle gate ablation)
+    if nm is not None and hasattr(nm, "_last_oracle_rate"):
+        oracle_rate      = getattr(nm, "_last_oracle_rate",      nan)
+        oracle_trig_rate = getattr(nm, "_last_oracle_trig_rate", nan)
+        gate_mode_str    = getattr(nm, "gate_mode",              "learned")
+        print(
+            f"[{prefix}][ORACLE]"
+            f" gate_mode={gate_mode_str}"
+            f" oracle_rate={oracle_rate:.6f}"
+            f" trig_rate={oracle_trig_rate:.6f}"
         )
 
     # ------------------------------------------------------------------ TFBG (TF-background norm)

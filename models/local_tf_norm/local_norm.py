@@ -60,6 +60,11 @@ class LocalTFNorm(nn.Module):
         gate_lowrank_use_bias: bool = True,
         gate_sparse_l1_weight: float = 0.0,
         gate_lowrank_u_tv_weight: float = 0.0,
+        # Oracle gate ablation
+        gate_mode: str = "learned",          # "learned" | "oracle_train" | "oracle_eval"
+        oracle_q: float = 0.99,              # quantile threshold for oracle trigger
+        oracle_lambda_p: float = 0.25,       # phase-change weight in proxy score
+        oracle_dilate: int = 1,              # extra dilation passes after base mask (1=no extra)
         # Aux loss hyperparams
         easy_ar_weight: float = 0.0,
         easy_ar_k: int = 8,
@@ -134,6 +139,10 @@ class LocalTFNorm(nn.Module):
                 f"gate_lowrank_u_tv_weight > 0 requires gate_arch in ('lowrank', 'lowrank_sparse'), "
                 f"got gate_arch={gate_arch!r}"
             )
+        if gate_mode not in ("learned", "oracle_train", "oracle_eval"):
+            raise ValueError(
+                f"gate_mode must be 'learned', 'oracle_train', or 'oracle_eval', got {gate_mode!r}"
+            )
 
         self.trigger_mask_mode = trigger_mask_mode
         self.seq_len = seq_len
@@ -161,6 +170,11 @@ class LocalTFNorm(nn.Module):
         self.gate_lowrank_use_bias = bool(gate_lowrank_use_bias)
         self.gate_sparse_l1_weight = float(gate_sparse_l1_weight)
         self.gate_lowrank_u_tv_weight = float(gate_lowrank_u_tv_weight)
+        # Oracle gate
+        self.gate_mode = gate_mode
+        self.oracle_q = float(oracle_q)
+        self.oracle_lambda_p = float(oracle_lambda_p)
+        self.oracle_dilate = int(oracle_dilate)
 
         # Aux loss hyperparams
         self.easy_ar_weight = float(easy_ar_weight)
@@ -221,6 +235,9 @@ class LocalTFNorm(nn.Module):
         self._last_gate_sum_f = 0.0
         self._last_gate_max_f = 0.0
         self._last_gate_ent_f = 0.0
+        # Oracle gate diagnostics
+        self._last_oracle_rate: float = 0.0
+        self._last_oracle_trig_rate: float = 0.0
 
         self._last_state: Optional[LocalTFNormState] = None
 
@@ -321,6 +338,65 @@ class LocalTFNorm(nn.Module):
     def _make_gate(self, x_tf: torch.Tensor) -> torch.Tensor:
         magnitude = self._compute_gate_magnitude(x_tf)
         return self.gate(magnitude)
+
+    @torch.no_grad()
+    def _oracle_gate_from_tf(self, x_tf_complex: torch.Tensor) -> torch.Tensor:
+        """Deterministic oracle gate derived from the TF spectrum.
+
+        Proxy score = |Δlog(|X|²)| + oracle_lambda_p * |wrap(Δphase)|,
+        thresholded per (B, C) at quantile oracle_q.  The resulting transition
+        trigger is dilated to a frame mask covering both sides of each triggered
+        edge, then optionally grown for oracle_dilate−1 additional passes.
+
+        Args:
+            x_tf_complex: (B, C, F, T) complex STFT tensor
+
+        Returns:
+            g_oracle: (B, C, F, T) float in {0.0, 1.0}  (no grad)
+        """
+        import math as _math
+        B, C, F, T = x_tf_complex.shape
+
+        if T <= 1:
+            self._last_oracle_trig_rate = 0.0
+            self._last_oracle_rate = 0.0
+            return x_tf_complex.new_zeros(B, C, F, T)
+
+        eps = self.eps_E
+        mag   = x_tf_complex.abs()                           # (B, C, F, T)
+        logE  = torch.log(mag * mag + eps)                   # (B, C, F, T)
+        phase = torch.angle(x_tf_complex)                    # (B, C, F, T)
+
+        # Temporal differences → (B, C, F, T-1)
+        dlogE  = torch.diff(logE,  dim=-1).abs()
+        dP_raw = torch.diff(phase, dim=-1)
+        dP     = ((dP_raw + _math.pi) % (2 * _math.pi) - _math.pi).abs()
+
+        score = dlogE + self.oracle_lambda_p * dP            # (B, C, F, T-1)
+
+        # Per-(B, C) quantile threshold (avoids cross-sample scale issues)
+        flat = score.reshape(B, C, F * (T - 1))
+        thr  = torch.quantile(flat, self.oracle_q, dim=-1, keepdim=True)  # (B, C, 1)
+        thr  = thr.unsqueeze(-1)                                           # (B, C, 1, 1)
+        trig = score >= thr                                                # (B, C, F, T-1)
+
+        self._last_oracle_trig_rate = float(trig.float().mean().item())
+
+        # Spread each triggered edge to both neighbouring frames → (B, C, F, T)
+        mask_t = torch.zeros(B, C, F, T, device=x_tf_complex.device, dtype=torch.bool)
+        mask_t[..., :-1] |= trig
+        mask_t[...,  1:] |= trig
+
+        # Extra dilation passes (oracle_dilate=1 means no extra pass beyond base)
+        for _ in range(self.oracle_dilate - 1):
+            expanded = mask_t.clone()
+            expanded[..., :-1] |= mask_t[..., 1:]
+            expanded[...,  1:] |= mask_t[..., :-1]
+            mask_t = expanded
+
+        g_oracle = mask_t.float()
+        self._last_oracle_rate = float(g_oracle.mean().item())
+        return g_oracle
 
     def _compute_gate_stats(self, g_local: torch.Tensor) -> None:
         """Compute gate statistics from gate activations g_local (B, C, F, T)."""
@@ -504,6 +580,17 @@ class LocalTFNorm(nn.Module):
         x_tf = self.stft(batch_x)                                   # (B, C, F, T)
         gate_magnitude = self._compute_gate_magnitude(x_tf)
         g_raw = self.gate(gate_magnitude)                           # (B, C, F, T)
+
+        # Oracle gate ablation: replace g_raw with deterministic gate (no grad)
+        _use_oracle = (
+            self.gate_mode == "oracle_train"
+            or (self.gate_mode == "oracle_eval" and not self.training)
+        )
+        if _use_oracle:
+            g_raw = self._oracle_gate_from_tf(x_tf)
+        else:
+            self._last_oracle_rate = 0.0
+            self._last_oracle_trig_rate = 0.0
 
         # Trigger mask: restrict gate to non-stationary boundary frames
         if self.trigger_mask:
