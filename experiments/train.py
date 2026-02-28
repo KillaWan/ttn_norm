@@ -16,7 +16,7 @@ from tqdm import tqdm
 from torchmetrics import MeanAbsoluteError, MeanAbsolutePercentageError, MeanSquaredError
 
 from ttn_norm.models import LocalTFNorm, TTNModel
-from ttn_norm.normalizations import DishTS, FAN, No, RevIN, SAN
+from ttn_norm.normalizations import DishTS, FAN, No, RevIN, SAN, TFBackgroundNorm
 from ttn_norm.utils.metrics import RMSE
 
 
@@ -435,6 +435,12 @@ class TrainConfig:
     spike_q: float = 0.99
     spike_dilate: int = 1
     spike_mode: str = "mad"
+    # TFBackgroundNorm (norm_type="tf_bg")
+    tfbg_n_fft: int = 0        # 0 = auto (next power of 2 above T//4)
+    tfbg_hop: int = 0          # 0 = auto (n_fft // 4)
+    tfbg_time_kernel: int = 9
+    tfbg_freq_kernel: int = 5
+    tfbg_bmax: float = 2.0
 
 
 def _next_power_of_two(n: int) -> int:
@@ -487,6 +493,15 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             spike_q=cfg.spike_q,
             spike_dilate=cfg.spike_dilate,
             spike_mode=cfg.spike_mode,
+        )
+
+    elif _nt == "tf_bg":
+        norm_model = TFBackgroundNorm(
+            n_fft=cfg.tfbg_n_fft,
+            hop_length=cfg.tfbg_hop,
+            time_kernel=cfg.tfbg_time_kernel,
+            freq_kernel=cfg.tfbg_freq_kernel,
+            bmax=cfg.tfbg_bmax,
         )
 
     else:
@@ -945,6 +960,17 @@ def collect_and_print_debug(
             f" spike_thr_mean={spike_stats['spike_thr_mean']:.6e}"
             f" clip_frac={spike_stats['clip_frac']:.6f}"
             f" sigma_min_frac={spike_stats['sigma_min_frac']:.6f}"
+        )
+
+    # ------------------------------------------------------------------ TFBG (TF-background norm)
+    if nm is not None and hasattr(nm, "get_last_stats"):
+        tfbg_stats = nm.get_last_stats()
+        print(
+            f"[{prefix}][TFBG]"
+            f" scale_min={tfbg_stats['scale_min']:.6f}"
+            f" scale_max={tfbg_stats['scale_max']:.6f}"
+            f" scale_mean={tfbg_stats['scale_mean']:.6f}"
+            f" B_std={tfbg_stats['B_std']:.6f}"
         )
 
     # ------------------------------------------------------------------ GRAD
