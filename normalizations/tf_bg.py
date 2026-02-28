@@ -214,6 +214,12 @@ class TFBackgroundNorm(nn.Module):
         return y
 
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Called by TTNModel.normalize() for unknown norm types: nm(batch_x)."""
+        return self.normalize(x)
+
+    # ------------------------------------------------------------------
     def get_last_stats(self) -> dict:
         """Diagnostics from the most recent normalize() call."""
         return {
