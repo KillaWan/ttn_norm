@@ -16,7 +16,7 @@ from tqdm import tqdm
 from torchmetrics import MeanAbsoluteError, MeanAbsolutePercentageError, MeanSquaredError
 
 from ttn_norm.models import LocalTFNorm, TTNModel
-from ttn_norm.normalizations import DishTS, FAN, No, RevIN, SAN, TFBackgroundNorm
+from ttn_norm.normalizations import DishTS, FAN, No, RevIN, SAN, SANMS, TFBackgroundNorm
 from ttn_norm.utils.metrics import RMSE
 
 
@@ -431,6 +431,12 @@ class TrainConfig:
     dish_init: str = "uniform"   # "standard" | "avg" | "uniform"
     # SAN (seasonal adaptive normalization)
     san_period_len: int = 12
+    # SANMS (multi-scale SAN)
+    san_ms_scales: str = "1,2,4"
+    san_ms_tau: float = 1.0
+    san_ms_sigma_min: float = 1e-3
+    san_ms_lambda_std: float = 1.0
+    san_ms_ent_weight: float = 0.0
     # SAN spike-robust stat estimation (used by norm_type="san_spike")
     spike_q: float = 0.99
     spike_dilate: int = 1
@@ -498,6 +504,20 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             spike_q=cfg.spike_q,
             spike_dilate=cfg.spike_dilate,
             spike_mode=cfg.spike_mode,
+        )
+
+    elif _nt in {"sanms", "san_ms"}:
+        _scales = tuple(int(x) for x in cfg.san_ms_scales.split(",") if x.strip())
+        norm_model = SANMS(
+            seq_len=cfg.window,
+            pred_len=cfg.pred_len,
+            period_len=cfg.san_period_len,
+            enc_in=num_features,
+            scales=_scales,
+            tau=cfg.san_ms_tau,
+            sigma_min=cfg.san_ms_sigma_min,
+            lambda_std=cfg.san_ms_lambda_std,
+            ent_weight=cfg.san_ms_ent_weight,
         )
 
     elif _nt == "tf_bg":
