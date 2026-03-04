@@ -16,7 +16,7 @@ from tqdm import tqdm
 from torchmetrics import MeanAbsoluteError, MeanAbsolutePercentageError, MeanSquaredError
 
 from ttn_norm.models import LocalTFNorm, TTNModel
-from ttn_norm.normalizations import DishTS, FAN, No, RevIN, SAN, SANMS, TFBackgroundNorm
+from ttn_norm.normalizations import DishTS, FAN, No, RevIN, SAN, SANMS, TFBackgroundNorm, WaveBandNormB
 from ttn_norm.utils.metrics import RMSE
 
 
@@ -452,6 +452,16 @@ class TrainConfig:
     oracle_q: float = 0.99           # quantile for oracle trigger
     oracle_lambda_p: float = 0.25    # phase-change weight in proxy score
     oracle_dilate: int = 1           # temporal dilation passes (1 = base mask only)
+    # WaveBandNormB (norm_type="wavband_b" or "wavband")
+    wav_wavelet: str = "haar"        # "haar" | "db2"
+    wav_levels: int = 3              # SWT decomposition levels
+    wav_mid_levels: str = "2,3"      # comma-separated 1-indexed level indices
+    wav_high_levels: str = "1"       # comma-separated 1-indexed level indices
+    wav_patch_len: int = 24          # patch length (window & pred_len must be divisible)
+    wav_cond: str = "rho_h"          # "none" | "rho_h" | "rho_all"
+    wav_sigma_min: float = 1e-3
+    wav_stats_loss_weight: float = 0.1
+    wav_rho_loss_weight: float = 0.1
 
 
 def _next_power_of_two(n: int) -> int:
@@ -519,6 +529,26 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             lambda_std=cfg.san_ms_lambda_std,
             ent_weight=cfg.san_ms_ent_weight,
         )
+
+    elif _nt in {"wavband_b", "wavband"}:
+        _wav_mid  = tuple(int(x) for x in cfg.wav_mid_levels.split(",")  if x.strip())
+        _wav_high = tuple(int(x) for x in cfg.wav_high_levels.split(",") if x.strip())
+        norm_model = WaveBandNormB(
+            seq_len=cfg.window,
+            pred_len=cfg.pred_len,
+            enc_in=num_features,
+            wavelet=cfg.wav_wavelet,
+            levels=cfg.wav_levels,
+            mid_levels=_wav_mid,
+            high_levels=_wav_high,
+            patch_len=cfg.wav_patch_len,
+            cond=cfg.wav_cond,
+            sigma_min=cfg.wav_sigma_min,
+            stats_loss_weight=cfg.wav_stats_loss_weight,
+            rho_loss_weight=cfg.wav_rho_loss_weight,
+        )
+        # Adjust backbone enc_in to include conditioning channels
+        num_features += norm_model.cond_channels
 
     elif _nt == "tf_bg":
         norm_model = TFBackgroundNorm(
@@ -1012,6 +1042,20 @@ def collect_and_print_debug(
             f" scale_max={tfbg_stats['scale_max']:.6f}"
             f" scale_mean={tfbg_stats['scale_mean']:.6f}"
             f" B_std={tfbg_stats['B_std']:.6f}"
+        )
+
+    # ------------------------------------------------------------------ WAVBAND
+    if nm is not None and hasattr(nm, "get_last_diag"):
+        d = nm.get_last_diag()
+        print(
+            f"[{prefix}][WAVBAND]"
+            f" sigL={d.get('sig_L_mean', nan):.4f}"
+            f" sigM={d.get('sig_M_mean', nan):.4f}"
+            f" rhoH_mean={d.get('rho_H_mean', nan):.4f}"
+            f" rhoH_p10={d.get('rho_H_p10', nan):.4f}"
+            f" rhoH_p90={d.get('rho_H_p90', nan):.4f}"
+            f" L_stats={d.get('L_stats', nan):.6f}"
+            f" L_rho={d.get('L_rho', nan):.6f}"
         )
 
     # ------------------------------------------------------------------ GRAD
