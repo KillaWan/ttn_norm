@@ -140,9 +140,9 @@ class _WavPredictor(nn.Module):
         feat: (B, P_hist, 4, C)
         returns: (B, P_fut, 6, C)
         """
-        B, P, F, C = feat.shape
-        x = feat.permute(0, 3, 1, 2).reshape(B, C, P * F)  # (B, C, P*4)
-        x = F.relu(self.fc1(x))                              # (B, C, hidden)
+        B, P, nf, C = feat.shape
+        x = feat.permute(0, 3, 1, 2).reshape(B, C, P * nf)  # (B, C, P*4)
+        x = torch.relu(self.fc1(x))                           # (B, C, hidden)
         x = self.fc2(x)                                      # (B, C, P_fut*6)
         return x.reshape(B, C, self.P_fut, self.N_OUT).permute(0, 2, 3, 1)
         # → (B, P_fut, 6, C)
