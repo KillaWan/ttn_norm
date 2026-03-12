@@ -235,11 +235,15 @@ class WaveBandNormB(nn.Module):
         # ── Internal state ────────────────────────────────────────────────────
         self._pred_stats: Optional[dict] = None   # set by normalize()
         self._pred_raw:   Optional[Tensor] = None  # cached predictor output
+        # Oracle upper-bound gate (set/cleared by set_oracle_future / clear_oracle_future)
+        self._oracle_future_y: Optional[Tensor] = None
+        self._oracle_enabled: bool = False
         # Diagnostic cache (float scalars, updated each call)
         self._last_diag: dict[str, float] = {
             "sig_L_mean": 0.0, "sig_M_mean": 0.0,
             "rho_H_mean": 0.0, "rho_H_p10": 0.0, "rho_H_p90": 0.0,
             "L_stats": 0.0, "L_rho": 0.0,
+            "oracle_recon_mse": 0.0,
         }
 
     # ------------------------------------------------------------------
@@ -247,6 +251,22 @@ class WaveBandNormB(nn.Module):
     def cond_channels(self) -> int:
         """Extra channels appended to x_norm by normalize()."""
         return self._cond_channels
+
+    # ------------------------------------------------------------------
+    def set_oracle_future(self, y_future: Tensor, mode: str) -> None:
+        """Pass the true future tensor so denormalize() uses oracle wavelet stats.
+
+        Args:
+            y_future: (B, H, C) ground-truth future tensor in original space.
+            mode:     caller-supplied label (e.g. "eval_stats"); logged only.
+        """
+        self._oracle_future_y = y_future
+        self._oracle_enabled = True
+
+    def clear_oracle_future(self) -> None:
+        """Remove oracle future tensor; denormalize() falls back to predictor stats."""
+        self._oracle_future_y = None
+        self._oracle_enabled = False
 
     # ------------------------------------------------------------------
     def _patch_stats(
@@ -394,10 +414,11 @@ class WaveBandNormB(nn.Module):
     def denormalize(self, y_norm: Tensor, station_pred=None) -> Tensor:
         """(B, H, C+cond) → (B, H, C).
 
-        Applies the inverse band-wise normalisation to the backbone output
-        using predicted future stats from self._pred_stats.
+        Applies the inverse band-wise normalisation to the backbone output.
+        Uses oracle wavelet stats when self._oracle_enabled is True,
+        otherwise falls back to self._pred_stats from the predictor.
         """
-        if self._pred_stats is None:
+        if self._pred_stats is None and not self._oracle_enabled:
             # Fallback: strip cond channels and return
             return y_norm[:, :, :self.channels]
 
@@ -408,10 +429,23 @@ class WaveBandNormB(nn.Module):
         # Strip cond channels
         y = y_norm[:, :, :C]   # (B, H, C)
 
-        ps = self._pred_stats
-        mu_L_rep  = ps["mu_L"].repeat_interleave(self.patch_len, dim=1)   # (B, H, C)
-        sig_L_rep = ps["sig_L"].repeat_interleave(self.patch_len, dim=1)
-        sig_M_rep = ps["sig_M"].repeat_interleave(self.patch_len, dim=1)
+        if self._oracle_enabled and self._oracle_future_y is not None:
+            # ── Oracle path: true future wavelet stats ───────────────────────
+            y_true = self._oracle_future_y.detach()
+            with torch.no_grad():
+                A_J_t, details_t = _swt_fwd(y_true, self.h_lo, self.levels)
+                mid_sig_t = self._build_mid_signal(details_t)
+                mu_L_f, sig_L_f, _ = self._patch_stats_future(A_J_t)
+                _, sig_M_f, _      = self._patch_stats_future(mid_sig_t, compute_mean=False)
+            mu_L_rep  = mu_L_f.repeat_interleave(self.patch_len, dim=1)   # (B, H, C)
+            sig_L_rep = sig_L_f.repeat_interleave(self.patch_len, dim=1)
+            sig_M_rep = sig_M_f.repeat_interleave(self.patch_len, dim=1)
+        else:
+            # ── Predictor path ────────────────────────────────────────────────
+            ps = self._pred_stats
+            mu_L_rep  = ps["mu_L"].repeat_interleave(self.patch_len, dim=1)
+            sig_L_rep = ps["sig_L"].repeat_interleave(self.patch_len, dim=1)
+            sig_M_rep = ps["sig_M"].repeat_interleave(self.patch_len, dim=1)
 
         # SWT forward on normalised prediction
         A_J_n, details_n = _swt_fwd(y, self.h_lo, self.levels)
@@ -427,7 +461,27 @@ class WaveBandNormB(nn.Module):
             else:
                 details_hat.append(d * (sig_M_rep + eps))  # mid: un-scale
 
-        return _swt_inv(A_J_hat, details_hat)   # (B, H, C)
+        y_hat = _swt_inv(A_J_hat, details_hat)   # (B, H, C)
+
+        # ── Consistency self-check (oracle mode only) ─────────────────────────
+        # Re-normalise y_hat with the same oracle stats → should recover y.
+        if self._oracle_enabled:
+            with torch.no_grad():
+                A_J_chk, details_chk = _swt_fwd(y_hat.detach(), self.h_lo, self.levels)
+                A_J_norm_chk = (A_J_chk - mu_L_rep) / (sig_L_rep + eps)
+                details_norm_chk: list[Tensor] = []
+                for j_idx, d in enumerate(details_chk):
+                    j = j_idx + 1
+                    if j in self.high_set:
+                        details_norm_chk.append(d)
+                    else:
+                        details_norm_chk.append(d / (sig_M_rep + eps))
+                y_renorm = _swt_inv(A_J_norm_chk, details_norm_chk)
+                self._last_diag["oracle_recon_mse"] = float(
+                    F.mse_loss(y_renorm, y.detach()).item()
+                )
+
+        return y_hat
 
     # ------------------------------------------------------------------
     def loss(self, true: Tensor) -> Tensor:

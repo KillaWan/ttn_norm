@@ -462,6 +462,7 @@ class TrainConfig:
     wav_sigma_min: float = 1e-3
     wav_stats_loss_weight: float = 0.1
     wav_rho_loss_weight: float = 0.1
+    wav_oracle_mode: str = "none"    # "none" | "eval_stats" | "train_eval_stats"
 
 
 def _next_power_of_two(n: int) -> int:
@@ -1056,6 +1057,7 @@ def collect_and_print_debug(
             f" rhoH_p90={d.get('rho_H_p90', nan):.4f}"
             f" L_stats={d.get('L_stats', nan):.6f}"
             f" L_rho={d.get('L_rho', nan):.6f}"
+            f" oracle_recon_mse={d.get('oracle_recon_mse', nan):.2e}"
         )
 
     # ------------------------------------------------------------------ GRAD
@@ -1126,6 +1128,25 @@ def _get_gate_params(model: nn.Module) -> list:
     return [p for p in gate_mod.parameters() if p.requires_grad]
 
 
+def _maybe_set_oracle_future(
+    model: nn.Module, cfg: TrainConfig, y_future: torch.Tensor
+) -> None:
+    """If wav_oracle_mode requires it, pass true future stats to WaveBandNormB.
+
+    y_future: (B, pred_len, C) ground-truth future tensor (unscaled original space).
+    """
+    nm = getattr(model, "nm", None)
+    if nm is not None and hasattr(nm, "set_oracle_future"):
+        nm.set_oracle_future(y_future, cfg.wav_oracle_mode)
+
+
+def _maybe_clear_oracle_future(model: nn.Module, cfg: TrainConfig) -> None:
+    """Remove oracle future tensor from WaveBandNormB after inference."""
+    nm = getattr(model, "nm", None)
+    if nm is not None and hasattr(nm, "clear_oracle_future"):
+        nm.clear_oracle_future()
+
+
 def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
     model.train()
     loss_fn = nn.MSELoss()
@@ -1166,7 +1187,12 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
                 )
 
             optimizer.zero_grad()
+            # UB-2: oracle future stats used during training forward pass
+            if cfg.wav_oracle_mode == "train_eval_stats":
+                _maybe_set_oracle_future(model, cfg, batch_y)
             pred = model(batch_x, batch_x_enc, dec_inp, dec_inp_enc)
+            if cfg.wav_oracle_mode == "train_eval_stats":
+                _maybe_clear_oracle_future(model, cfg)
             true = batch_y
             if cfg.invtrans_loss:
                 pred = scaler.inverse_transform(pred)
@@ -1290,7 +1316,12 @@ def evaluate(model, loader, cfg, scaler, debug_prefix: str | None = None):
             dec_inp, dec_inp_enc = _make_dec_inputs(
                 batch_x, batch_y_enc, batch_x_enc, label_len
             )
+        # UB-1 / UB-2: oracle future stats used during evaluation
+        if cfg.wav_oracle_mode in {"eval_stats", "train_eval_stats"}:
+            _maybe_set_oracle_future(model, cfg, batch_y)
         pred = model(batch_x, batch_x_enc, dec_inp, dec_inp_enc)
+        if cfg.wav_oracle_mode in {"eval_stats", "train_eval_stats"}:
+            _maybe_clear_oracle_future(model, cfg)
 
         if has_nm_aux:
             model.nm.loss()
