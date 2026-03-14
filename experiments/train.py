@@ -1539,11 +1539,11 @@ def evaluate(model, loader, cfg, scaler, debug_prefix: str | None = None):
                     batch_x, batch_y_enc, batch_x_enc, label_len
                 )
 
-        # UB-1 / UB-2: oracle future stats used during evaluation
-        if cfg.wav_oracle_mode in {"eval_stats", "train_eval_stats"}:
+        # Oracle future stats used during evaluation (only explicit eval_stats mode)
+        if cfg.wav_oracle_mode == "eval_stats":
             _maybe_set_oracle_future(model, cfg, batch_y)
         pred = model(x_main, x_enc_main, dec_inp, dec_inp_enc)
-        if cfg.wav_oracle_mode in {"eval_stats", "train_eval_stats"}:
+        if cfg.wav_oracle_mode == "eval_stats":
             _maybe_clear_oracle_future(model, cfg)
         if ctx_len > 0 and _is_wavband:
             if model.nm is not None and hasattr(model.nm, "clear_ctx_history"):
@@ -1664,6 +1664,7 @@ def main(argv: list[str] | None = None):
     best_checkpoint_path = os.path.join(result_root, f"{run_name}_best.pth")
 
     print(f"Train config: {cfg}")
+    print(f"[OracleEval] wav_oracle_mode={cfg.wav_oracle_mode} eval_uses_oracle={cfg.wav_oracle_mode == 'eval_stats'}")
     if cfg.early_stop_metric not in {"val_mse", "ema_val_mse"}:
         raise ValueError(
             f"Unsupported early_stop_metric: {cfg.early_stop_metric}. "
