@@ -481,6 +481,20 @@ class TrainConfig:
     wav_pred_lr: float = 1e-3        # predictor-specific learning rate (separate optimizer group)
     wav_pred_weight_decay: float = 0.0   # predictor-specific weight decay
     wav_pad_mode: str = "reflect"    # SWT boundary padding: "reflect" | "replicate" | "circular"
+    wav_use_soft_split: bool = False  # if True, use learnable soft band split with band_logits
+    wav_gate_tau: float = 1.0         # soft-split temperature (smaller → harder split)
+    wav_split_reg_weight: float = 1e-2  # monotone regularisation weight for band-split gates
+    wav_detach_pred_stats: bool = True  # detach predictor stats in denormalize() to isolate task grad
+    wav_pretrain_use_early_stop: bool = True   # enable early stop during stage1 pretraining
+    wav_pretrain_patience: int = 8             # stage1 early stop patience (epochs)
+    wav_pretrain_min_epochs: int = 10          # minimum stage1 epochs before early stop kicks in
+    wav_pretrain_metric: str = "val_aux_total" # metric to monitor for stage1 early stop
+    wav_pretrain_delta: float = 0.0            # minimum improvement to reset patience counter
+    wav_oracle_prob_start: float = 1.0         # starting oracle probability in stage2 (epoch 0 of stage2)
+    wav_oracle_prob_end: float = 0.0           # ending oracle probability in stage2
+    wav_oracle_anneal_epochs: int = 50         # number of stage2 epochs over which oracle prob anneals
+    wav_freeze_pred_in_stage2: bool = True     # freeze predictor+band_logits during stage2 joint training
+    wav_pretrain_stop_to_stage2: bool = True   # if True, stage1 early-stop immediately advances to stage2
 
 
 def _next_power_of_two(n: int) -> int:
@@ -568,6 +582,10 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             pred_use_wave=cfg.wav_pred_use_wave,
             ctx_patches=cfg.wav_ctx_patches,
             pad_mode=cfg.wav_pad_mode,
+            wav_use_soft_split=cfg.wav_use_soft_split,
+            wav_gate_tau=cfg.wav_gate_tau,
+            wav_split_reg_weight=cfg.wav_split_reg_weight,
+            detach_pred_stats=cfg.wav_detach_pred_stats,
         )
         # Adjust backbone enc_in to include conditioning channels
         num_features += norm_model.cond_channels
@@ -1078,8 +1096,21 @@ def collect_and_print_debug(
             f" rhoH_p90={d.get('rho_H_p90', nan):.4f}"
             f" L_stats={d.get('L_stats', nan):.6f}"
             f" L_rho={d.get('L_rho', nan):.6f}"
+            f" L_split={d.get('L_split', nan):.6f}"
             f" oracle_recon_mse={d.get('oracle_recon_mse', nan):.2e}"
         )
+        if hasattr(nm, "get_split_stats"):
+            ss = nm.get_split_stats()
+            print(
+                f"[{prefix}][WAVBAND_GATES]"
+                f" g_mean={ss['g_mean']:.4f}"
+                f" g_min={ss['g_min']:.4f}"
+                f" g_max={ss['g_max']:.4f}"
+                f" split_reg={ss['split_reg']:.6f}"
+            )
+            if prefix == "TRAIN_DBG":
+                g_vec_str = " ".join(f"{g:.4f}" for g in ss["g_vec"])
+                print(f"[{prefix}][WAVBAND_GATES] g_vec=[{g_vec_str}]")
 
     # ------------------------------------------------------------------ GRAD
     gi = grad_info or {}
@@ -1184,27 +1215,70 @@ def _set_requires_grad(module: nn.Module, flag: bool) -> None:
 
 
 def _wav_pred_params(model: nn.Module) -> list:
-    """Return predictor parameters from model.nm, or empty list if not present."""
+    """Return predictor + band_logits parameters from model.nm, or empty list if absent."""
     nm = getattr(model, "nm", None)
     if nm is None:
         return []
+    params: list = []
     predictor = getattr(nm, "predictor", None)
-    if predictor is None:
-        return []
-    return list(predictor.parameters())
+    if predictor is not None:
+        params.extend(predictor.parameters())
+    # Include learnable band split logits if present
+    band_logits = getattr(nm, "band_logits", None)
+    if band_logits is not None and isinstance(band_logits, torch.nn.Parameter):
+        params.append(band_logits)
+    return params
 
 
 def _freeze_all_except_wav_predictor(model: nn.Module) -> None:
-    """Freeze the entire model, then unfreeze only model.nm.predictor."""
+    """Freeze the entire model, then unfreeze model.nm.predictor and band_logits."""
     _set_requires_grad(model, False)
     nm = getattr(model, "nm", None)
     if nm is not None:
         predictor = getattr(nm, "predictor", None)
         if predictor is not None:
             _set_requires_grad(predictor, True)
+        band_logits = getattr(nm, "band_logits", None)
+        if band_logits is not None and isinstance(band_logits, torch.nn.Parameter):
+            band_logits.requires_grad = True
 
 
-def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
+@torch.no_grad()
+def _wavband_val_aux(model: nn.Module, loader, cfg: TrainConfig) -> float:
+    """Compute mean wavband predictor aux loss on *loader* (no task loss).
+
+    Used for stage1 early-stop monitoring.  Returns mean aux loss; 0.0 if
+    model.nm has no ``loss`` method.
+    """
+    nm = getattr(model, "nm", None)
+    if nm is None or not hasattr(nm, "loss"):
+        return 0.0
+    model.eval()
+    ctx_len = cfg.wav_ctx_patches * cfg.wav_patch_len
+    vals: list[float] = []
+    for batch_data in loader:
+        bx = batch_data[0].to(cfg.device).float()
+        by = batch_data[1].to(cfg.device).float()
+        if ctx_len > 0 and hasattr(nm, "set_ctx_history"):
+            nm.set_ctx_history(bx[:, :ctx_len, :])
+            nm.normalize(bx[:, ctx_len:, :])
+            nm.clear_ctx_history()
+        else:
+            nm.normalize(bx)
+        vals.append(float(nm.loss(by).item()))
+    return float(np.mean(vals)) if vals else 0.0
+
+
+def _oracle_prob(cfg: TrainConfig, stage2_epoch: int) -> float:
+    """Linearly anneal oracle probability from wav_oracle_prob_start to wav_oracle_prob_end."""
+    anneal = max(int(cfg.wav_oracle_anneal_epochs), 1)
+    t = min(stage2_epoch, anneal) / float(anneal)
+    return float(cfg.wav_oracle_prob_start + (cfg.wav_oracle_prob_end - cfg.wav_oracle_prob_start) * t)
+
+
+def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int,
+                    oracle_prob: float = 1.0, in_stage1: bool = False,
+                    freeze_wav_pred: bool = False):
     model.train()
     loss_fn = nn.MSELoss()
     losses = []
@@ -1223,13 +1297,22 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
     )
 
     # ── Stage freeze / unfreeze ───────────────────────────────────────────────
-    _is_wavband_epoch = cfg.norm_type.lower() in {"wavband", "wavband_b"}
-    _in_stage1 = _is_wavband_epoch and cfg.wav_stage_train and epoch_idx < cfg.wav_pretrain_epochs
+    _in_stage1 = bool(in_stage1)
     if _in_stage1:
         _freeze_all_except_wav_predictor(model)
         print(f"[stage1] epoch {epoch_idx}: predictor-only training (frozen backbone)")
     else:
         _set_requires_grad(model, True)
+        # Re-apply predictor freeze for stage2 (wav_freeze_pred_in_stage2=True)
+        if freeze_wav_pred:
+            _nm_fp = getattr(model, "nm", None)
+            if _nm_fp is not None:
+                _pred_fp = getattr(_nm_fp, "predictor", None)
+                if _pred_fp is not None:
+                    _set_requires_grad(_pred_fp, False)
+                _bl_fp = getattr(_nm_fp, "band_logits", None)
+                if _bl_fp is not None and isinstance(_bl_fp, torch.nn.Parameter):
+                    _bl_fp.requires_grad = False
 
     aux_scale = _aux_scale(cfg, epoch_idx)
     print(f"aux_loss_scale: {aux_scale:.6f}")
@@ -1299,10 +1382,15 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
 
             # ── Stage 2 / joint: full model forward ──────────────────────────
             # UB-2 / train_oracle: oracle future stats used during training forward pass
-            if cfg.wav_oracle_mode in {"train_eval_stats", "train_oracle"}:
+            # oracle_prob < 1.0 anneals towards predictor-only denorm
+            _use_oracle = (
+                cfg.wav_oracle_mode in {"train_eval_stats", "train_oracle"}
+                and torch.rand(1).item() < oracle_prob
+            )
+            if _use_oracle:
                 _maybe_set_oracle_future(model, cfg, batch_y)
             pred = model(x_main, x_enc_main, dec_inp, dec_inp_enc)
-            if cfg.wav_oracle_mode in {"train_eval_stats", "train_oracle"}:
+            if _use_oracle:
                 _maybe_clear_oracle_future(model, cfg)
             if ctx_len > 0 and _is_wavband:
                 if model.nm is not None and hasattr(model.nm, "clear_ctx_history"):
@@ -1496,6 +1584,19 @@ def evaluate(model, loader, cfg, scaler, debug_prefix: str | None = None):
     if has_nm_aux and aux_stat_vals["aux_total"]:
         for k in aux_stat_keys:
             results[k] = float(np.mean(aux_stat_vals[k]))
+
+    # Wavband-specific diagnostics (band-split gate stats, monotone reg)
+    _nm_eval = getattr(model, "nm", None)
+    if _nm_eval is not None and hasattr(_nm_eval, "get_split_stats"):
+        ss = _nm_eval.get_split_stats()
+        results["wav_g_mean"]  = ss["g_mean"]
+        results["wav_g_min"]   = ss["g_min"]
+        results["wav_g_max"]   = ss["g_max"]
+        results["wav_L_split"] = ss["split_reg"]
+    if _nm_eval is not None and hasattr(_nm_eval, "get_last_diag"):
+        d = _nm_eval.get_last_diag()
+        results.setdefault("wav_L_split", d.get("L_split", 0.0))
+
     return results
 
 
@@ -1577,6 +1678,12 @@ def main(argv: list[str] | None = None):
             "gate_arch=lowrank_sparse requires --gate-sparse-l1-weight > 0 "
             "to keep sparse residual constrained. Set e.g. 1e-3."
         )
+    _is_wavband_main = cfg.norm_type.lower() in {"wavband", "wavband_b"}
+    if _is_wavband_main and cfg.wav_stage_train:
+        if cfg.wav_pretrain_metric not in {"val_aux_total"}:
+            raise ValueError(
+                f"wav_pretrain_metric must be 'val_aux_total'; got {cfg.wav_pretrain_metric!r}"
+            )
     if cfg.gate_lowrank_time_ks % 2 == 0 or cfg.gate_lowrank_freq_ks % 2 == 0:
         raise ValueError(
             f"gate_lowrank_time_ks and gate_lowrank_freq_ks must be odd for symmetric padding. "
@@ -1603,9 +1710,81 @@ def main(argv: list[str] | None = None):
     ema_val_mse = None
     no_improve_count = 0
 
+    # Stage1 early-stop state
+    _s1_best_aux = float("inf")
+    _s1_no_improve = 0
+    _s1_stopped_early = False
+    _s1_end_epoch = int(cfg.wav_pretrain_epochs)   # may be shortened by early stop
+    _pred_best_path = os.path.join(result_root, f"{run_name}_pred_best.pth")
+
     for epoch in range(cfg.epochs):
+        # ── If stage1 stopped early and stop_to_stage2 requested, advance end epoch ──
+        _in_stage1_main = (
+            _is_wavband_main
+            and cfg.wav_stage_train
+            and epoch < _s1_end_epoch
+        )
+        if _s1_stopped_early and cfg.wav_pretrain_stop_to_stage2 and _in_stage1_main:
+            _s1_end_epoch = epoch
+            _in_stage1_main = False
+            print(f"[stage1] stopped early → switching to stage2 at epoch {epoch}")
+
+        # ── Stage boundary: rebuild optimizer + scheduler + reset early-stop ──
+        if (
+            _is_wavband_main
+            and cfg.wav_stage_train
+            and epoch == _s1_end_epoch
+            and _s1_end_epoch > 0
+        ):
+            print(f"[stage transition] epoch {epoch}: entering joint training — "
+                  "rebuilding optimizer, scheduler, resetting early-stop state")
+            _set_requires_grad(model, True)
+            # Load stage1 best predictor checkpoint (before any freezing)
+            _nm_tr = getattr(model, "nm", None)
+            if _nm_tr is not None and os.path.exists(_pred_best_path):
+                _s1_ckpt = torch.load(_pred_best_path, map_location=cfg.device)
+                _pred_tr = getattr(_nm_tr, "predictor", None)
+                if _pred_tr is not None and "predictor" in _s1_ckpt:
+                    _pred_tr.load_state_dict(_s1_ckpt["predictor"])
+                if "band_logits" in _s1_ckpt:
+                    _nm_tr.band_logits.data.copy_(_s1_ckpt["band_logits"].to(cfg.device))
+                print(f"[stage2] loaded stage1 best predictor → {_pred_best_path}")
+            # Optionally freeze predictor + band_logits in stage2 (after loading)
+            if cfg.wav_freeze_pred_in_stage2 and _nm_tr is not None:
+                _pred_s2 = getattr(_nm_tr, "predictor", None)
+                if _pred_s2 is not None:
+                    _set_requires_grad(_pred_s2, False)
+                _bl_s2 = getattr(_nm_tr, "band_logits", None)
+                if _bl_s2 is not None and isinstance(_bl_s2, torch.nn.Parameter):
+                    _bl_s2.requires_grad = False
+                print(f"[stage2] predictor+band_logits frozen (wav_freeze_pred_in_stage2=True)")
+            optimizer = _build_optimizer(model, cfg)
+            remaining_epochs = cfg.epochs - epoch
+            scheduler = CosineAnnealingLR(optimizer, T_max=max(remaining_epochs, 1))
+            best_monitor = float("inf")
+            best_epoch = -1
+            best_val_at_best = float("inf")
+            best_test_at_best = float("inf")
+            ema_val_mse = None
+            no_improve_count = 0
+
+        # Compute oracle annealing probability (stage2 only)
+        if _in_stage1_main or not _is_wavband_main or not cfg.wav_stage_train:
+            _oracle_p = 1.0
+        else:
+            _stage2_epoch = epoch - _s1_end_epoch
+            _oracle_p = _oracle_prob(cfg, _stage2_epoch)
+
+        _freeze_pred = (
+            not _in_stage1_main
+            and _is_wavband_main
+            and cfg.wav_stage_train
+            and cfg.wav_freeze_pred_in_stage2
+        )
         result = train_one_epoch(
-            model, dataloader.train_loader, optimizer, cfg, scaler, epoch_idx=epoch
+            model, dataloader.train_loader, optimizer, cfg, scaler,
+            epoch_idx=epoch, oracle_prob=_oracle_p,
+            in_stage1=_in_stage1_main, freeze_wav_pred=_freeze_pred,
         )
         if isinstance(result, tuple) and len(result) == 3:
             train_loss, gate_info, train_stat = result
@@ -1616,6 +1795,50 @@ def main(argv: list[str] | None = None):
             train_loss = result
             gate_info = ""
             train_stat = {}
+
+        # ── Stage1: val_aux early stop, then skip full val/test evaluation ────
+        if _in_stage1_main:
+            val_aux = _wavband_val_aux(model, dataloader.val_loader, cfg)
+            print(
+                f"Epoch: {epoch + 1} [stage1-pretrain]"
+                f" train_loss: {train_loss:.6f}"
+                f" val_aux: {val_aux:.6f}"
+            )
+            # Save best predictor checkpoint
+            s1_improved = val_aux < (_s1_best_aux - cfg.wav_pretrain_delta)
+            if s1_improved:
+                _s1_best_aux = val_aux
+                _s1_no_improve = 0
+                _nm_s1 = getattr(model, "nm", None)
+                if _nm_s1 is not None:
+                    _s1_state = {}
+                    _pred_s1 = getattr(_nm_s1, "predictor", None)
+                    if _pred_s1 is not None:
+                        _s1_state["predictor"] = _pred_s1.state_dict()
+                    _bl_s1 = getattr(_nm_s1, "band_logits", None)
+                    if _bl_s1 is not None:
+                        _s1_state["band_logits"] = _bl_s1.data.clone()
+                    if _s1_state:
+                        torch.save(_s1_state, _pred_best_path)
+                        print(f"[stage1] predictor checkpoint saved → {_pred_best_path}")
+            elif cfg.wav_pretrain_use_early_stop and (epoch + 1) >= cfg.wav_pretrain_min_epochs:
+                _s1_no_improve += 1
+                print(
+                    f"[stage1] EarlyStopping counter: {_s1_no_improve} out of {cfg.wav_pretrain_patience}"
+                )
+                if _s1_no_improve >= cfg.wav_pretrain_patience:
+                    _s1_stopped_early = True
+                    if cfg.wav_pretrain_stop_to_stage2:
+                        _s1_end_epoch = epoch + 1
+                        print(
+                            f"[stage1] early stop triggered at epoch {epoch + 1},"
+                            f" _s1_end_epoch={_s1_end_epoch}"
+                        )
+                    else:
+                        print(f"[stage1] Early stopping after epoch {epoch + 1}")
+            scheduler.step()
+            continue
+
         val_metrics = evaluate(model, dataloader.val_loader, cfg, scaler, debug_prefix="VAL_DBG")
         test_metrics = evaluate(model, dataloader.test_loader, cfg, scaler)
 

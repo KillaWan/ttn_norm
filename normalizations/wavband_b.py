@@ -205,6 +205,11 @@ class WaveBandNormB(nn.Module):
         pred_use_wave: bool = False,
         ctx_patches: int = 0,
         pad_mode: str = "reflect",
+        wav_use_soft_split: bool = False,
+        wav_gate_tau: float = 1.0,
+        wav_split_reg_weight: float = 1e-2,
+        wav_split_target: str = "monotone",
+        detach_pred_stats: bool = True,
     ):
         super().__init__()
         if seq_len % patch_len != 0:
@@ -227,6 +232,13 @@ class WaveBandNormB(nn.Module):
         self.pred_use_wave = pred_use_wave
         self.ctx_patches = int(ctx_patches)
         self.pad_mode = pad_mode
+        self.wav_use_soft_split = bool(wav_use_soft_split)
+        self.wav_gate_tau = float(wav_gate_tau)
+        self.wav_split_reg_weight = float(wav_split_reg_weight)
+        if wav_split_target != "monotone":
+            raise ValueError(f"wav_split_target must be 'monotone'; got {wav_split_target!r}")
+        self.wav_split_target = wav_split_target
+        self.detach_pred_stats = detach_pred_stats
 
         # ── Classify levels ───────────────────────────────────────────────────
         all_lvls  = set(range(1, levels + 1))
@@ -234,7 +246,13 @@ class WaveBandNormB(nn.Module):
         self.mid_set  = frozenset(int(l) for l in mid_levels  if 1 <= l <= levels)
         # "other" levels (not high, not explicitly mid) default to mid
         self.mid_eff  = frozenset(l for l in all_lvls if l not in self.high_set)
-        # (mid_eff = mid_set ∪ "others"; high_eff = high_set)
+
+        # ── Adaptive band split ───────────────────────────────────────────────
+        # Initialise: high-set levels at +2.0, mid-set at -2.0
+        logit_init = torch.full((levels,), -2.0)
+        for l in self.high_set:
+            logit_init[l - 1] = 2.0   # 1-indexed → 0-indexed
+        self.band_logits = nn.Parameter(logit_init, requires_grad=bool(wav_use_soft_split))
 
         # ── Filter bank (registered as buffer so it moves with .to(device)) ──
         h_values = _FILTER_BANKS[wavelet]
@@ -269,7 +287,7 @@ class WaveBandNormB(nn.Module):
         self._last_diag: dict[str, float] = {
             "sig_L_mean": 0.0, "sig_M_mean": 0.0,
             "rho_H_mean": 0.0, "rho_H_p10": 0.0, "rho_H_p90": 0.0,
-            "L_stats": 0.0, "L_rho": 0.0,
+            "L_stats": 0.0, "L_rho": 0.0, "L_split": 0.0,
             "oracle_recon_mse": 0.0,
         }
 
@@ -341,23 +359,70 @@ class WaveBandNormB(nn.Module):
         return mu, sig, E
 
     # ------------------------------------------------------------------
-    def _build_mid_signal(self, details: list[Tensor]) -> Tensor:
-        """Sum all mid-effective detail coefficients. Returns (B, T, C)."""
+    def _build_mid_signal(self, details: list[Tensor], w_high: Optional[Tensor] = None) -> Tensor:
+        """Weighted sum of detail coefficients for the mid band. Returns (B, T, C)."""
+        if self.wav_use_soft_split and w_high is not None:
+            return sum((1.0 - w_high[j]) * details[j] for j in range(self.levels))
         out = torch.zeros_like(details[0])
         for j_idx, d in enumerate(details):
-            j = j_idx + 1  # 1-indexed
-            if j in self.mid_eff:
+            if (j_idx + 1) in self.mid_eff:
                 out = out + d
         return out
 
-    def _build_high_signal(self, details: list[Tensor]) -> Tensor:
-        """Sum all high-band detail coefficients. Returns (B, T, C)."""
+    def _build_high_signal(self, details: list[Tensor], w_high: Optional[Tensor] = None) -> Tensor:
+        """Weighted sum of detail coefficients for the high band. Returns (B, T, C)."""
+        if self.wav_use_soft_split and w_high is not None:
+            return sum(w_high[j] * details[j] for j in range(self.levels))
         out = torch.zeros_like(details[0])
         for j_idx, d in enumerate(details):
-            j = j_idx + 1
-            if j in self.high_set:
+            if (j_idx + 1) in self.high_set:
                 out = out + d
         return out
+
+    # ------------------------------------------------------------------
+    def _band_w_high(self) -> Tensor:
+        """Return per-level high-band weight vector w_high, shape (levels,).
+
+        wav_use_soft_split=True:  w_high[j] = sigmoid(band_logits[j] / wav_gate_tau)  ∈ (0,1)
+        wav_use_soft_split=False: w_high[j] = 1 if level j+1 in high_set, else 0
+        """
+        if self.wav_use_soft_split:
+            return torch.sigmoid(self.band_logits / self.wav_gate_tau)  # (levels,)
+        else:
+            w = torch.zeros(self.levels, device=self.h_lo.device, dtype=self.h_lo.dtype)
+            for l in self.high_set:
+                w[l - 1] = 1.0
+            return w
+
+    # ------------------------------------------------------------------
+    def get_split_stats(self) -> dict:
+        """Return current band-split gate statistics (detached floats/list).
+
+        Returns:
+            g_mean:    float — mean of g_j = sigmoid(logits_j / tau) over all levels
+            g_min:     float — minimum gate value
+            g_max:     float — maximum gate value
+            g_vec:     list[float] — per-level gate values [g_1, …, g_J]
+            split_reg: float — current monotone regularization value L_split
+        """
+        with torch.no_grad():
+            g = torch.sigmoid(self.band_logits / self.wav_gate_tau)  # (J,)
+            g_cpu = g.detach().cpu()
+            if self.wav_use_soft_split and self.levels > 1:
+                # L_split = sum relu(g_{j+1} - g_j) for j=0..J-2
+                split_reg = float(
+                    (self.wav_split_reg_weight *
+                     F.relu(g_cpu[1:] - g_cpu[:-1]).sum()).item()
+                )
+            else:
+                split_reg = 0.0
+        return {
+            "g_mean":    float(g_cpu.mean().item()),
+            "g_min":     float(g_cpu.min().item()),
+            "g_max":     float(g_cpu.max().item()),
+            "g_vec":     g_cpu.tolist(),
+            "split_reg": split_reg,
+        }
 
     # ------------------------------------------------------------------
     def _extract_patch_tokens(self, x_in: Tensor) -> dict:
@@ -381,8 +446,14 @@ class WaveBandNormB(nn.Module):
 
         with torch.no_grad():
             A_J_det, details_det = _swt_fwd(x_in.detach(), self.h_lo, self.levels, self.pad_mode)
-            mid_sig_det = self._build_mid_signal(details_det)
-            hi_sig_det  = self._build_high_signal(details_det)
+            # Build adaptive mid/high signals using w_high weights (detached for stats)
+            w_high = self._band_w_high().detach()   # (levels,)
+            mid_sig_det = sum(
+                (1.0 - w_high[j]) * details_det[j] for j in range(self.levels)
+            )
+            hi_sig_det = sum(
+                w_high[j] * details_det[j] for j in range(self.levels)
+            )
 
         r_L = A_J_det.reshape(B, P, self.patch_len, C)
         mu_L  = r_L.mean(dim=2)
@@ -428,11 +499,14 @@ class WaveBandNormB(nn.Module):
         h   = self.h_lo
 
         # ── 1. SWT forward (current window x only) ───────────────────────────
+        w_high = self._band_w_high()   # (levels,) — may carry grad if learned
+
         with torch.no_grad():
             # Detached SWT for statistics (no autograd through stats)
             A_J_det, details_det = _swt_fwd(x.detach(), h, self.levels, self.pad_mode)
-            mid_sig_det = self._build_mid_signal(details_det)
-            hi_sig_det  = self._build_high_signal(details_det)
+            w_high_det = w_high.detach()
+            mid_sig_det = sum((1.0 - w_high_det[j]) * details_det[j] for j in range(self.levels))
+            hi_sig_det  = sum(w_high_det[j]          * details_det[j] for j in range(self.levels))
 
         # Full-gradient SWT for reconstruction path
         A_J, details = _swt_fwd(x, h, self.levels, self.pad_mode)
@@ -525,16 +599,15 @@ class WaveBandNormB(nn.Module):
         sig_L_rep = sig_L.repeat_interleave(self.patch_len, dim=1)
         sig_M_rep = sig_M.repeat_interleave(self.patch_len, dim=1)
 
-        # ── 5. Normalise wavelet coefficients ─────────────────────────────────
+        # ── 5. Normalise wavelet coefficients (adaptive soft band split) ─────────
         A_J_norm = (A_J - mu_L_rep) / (sig_L_rep + eps)
 
         details_norm: list[Tensor] = []
         for j_idx, d in enumerate(details):
-            j = j_idx + 1
-            if j in self.high_set:
-                details_norm.append(d)                   # high: unchanged
-            else:
-                details_norm.append(d / (sig_M_rep + eps))  # mid (or other→mid)
+            # scale_j = w_high[j]*1 + (1-w_high[j])*(sig_M+eps)
+            # → high-weight levels divided by ~1, mid-weight levels by sig_M
+            scale_j = (1.0 - w_high[j_idx]) * (sig_M_rep + eps) + w_high[j_idx] * 1.0
+            details_norm.append(d / scale_j)
 
         # ── 6. Reconstruct normalised time-domain signal ──────────────────────
         x_norm = _swt_inv(A_J_norm, details_norm)   # (B, T, C)
@@ -571,12 +644,15 @@ class WaveBandNormB(nn.Module):
         # Strip cond channels
         y = y_norm[:, :, :C]   # (B, H, C)
 
+        w_high = self._band_w_high()   # (levels,)
+
         if self._oracle_enabled and self._oracle_future_y is not None:
             # ── Oracle path: true future wavelet stats ───────────────────────
             y_true = self._oracle_future_y.detach()
             with torch.no_grad():
                 A_J_t, details_t = _swt_fwd(y_true, self.h_lo, self.levels, self.pad_mode)
-                mid_sig_t = self._build_mid_signal(details_t)
+                w_high_det = w_high.detach()
+                mid_sig_t = sum((1.0 - w_high_det[j]) * details_t[j] for j in range(self.levels))
                 mu_L_f, sig_L_f, _ = self._patch_stats_future(A_J_t)
                 _, sig_M_f, _      = self._patch_stats_future(mid_sig_t, compute_mean=False)
             mu_L_rep  = mu_L_f.repeat_interleave(self.patch_len, dim=1)   # (B, H, C)
@@ -585,39 +661,37 @@ class WaveBandNormB(nn.Module):
         else:
             # ── Predictor path ────────────────────────────────────────────────
             ps = self._pred_stats
-            mu_L_rep  = ps["mu_L"].repeat_interleave(self.patch_len, dim=1)
-            sig_L_rep = ps["sig_L"].repeat_interleave(self.patch_len, dim=1)
-            sig_M_rep = ps["sig_M"].repeat_interleave(self.patch_len, dim=1)
+            if self.detach_pred_stats:
+                mu_L_rep  = ps["mu_L"].detach().repeat_interleave(self.patch_len, dim=1)
+                sig_L_rep = ps["sig_L"].detach().repeat_interleave(self.patch_len, dim=1)
+                sig_M_rep = ps["sig_M"].detach().repeat_interleave(self.patch_len, dim=1)
+            else:
+                mu_L_rep  = ps["mu_L"].repeat_interleave(self.patch_len, dim=1)
+                sig_L_rep = ps["sig_L"].repeat_interleave(self.patch_len, dim=1)
+                sig_M_rep = ps["sig_M"].repeat_interleave(self.patch_len, dim=1)
 
         # SWT forward on normalised prediction
         A_J_n, details_n = _swt_fwd(y, self.h_lo, self.levels, self.pad_mode)
 
-        # Invert band normalisation
+        # Invert band normalisation (symmetric to normalize's soft scale_j)
         A_J_hat = A_J_n * (sig_L_rep + eps) + mu_L_rep
 
         details_hat: list[Tensor] = []
         for j_idx, d in enumerate(details_n):
-            j = j_idx + 1
-            if j in self.high_set:
-                details_hat.append(d)                       # high: unchanged
-            else:
-                details_hat.append(d * (sig_M_rep + eps))  # mid: un-scale
+            scale_j = (1.0 - w_high[j_idx]) * (sig_M_rep + eps) + w_high[j_idx] * 1.0
+            details_hat.append(d * scale_j)
 
         y_hat = _swt_inv(A_J_hat, details_hat)   # (B, H, C)
 
         # ── Consistency self-check (oracle mode only) ─────────────────────────
-        # Re-normalise y_hat with the same oracle stats → should recover y.
         if self._oracle_enabled:
             with torch.no_grad():
                 A_J_chk, details_chk = _swt_fwd(y_hat.detach(), self.h_lo, self.levels, self.pad_mode)
                 A_J_norm_chk = (A_J_chk - mu_L_rep) / (sig_L_rep + eps)
                 details_norm_chk: list[Tensor] = []
                 for j_idx, d in enumerate(details_chk):
-                    j = j_idx + 1
-                    if j in self.high_set:
-                        details_norm_chk.append(d)
-                    else:
-                        details_norm_chk.append(d / (sig_M_rep + eps))
+                    scale_j = (1.0 - w_high[j_idx].detach()) * (sig_M_rep + eps) + w_high[j_idx].detach() * 1.0
+                    details_norm_chk.append(d / scale_j)
                 y_renorm = _swt_inv(A_J_norm_chk, details_norm_chk)
                 self._last_diag["oracle_recon_mse"] = float(
                     F.mse_loss(y_renorm, y.detach()).item()
@@ -640,12 +714,13 @@ class WaveBandNormB(nn.Module):
         # SWT on future ground-truth (detached — supervision signal only)
         with torch.no_grad():
             A_J_t, details_t = _swt_fwd(true.detach(), self.h_lo, self.levels, self.pad_mode)
-            mid_sig_t = self._build_mid_signal(details_t)
+            w_high_det = self._band_w_high().detach()
+            mid_sig_t = sum((1.0 - w_high_det[j]) * details_t[j] for j in range(self.levels))
+            hi_sig_t  = sum(w_high_det[j]          * details_t[j] for j in range(self.levels))
 
         # Future patch oracle stats
         mu_L_true, sig_L_true, E_L_true = self._patch_stats_future(A_J_t)
         _,         sig_M_true, E_M_true = self._patch_stats_future(mid_sig_t, compute_mean=False)
-        hi_sig_t  = self._build_high_signal(details_t)
         _,         _,          E_H_true = self._patch_stats_future(hi_sig_t,  compute_mean=False)
 
         E_tot_t = E_L_true + E_M_true + E_H_true + eps
@@ -674,11 +749,21 @@ class WaveBandNormB(nn.Module):
         log_rho_pred = F.log_softmax(rho_logits, dim=2)  # (B, P_fut, 3, C)
         L_rho = -(rho_true * log_rho_pred).sum(dim=2).mean()
 
+        # Monotone regularisation on band-split gates (wav_split_target == "monotone")
+        # L_split = wav_split_reg_weight * sum_j relu(g_{j+1} - g_j)
+        # Enforces g_1 >= g_2 >= ... >= g_J  (finest level has highest high-weight)
+        if self.wav_use_soft_split and self.levels > 1:
+            g = torch.sigmoid(self.band_logits / self.wav_gate_tau)  # (J,)
+            L_split = self.wav_split_reg_weight * F.relu(g[1:] - g[:-1]).sum()
+        else:
+            L_split = torch.tensor(0.0, device=true.device)
+
         # Update diagnostic cache (detached scalars)
         self._last_diag["L_stats"] = float((self.stats_loss_weight * L_stats).item())
         self._last_diag["L_rho"]   = float((self.rho_loss_weight   * L_rho).item())
+        self._last_diag["L_split"] = float(L_split.item())
 
-        return self.stats_loss_weight * L_stats + self.rho_loss_weight * L_rho
+        return self.stats_loss_weight * L_stats + self.rho_loss_weight * L_rho + L_split
 
     # ------------------------------------------------------------------
     def get_last_diag(self) -> dict[str, float]:
