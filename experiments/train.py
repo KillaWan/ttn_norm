@@ -462,7 +462,7 @@ class TrainConfig:
     wav_sigma_min: float = 1e-3
     wav_stats_loss_weight: float = 0.1
     wav_rho_loss_weight: float = 0.1
-    wav_oracle_mode: str = "none"    # "none" | "eval_stats" | "train_eval_stats"
+    wav_oracle_mode: str = "none"    # "none" | "eval_stats" | "train_eval_stats" | "train_oracle"
 
 
 def _next_power_of_two(n: int) -> int:
@@ -1187,11 +1187,11 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
                 )
 
             optimizer.zero_grad()
-            # UB-2: oracle future stats used during training forward pass
-            if cfg.wav_oracle_mode == "train_eval_stats":
+            # UB-2 / train_oracle: oracle future stats used during training forward pass
+            if cfg.wav_oracle_mode in {"train_eval_stats", "train_oracle"}:
                 _maybe_set_oracle_future(model, cfg, batch_y)
             pred = model(batch_x, batch_x_enc, dec_inp, dec_inp_enc)
-            if cfg.wav_oracle_mode == "train_eval_stats":
+            if cfg.wav_oracle_mode in {"train_eval_stats", "train_oracle"}:
                 _maybe_clear_oracle_future(model, cfg)
             true = batch_y
             if cfg.invtrans_loss:

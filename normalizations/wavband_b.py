@@ -109,11 +109,11 @@ def _swt_inv(A_J: Tensor, details: list[Tensor]) -> Tensor:
 
 
 # ---------------------------------------------------------------------------
-# Lightweight MLP predictor
+# GRU-based predictor
 # ---------------------------------------------------------------------------
 
 class _WavPredictor(nn.Module):
-    """Per-channel MLP: history patch stats → future patch stats.
+    """Per-channel GRU encoder-decoder: history patch stats → future patch stats.
 
     Input  (per batch element, per channel): P_hist patches × 4 features
       [mu_L, log_sig_L, log_sig_M, rho_H]
@@ -128,23 +128,28 @@ class _WavPredictor(nn.Module):
     N_IN  = 4
     N_OUT = 6
 
-    def __init__(self, P_hist: int, P_fut: int, hidden: int = 256):
+    def __init__(self, P_hist: int, P_fut: int, hidden: int = 256, emb_dim: int = 16):
         super().__init__()
         self.P_hist = P_hist
         self.P_fut  = P_fut
-        self.fc1 = nn.Linear(P_hist * self.N_IN, hidden)
-        self.fc2 = nn.Linear(hidden, P_fut * self.N_OUT)
+        self.enc = nn.GRU(input_size=4, hidden_size=hidden, num_layers=1, batch_first=True)
+        self.dec = nn.GRU(input_size=emb_dim, hidden_size=hidden, num_layers=1, batch_first=True)
+        self.future_embed = nn.Parameter(torch.randn(P_fut, emb_dim))
+        self.head = nn.Linear(hidden, self.N_OUT)
 
     def forward(self, feat: Tensor) -> Tensor:
         """
         feat: (B, P_hist, 4, C)
         returns: (B, P_fut, 6, C)
         """
-        B, P, nf, C = feat.shape
-        x = feat.permute(0, 3, 1, 2).reshape(B, C, P * nf)  # (B, C, P*4)
-        x = torch.relu(self.fc1(x))                           # (B, C, hidden)
-        x = self.fc2(x)                                      # (B, C, P_fut*6)
-        return x.reshape(B, C, self.P_fut, self.N_OUT).permute(0, 2, 3, 1)
+        B, P_hist, nf, C = feat.shape
+        assert nf == 4
+        x = feat.permute(0, 3, 1, 2).reshape(B * C, P_hist, 4)   # (B*C, P_hist, 4)
+        _, h = self.enc(x)                                         # h: (1, B*C, hidden)
+        u = self.future_embed.unsqueeze(0).expand(B * C, -1, -1)  # (B*C, P_fut, emb_dim)
+        out, _ = self.dec(u, h)                                    # (B*C, P_fut, hidden)
+        y = self.head(out)                                         # (B*C, P_fut, 6)
+        return y.reshape(B, C, self.P_fut, self.N_OUT).permute(0, 2, 3, 1)
         # → (B, P_fut, 6, C)
 
 
@@ -258,10 +263,14 @@ class WaveBandNormB(nn.Module):
 
         Args:
             y_future: (B, H, C) ground-truth future tensor in original space.
-            mode:     caller-supplied label (e.g. "eval_stats"); logged only.
+            mode:     oracle mode; must be in {"eval_stats","train_eval_stats","train_oracle"}.
         """
-        self._oracle_future_y = y_future
-        self._oracle_enabled = True
+        if mode in {"eval_stats", "train_eval_stats", "train_oracle"}:
+            self._oracle_future_y = y_future.detach()
+            self._oracle_enabled = True
+        else:
+            self._oracle_enabled = False
+            self._oracle_future_y = None
 
     def clear_oracle_future(self) -> None:
         """Remove oracle future tensor; denormalize() falls back to predictor stats."""
