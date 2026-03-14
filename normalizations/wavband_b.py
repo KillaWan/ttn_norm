@@ -128,23 +128,24 @@ class _WavPredictor(nn.Module):
     N_IN  = 4
     N_OUT = 6
 
-    def __init__(self, P_hist: int, P_fut: int, hidden: int = 256, emb_dim: int = 16):
+    def __init__(self, P_hist: int, P_fut: int, in_dim: int, hidden: int = 256, emb_dim: int = 16):
         super().__init__()
         self.P_hist = P_hist
         self.P_fut  = P_fut
-        self.enc = nn.GRU(input_size=4, hidden_size=hidden, num_layers=1, batch_first=True)
+        self.in_dim = in_dim
+        self.enc = nn.GRU(input_size=in_dim, hidden_size=hidden, num_layers=1, batch_first=True)
         self.dec = nn.GRU(input_size=emb_dim, hidden_size=hidden, num_layers=1, batch_first=True)
         self.future_embed = nn.Parameter(torch.randn(P_fut, emb_dim))
         self.head = nn.Linear(hidden, self.N_OUT)
 
     def forward(self, feat: Tensor) -> Tensor:
         """
-        feat: (B, P_hist, 4, C)
+        feat: (B, P_hist, in_dim, C)
         returns: (B, P_fut, 6, C)
         """
         B, P_hist, nf, C = feat.shape
-        assert nf == 4
-        x = feat.permute(0, 3, 1, 2).reshape(B * C, P_hist, 4)   # (B*C, P_hist, 4)
+        assert nf == self.in_dim
+        x = feat.permute(0, 3, 1, 2).reshape(B * C, P_hist, self.in_dim)  # (B*C, P_hist, in_dim)
         _, h = self.enc(x)                                         # h: (1, B*C, hidden)
         u = self.future_embed.unsqueeze(0).expand(B * C, -1, -1)  # (B*C, P_fut, emb_dim)
         out, _ = self.dec(u, h)                                    # (B*C, P_fut, hidden)
@@ -190,6 +191,7 @@ class WaveBandNormB(nn.Module):
         sigma_min: float = 1e-3,
         stats_loss_weight: float = 0.1,
         rho_loss_weight: float = 0.1,
+        pred_use_wave: bool = False,
     ):
         super().__init__()
         if seq_len % patch_len != 0:
@@ -209,6 +211,7 @@ class WaveBandNormB(nn.Module):
         self.stats_loss_weight = stats_loss_weight
         self.rho_loss_weight   = rho_loss_weight
         self.epsilon   = 1e-6
+        self.pred_use_wave = pred_use_wave
 
         # ── Classify levels ───────────────────────────────────────────────────
         all_lvls  = set(range(1, levels + 1))
@@ -227,7 +230,8 @@ class WaveBandNormB(nn.Module):
         self.P_fut  = pred_len // patch_len
 
         # ── Predictor ─────────────────────────────────────────────────────────
-        self.predictor = _WavPredictor(self.P_hist, self.P_fut)
+        in_dim = 4 + 2 * self.patch_len if self.pred_use_wave else 4
+        self.predictor = _WavPredictor(self.P_hist, self.P_fut, in_dim=in_dim)
 
         # ── Condition channels ────────────────────────────────────────────────
         if cond == "rho_h":
@@ -366,10 +370,24 @@ class WaveBandNormB(nn.Module):
             self._last_diag["rho_H_p90"]  = float(torch.quantile(rho_H_flat, 0.90).item())
 
         # ── 3. Predictor ──────────────────────────────────────────────────────
-        feat = torch.stack(
+        feat_stats = torch.stack(
             [mu_L, torch.log(sig_L + eps), torch.log(sig_M + eps), rho_H],
             dim=2,
         )  # (B, P_hist, 4, C)
+
+        if self.pred_use_wave:
+            low_patch = A_J_det.reshape(B, self.P_hist, self.patch_len, C)
+            mid_patch = mid_sig_det.reshape(B, self.P_hist, self.patch_len, C)
+            mu_L_u  = mu_L.unsqueeze(2)   # (B, P_hist, 1, C)
+            sig_L_u = sig_L.unsqueeze(2)
+            sig_M_u = sig_M.unsqueeze(2)
+            low_z = (low_patch - mu_L_u) / (sig_L_u + eps)   # (B, P_hist, patch_len, C)
+            mid_z = mid_patch / (sig_M_u + eps)               # (B, P_hist, patch_len, C)
+            feat_wave = torch.cat([low_z, mid_z], dim=2)      # (B, P_hist, 2*patch_len, C)
+            feat = torch.cat([feat_stats, feat_wave], dim=2)  # (B, P_hist, 4+2*patch_len, C)
+        else:
+            feat = feat_stats  # (B, P_hist, 4, C)
+
         pred_raw = self.predictor(feat)   # (B, P_fut, 6, C)
         self._pred_raw = pred_raw
 

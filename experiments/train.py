@@ -463,6 +463,7 @@ class TrainConfig:
     wav_stats_loss_weight: float = 0.1
     wav_rho_loss_weight: float = 0.1
     wav_oracle_mode: str = "none"    # "none" | "eval_stats" | "train_eval_stats" | "train_oracle"
+    wav_pred_use_wave: bool = False  # if True, append normalized low/mid waveforms to predictor input
 
 
 def _next_power_of_two(n: int) -> int:
@@ -547,6 +548,7 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             sigma_min=cfg.wav_sigma_min,
             stats_loss_weight=cfg.wav_stats_loss_weight,
             rho_loss_weight=cfg.wav_rho_loss_weight,
+            pred_use_wave=cfg.wav_pred_use_wave,
         )
         # Adjust backbone enc_in to include conditioning channels
         num_features += norm_model.cond_channels
