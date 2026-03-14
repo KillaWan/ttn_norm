@@ -61,16 +61,23 @@ def _make_atrous_kernel(h: Tensor, level: int) -> Tensor:
     return kernel  # (1, 1, length)
 
 
-def _swt_fwd(x: Tensor, h_lo: Tensor, levels: int) -> tuple[Tensor, list[Tensor]]:
+def _swt_fwd(
+    x: Tensor,
+    h_lo: Tensor,
+    levels: int,
+    pad_mode: str = "reflect",
+) -> tuple[Tensor, list[Tensor]]:
     """Stationary WT forward (residual variant).
 
-    A_j   = circular_conv(A_{j-1}, h_lo_upsampled)
-    D_j   = A_{j-1} – A_j          ← exact reconstruction guaranteed
+    A_j   = conv(A_{j-1}, h_lo_upsampled)  with configurable boundary padding
+    D_j   = A_{j-1} – A_j                  ← exact reconstruction guaranteed
 
     Args:
-        x:      (B, T, C)
-        h_lo:   1-D low-pass kernel  (n,)
-        levels: number of decomposition levels J
+        x:        (B, T, C)
+        h_lo:     1-D low-pass kernel  (n,)
+        levels:   number of decomposition levels J
+        pad_mode: padding strategy passed to F.pad; "reflect" requires pad < T,
+                  falls back to "replicate" for very short signals.
     Returns:
         A_J:    (B, T, C)
         details: [D_1, …, D_J]  each (B, T, C)
@@ -83,7 +90,11 @@ def _swt_fwd(x: Tensor, h_lo: Tensor, levels: int) -> tuple[Tensor, list[Tensor]
         kernel = _make_atrous_kernel(h_lo, j)  # (1, 1, K)
         K = kernel.shape[-1]
         pad = K // 2
-        a_pad = F.pad(a, (pad, pad), mode="circular")
+        # "reflect" requires pad < T; fall back to "replicate" for very short signals
+        effective_mode = pad_mode
+        if effective_mode == "reflect" and pad >= T:
+            effective_mode = "replicate"
+        a_pad = F.pad(a, (pad, pad), mode=effective_mode)
         a_next = F.conv1d(a_pad, kernel.to(a.device, a.dtype))[:, :, :T]
         d = a - a_next
         details.append(d.reshape(B, C, T).permute(0, 2, 1))  # (B, T, C)
@@ -192,6 +203,8 @@ class WaveBandNormB(nn.Module):
         stats_loss_weight: float = 0.1,
         rho_loss_weight: float = 0.1,
         pred_use_wave: bool = False,
+        ctx_patches: int = 0,
+        pad_mode: str = "reflect",
     ):
         super().__init__()
         if seq_len % patch_len != 0:
@@ -212,6 +225,8 @@ class WaveBandNormB(nn.Module):
         self.rho_loss_weight   = rho_loss_weight
         self.epsilon   = 1e-6
         self.pred_use_wave = pred_use_wave
+        self.ctx_patches = int(ctx_patches)
+        self.pad_mode = pad_mode
 
         # ── Classify levels ───────────────────────────────────────────────────
         all_lvls  = set(range(1, levels + 1))
@@ -228,10 +243,11 @@ class WaveBandNormB(nn.Module):
         # ── History / future patch counts ─────────────────────────────────────
         self.P_hist = seq_len  // patch_len
         self.P_fut  = pred_len // patch_len
+        self.P_hist_pred = self.P_hist + self.ctx_patches  # predictor sees more history
 
         # ── Predictor ─────────────────────────────────────────────────────────
         in_dim = 4 + 2 * self.patch_len if self.pred_use_wave else 4
-        self.predictor = _WavPredictor(self.P_hist, self.P_fut, in_dim=in_dim)
+        self.predictor = _WavPredictor(self.P_hist_pred, self.P_fut, in_dim=in_dim)
 
         # ── Condition channels ────────────────────────────────────────────────
         if cond == "rho_h":
@@ -244,6 +260,8 @@ class WaveBandNormB(nn.Module):
         # ── Internal state ────────────────────────────────────────────────────
         self._pred_stats: Optional[dict] = None   # set by normalize()
         self._pred_raw:   Optional[Tensor] = None  # cached predictor output
+        # Context history for extended predictor input (set/cleared by callers)
+        self._ctx_x: Optional[Tensor] = None
         # Oracle upper-bound gate (set/cleared by set_oracle_future / clear_oracle_future)
         self._oracle_future_y: Optional[Tensor] = None
         self._oracle_enabled: bool = False
@@ -280,6 +298,18 @@ class WaveBandNormB(nn.Module):
         """Remove oracle future tensor; denormalize() falls back to predictor stats."""
         self._oracle_future_y = None
         self._oracle_enabled = False
+
+    def set_ctx_history(self, x_ctx: Tensor) -> None:
+        """Cache extra history context so normalize() feeds a longer sequence to the predictor.
+
+        Args:
+            x_ctx: (B, ctx_len, C)  extra history preceding the current window.
+        """
+        self._ctx_x = x_ctx.detach()
+
+    def clear_ctx_history(self) -> None:
+        """Clear cached context history."""
+        self._ctx_x = None
 
     # ------------------------------------------------------------------
     def _patch_stats(
@@ -330,6 +360,63 @@ class WaveBandNormB(nn.Module):
         return out
 
     # ------------------------------------------------------------------
+    def _extract_patch_tokens(self, x_in: Tensor) -> dict:
+        """Compute per-patch predictor tokens from a single contiguous segment.
+
+        Runs _swt_fwd independently on x_in (no concatenation with other segments),
+        so there is no cross-boundary leakage.
+
+        Args:
+            x_in: (B, T_in, C)  — must satisfy T_in % patch_len == 0
+
+        Returns dict with keys:
+            mu_L, log_sig_L, log_sig_M, rho_H  — each (B, P, C)
+            sig_L, sig_M                        — each (B, P, C)  (for wave features)
+            feat_wave                           — (B, P, 2*patch_len, C) if pred_use_wave
+                                                  else None
+        """
+        B, T_in, C = x_in.shape
+        P = T_in // self.patch_len
+        eps = self.epsilon
+
+        with torch.no_grad():
+            A_J_det, details_det = _swt_fwd(x_in.detach(), self.h_lo, self.levels, self.pad_mode)
+            mid_sig_det = self._build_mid_signal(details_det)
+            hi_sig_det  = self._build_high_signal(details_det)
+
+        r_L = A_J_det.reshape(B, P, self.patch_len, C)
+        mu_L  = r_L.mean(dim=2)
+        sig_L = r_L.std(dim=2).clamp(min=self.sigma_min)
+        E_L   = (r_L ** 2).mean(dim=2)
+
+        r_M = mid_sig_det.reshape(B, P, self.patch_len, C)
+        sig_M = r_M.std(dim=2).clamp(min=self.sigma_min)
+        E_M   = (r_M ** 2).mean(dim=2)
+
+        r_H = hi_sig_det.reshape(B, P, self.patch_len, C)
+        E_H = (r_H ** 2).mean(dim=2)
+
+        E_tot = E_L + E_M + E_H + eps
+        rho_H = E_H / E_tot
+
+        tokens: dict = {
+            "mu_L":      mu_L,
+            "log_sig_L": torch.log(sig_L + eps),
+            "log_sig_M": torch.log(sig_M + eps),
+            "rho_H":     rho_H,
+            "sig_L":     sig_L,
+            "sig_M":     sig_M,
+            "feat_wave": None,
+        }
+
+        if self.pred_use_wave:
+            low_z = (r_L - mu_L.unsqueeze(2)) / (sig_L.unsqueeze(2) + eps)
+            mid_z = r_M / (sig_M.unsqueeze(2) + eps)
+            tokens["feat_wave"] = torch.cat([low_z, mid_z], dim=2)  # (B, P, 2*patch_len, C)
+
+        return tokens
+
+    # ------------------------------------------------------------------
     def normalize(self, x: Tensor) -> Tensor:
         """(B, T, C) → (B, T, C + cond_channels).
 
@@ -340,17 +427,17 @@ class WaveBandNormB(nn.Module):
         eps = self.epsilon
         h   = self.h_lo
 
-        # ── 1. SWT forward ────────────────────────────────────────────────────
+        # ── 1. SWT forward (current window x only) ───────────────────────────
         with torch.no_grad():
-            # Stats are computed on detached input to avoid double-differentiating
-            A_J_det, details_det = _swt_fwd(x.detach(), h, self.levels)
+            # Detached SWT for statistics (no autograd through stats)
+            A_J_det, details_det = _swt_fwd(x.detach(), h, self.levels, self.pad_mode)
             mid_sig_det = self._build_mid_signal(details_det)
             hi_sig_det  = self._build_high_signal(details_det)
 
         # Full-gradient SWT for reconstruction path
-        A_J, details = _swt_fwd(x, h, self.levels)
+        A_J, details = _swt_fwd(x, h, self.levels, self.pad_mode)
 
-        # ── 2. History patch statistics ───────────────────────────────────────
+        # ── 2. Current-window patch statistics (used for normalization) ───────
         mu_L,  sig_L, E_L = self._patch_stats(A_J_det, compute_mean=True)
         _,     sig_M, E_M = self._patch_stats(mid_sig_det, compute_mean=False)
         _,     _,     E_H = self._patch_stats(hi_sig_det,  compute_mean=False)
@@ -360,7 +447,7 @@ class WaveBandNormB(nn.Module):
         rho_M  = E_M / E_tot
         rho_H  = E_H / E_tot
 
-        # ── Diagnostic cache (history-side stats, detached) ───────────────────
+        # ── Diagnostic cache (current-window stats, detached) ─────────────────
         with torch.no_grad():
             rho_H_flat = rho_H.reshape(-1)
             self._last_diag["sig_L_mean"] = float(sig_L.mean().item())
@@ -369,24 +456,52 @@ class WaveBandNormB(nn.Module):
             self._last_diag["rho_H_p10"]  = float(torch.quantile(rho_H_flat, 0.10).item())
             self._last_diag["rho_H_p90"]  = float(torch.quantile(rho_H_flat, 0.90).item())
 
-        # ── 3. Predictor ──────────────────────────────────────────────────────
+        # ── 3. Predictor input: per-segment token extraction (no cross-boundary SWT) ──
+        # Each segment (ctx and x) is processed independently by _extract_patch_tokens
+        # to avoid convolution leakage across the ctx/x boundary.
+        tok_x = self._extract_patch_tokens(x)   # tokens from current window: P_hist patches
+
+        if self._ctx_x is not None and self.ctx_patches > 0:
+            tok_ctx = self._extract_patch_tokens(self._ctx_x)  # tokens from ctx: ctx_patches patches
+            P_ctx  = self._ctx_x.shape[1] // self.patch_len
+            P_hist = tok_x["mu_L"].shape[1]
+            P_pred = P_ctx + P_hist
+            if P_ctx != self.ctx_patches:
+                raise ValueError(
+                    f"ctx segment has P_ctx={P_ctx} patches but ctx_patches={self.ctx_patches}. "
+                    f"Check that ctx_len = wav_ctx_patches * wav_patch_len matches the dataloader."
+                )
+            if P_pred != self.P_hist_pred:
+                raise ValueError(
+                    f"P_ctx={P_ctx} + P_hist={P_hist} = {P_pred} "
+                    f"!= P_hist_pred={self.P_hist_pred} "
+                    f"(ctx_patches={self.ctx_patches}, patch_len={self.patch_len})"
+                )
+            # Concatenate tokens along patch dimension
+            mu_L_p      = torch.cat([tok_ctx["mu_L"],      tok_x["mu_L"]],      dim=1)
+            log_sig_L_p = torch.cat([tok_ctx["log_sig_L"], tok_x["log_sig_L"]], dim=1)
+            log_sig_M_p = torch.cat([tok_ctx["log_sig_M"], tok_x["log_sig_M"]], dim=1)
+            rho_H_p     = torch.cat([tok_ctx["rho_H"],     tok_x["rho_H"]],     dim=1)
+            if self.pred_use_wave:
+                feat_wave = torch.cat([tok_ctx["feat_wave"], tok_x["feat_wave"]], dim=1)
+        else:
+            mu_L_p      = tok_x["mu_L"]
+            log_sig_L_p = tok_x["log_sig_L"]
+            log_sig_M_p = tok_x["log_sig_M"]
+            rho_H_p     = tok_x["rho_H"]
+            P_pred      = tok_x["mu_L"].shape[1]
+            if self.pred_use_wave:
+                feat_wave = tok_x["feat_wave"]
+
         feat_stats = torch.stack(
-            [mu_L, torch.log(sig_L + eps), torch.log(sig_M + eps), rho_H],
+            [mu_L_p, log_sig_L_p, log_sig_M_p, rho_H_p],
             dim=2,
-        )  # (B, P_hist, 4, C)
+        )  # (B, P_hist_pred, 4, C)
 
         if self.pred_use_wave:
-            low_patch = A_J_det.reshape(B, self.P_hist, self.patch_len, C)
-            mid_patch = mid_sig_det.reshape(B, self.P_hist, self.patch_len, C)
-            mu_L_u  = mu_L.unsqueeze(2)   # (B, P_hist, 1, C)
-            sig_L_u = sig_L.unsqueeze(2)
-            sig_M_u = sig_M.unsqueeze(2)
-            low_z = (low_patch - mu_L_u) / (sig_L_u + eps)   # (B, P_hist, patch_len, C)
-            mid_z = mid_patch / (sig_M_u + eps)               # (B, P_hist, patch_len, C)
-            feat_wave = torch.cat([low_z, mid_z], dim=2)      # (B, P_hist, 2*patch_len, C)
-            feat = torch.cat([feat_stats, feat_wave], dim=2)  # (B, P_hist, 4+2*patch_len, C)
+            feat = torch.cat([feat_stats, feat_wave], dim=2)  # (B, P_pred, 4+2*patch_len, C)
         else:
-            feat = feat_stats  # (B, P_hist, 4, C)
+            feat = feat_stats  # (B, P_hist_pred, 4, C)
 
         pred_raw = self.predictor(feat)   # (B, P_fut, 6, C)
         self._pred_raw = pred_raw
@@ -460,7 +575,7 @@ class WaveBandNormB(nn.Module):
             # ── Oracle path: true future wavelet stats ───────────────────────
             y_true = self._oracle_future_y.detach()
             with torch.no_grad():
-                A_J_t, details_t = _swt_fwd(y_true, self.h_lo, self.levels)
+                A_J_t, details_t = _swt_fwd(y_true, self.h_lo, self.levels, self.pad_mode)
                 mid_sig_t = self._build_mid_signal(details_t)
                 mu_L_f, sig_L_f, _ = self._patch_stats_future(A_J_t)
                 _, sig_M_f, _      = self._patch_stats_future(mid_sig_t, compute_mean=False)
@@ -475,7 +590,7 @@ class WaveBandNormB(nn.Module):
             sig_M_rep = ps["sig_M"].repeat_interleave(self.patch_len, dim=1)
 
         # SWT forward on normalised prediction
-        A_J_n, details_n = _swt_fwd(y, self.h_lo, self.levels)
+        A_J_n, details_n = _swt_fwd(y, self.h_lo, self.levels, self.pad_mode)
 
         # Invert band normalisation
         A_J_hat = A_J_n * (sig_L_rep + eps) + mu_L_rep
@@ -494,7 +609,7 @@ class WaveBandNormB(nn.Module):
         # Re-normalise y_hat with the same oracle stats → should recover y.
         if self._oracle_enabled:
             with torch.no_grad():
-                A_J_chk, details_chk = _swt_fwd(y_hat.detach(), self.h_lo, self.levels)
+                A_J_chk, details_chk = _swt_fwd(y_hat.detach(), self.h_lo, self.levels, self.pad_mode)
                 A_J_norm_chk = (A_J_chk - mu_L_rep) / (sig_L_rep + eps)
                 details_norm_chk: list[Tensor] = []
                 for j_idx, d in enumerate(details_chk):
@@ -524,7 +639,7 @@ class WaveBandNormB(nn.Module):
 
         # SWT on future ground-truth (detached — supervision signal only)
         with torch.no_grad():
-            A_J_t, details_t = _swt_fwd(true.detach(), self.h_lo, self.levels)
+            A_J_t, details_t = _swt_fwd(true.detach(), self.h_lo, self.levels, self.pad_mode)
             mid_sig_t = self._build_mid_signal(details_t)
 
         # Future patch oracle stats

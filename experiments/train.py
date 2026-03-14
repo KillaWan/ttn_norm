@@ -77,6 +77,15 @@ def _build_dataloader(cfg):
     scaler = _parse_scaler(cfg.scaler_type)(device=cfg.device)
     n_total = len(dataset)
 
+    # Enlarge loader window for wavband context patches
+    if (
+        cfg.norm_type.lower() in {"wavband", "wavband_b"}
+        and cfg.wav_ctx_patches > 0
+    ):
+        loader_window = cfg.window + cfg.wav_ctx_patches * cfg.wav_patch_len
+    else:
+        loader_window = cfg.window
+
     if cfg.split_type == "popular":
         if cfg.dataset_type not in _ETT_POPULAR_DATASETS:
             raise ValueError(
@@ -125,7 +134,7 @@ def _build_dataloader(cfg):
         dataloader = LoaderCls(
             dataset,
             scaler,
-            window=cfg.window,
+            window=loader_window,
             horizon=cfg.horizon,
             steps=cfg.pred_len,
             shuffle_train=True,
@@ -155,7 +164,7 @@ def _build_dataloader(cfg):
         dataloader = ChunkSequenceTimefeatureDataLoader(
             dataset,
             scaler,
-            window=cfg.window,
+            window=loader_window,
             horizon=cfg.horizon,
             steps=cfg.pred_len,
             scale_in_train=cfg.scale_in_train,
@@ -464,6 +473,14 @@ class TrainConfig:
     wav_rho_loss_weight: float = 0.1
     wav_oracle_mode: str = "none"    # "none" | "eval_stats" | "train_eval_stats" | "train_oracle"
     wav_pred_use_wave: bool = False  # if True, append normalized low/mid waveforms to predictor input
+    wav_ctx_patches: int = 0         # extra history patches fed to predictor (loader window enlarged)
+    wav_hard_aux_scale: float = 0.0  # >0: wavband aux loss uses this fixed scale instead of aux_scale
+    wav_stage_train: bool = False    # if True, stage1 trains only predictor; stage2 trains jointly
+    wav_pretrain_epochs: int = 10    # number of stage1 epochs (predictor-only pretraining)
+    wav_pretrain_aux_scale: float = 1.0  # aux loss scale in stage1
+    wav_pred_lr: float = 1e-3        # predictor-specific learning rate (separate optimizer group)
+    wav_pred_weight_decay: float = 0.0   # predictor-specific weight decay
+    wav_pad_mode: str = "reflect"    # SWT boundary padding: "reflect" | "replicate" | "circular"
 
 
 def _next_power_of_two(n: int) -> int:
@@ -549,6 +566,8 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             stats_loss_weight=cfg.wav_stats_loss_weight,
             rho_loss_weight=cfg.wav_rho_loss_weight,
             pred_use_wave=cfg.wav_pred_use_wave,
+            ctx_patches=cfg.wav_ctx_patches,
+            pad_mode=cfg.wav_pad_mode,
         )
         # Adjust backbone enc_in to include conditioning channels
         num_features += norm_model.cond_channels
@@ -1103,11 +1122,14 @@ def _build_optimizer(model: nn.Module, cfg: TrainConfig) -> Adam:
         if gate_mod is not None:
             gate_params = [p for p in gate_mod.parameters() if p.requires_grad]
 
-    gate_ids = {id(p) for p in gate_params}
+    # Predictor-specific parameter group (wavband staged training)
+    pred_params = _wav_pred_params(model)
+
+    excluded_ids = {id(p) for p in gate_params} | {id(p) for p in pred_params}
     remaining = [
         p
         for p in model.parameters()
-        if p.requires_grad and id(p) not in gate_ids
+        if p.requires_grad and id(p) not in excluded_ids
     ]
 
     groups: list[dict[str, object]] = []
@@ -1115,6 +1137,12 @@ def _build_optimizer(model: nn.Module, cfg: TrainConfig) -> Adam:
         groups.append({"params": remaining, "weight_decay": cfg.weight_decay, "lr": base_lr})
     if gate_params:
         groups.append({"params": gate_params, "weight_decay": gate_wd, "lr": gate_lr})
+    if pred_params:
+        groups.append({
+            "params": pred_params,
+            "lr": float(cfg.wav_pred_lr),
+            "weight_decay": float(cfg.wav_pred_weight_decay),
+        })
 
     return Adam(groups, lr=base_lr)
 
@@ -1149,6 +1177,33 @@ def _maybe_clear_oracle_future(model: nn.Module, cfg: TrainConfig) -> None:
         nm.clear_oracle_future()
 
 
+def _set_requires_grad(module: nn.Module, flag: bool) -> None:
+    """Enable or disable gradient computation for all parameters of a module."""
+    for p in module.parameters():
+        p.requires_grad = flag
+
+
+def _wav_pred_params(model: nn.Module) -> list:
+    """Return predictor parameters from model.nm, or empty list if not present."""
+    nm = getattr(model, "nm", None)
+    if nm is None:
+        return []
+    predictor = getattr(nm, "predictor", None)
+    if predictor is None:
+        return []
+    return list(predictor.parameters())
+
+
+def _freeze_all_except_wav_predictor(model: nn.Module) -> None:
+    """Freeze the entire model, then unfreeze only model.nm.predictor."""
+    _set_requires_grad(model, False)
+    nm = getattr(model, "nm", None)
+    if nm is not None:
+        predictor = getattr(nm, "predictor", None)
+        if predictor is not None:
+            _set_requires_grad(predictor, True)
+
+
 def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
     model.train()
     loss_fn = nn.MSELoss()
@@ -1166,6 +1221,15 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
         and model.nm is not None
         and hasattr(model.nm, "get_last_aux_stats")
     )
+
+    # ── Stage freeze / unfreeze ───────────────────────────────────────────────
+    _is_wavband_epoch = cfg.norm_type.lower() in {"wavband", "wavband_b"}
+    _in_stage1 = _is_wavband_epoch and cfg.wav_stage_train and epoch_idx < cfg.wav_pretrain_epochs
+    if _in_stage1:
+        _freeze_all_except_wav_predictor(model)
+        print(f"[stage1] epoch {epoch_idx}: predictor-only training (frozen backbone)")
+    else:
+        _set_requires_grad(model, True)
 
     aux_scale = _aux_scale(cfg, epoch_idx)
     print(f"aux_loss_scale: {aux_scale:.6f}")
@@ -1189,12 +1253,60 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
                 )
 
             optimizer.zero_grad()
+
+            # ctx split for wavband extended predictor history
+            ctx_len = cfg.wav_ctx_patches * cfg.wav_patch_len
+            _is_wavband = cfg.norm_type.lower() in {"wavband", "wavband_b"}
+            if ctx_len > 0 and _is_wavband:
+                x_ctx  = batch_x[:, :ctx_len, :]
+                x_main = batch_x[:, ctx_len:, :]
+                x_enc_main = batch_x_enc[:, ctx_len:, :]
+                if model.nm is not None and hasattr(model.nm, "set_ctx_history"):
+                    model.nm.set_ctx_history(x_ctx)
+                if model.is_former:
+                    label_len = min(cfg.label_len or (cfg.window // 2), x_main.size(1))
+                    dec_inp, dec_inp_enc = _make_dec_inputs(
+                        x_main, batch_y_enc, x_enc_main, label_len
+                    )
+            else:
+                x_main, x_enc_main = batch_x, batch_x_enc
+
+            # ── Stage 1: predictor-only pretraining ──────────────────────────
+            if _in_stage1:
+                if model.nm is not None and hasattr(model.nm, "normalize"):
+                    model.nm.normalize(x_main)
+                aux_loss = torch.tensor(0.0, device=batch_x.device)
+                if model.nm is not None and hasattr(model.nm, "loss"):
+                    aux_loss = model.nm.loss(batch_y)
+                loss = cfg.wav_pretrain_aux_scale * aux_loss
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                optimizer.step()
+                if ctx_len > 0 and _is_wavband:
+                    if model.nm is not None and hasattr(model.nm, "clear_ctx_history"):
+                        model.nm.clear_ctx_history()
+                task_loss = torch.tensor(0.0, device=batch_x.device)
+                losses.append(loss.item())
+                task_losses.append(task_loss.item())
+                aux_losses.append(aux_loss.item())
+                pbar.update(batch_x.size(0))
+                pbar.set_postfix(
+                    stage="pretrain",
+                    aux=f"{aux_loss.item():.4f}",
+                    total=f"{loss.item():.4f}",
+                )
+                continue
+
+            # ── Stage 2 / joint: full model forward ──────────────────────────
             # UB-2 / train_oracle: oracle future stats used during training forward pass
             if cfg.wav_oracle_mode in {"train_eval_stats", "train_oracle"}:
                 _maybe_set_oracle_future(model, cfg, batch_y)
-            pred = model(batch_x, batch_x_enc, dec_inp, dec_inp_enc)
+            pred = model(x_main, x_enc_main, dec_inp, dec_inp_enc)
             if cfg.wav_oracle_mode in {"train_eval_stats", "train_oracle"}:
                 _maybe_clear_oracle_future(model, cfg)
+            if ctx_len > 0 and _is_wavband:
+                if model.nm is not None and hasattr(model.nm, "clear_ctx_history"):
+                    model.nm.clear_ctx_history()
             true = batch_y
             if cfg.invtrans_loss:
                 pred = scaler.inverse_transform(pred)
@@ -1205,7 +1317,10 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
             if hasattr(model.nm, "loss"):
                 aux_loss = model.nm.loss(true)
 
-            loss = task_loss + aux_loss * aux_scale
+            if _is_wavband and cfg.wav_hard_aux_scale > 0.0:
+                loss = task_loss + cfg.wav_hard_aux_scale * aux_loss
+            else:
+                loss = task_loss + aux_loss * aux_scale
 
             # pred_N_loss: hard term, NOT scaled by aux_loss_scale
             if (
@@ -1313,17 +1428,38 @@ def evaluate(model, loader, cfg, scaler, debug_prefix: str | None = None):
         origin_y = origin_y.to(cfg.device).float()
 
         dec_inp, dec_inp_enc = None, None
-        if model.is_former:
-            label_len = min(cfg.label_len or (cfg.window // 2), batch_x.size(1))
-            dec_inp, dec_inp_enc = _make_dec_inputs(
-                batch_x, batch_y_enc, batch_x_enc, label_len
-            )
+
+        # ctx split for wavband extended predictor history
+        ctx_len = cfg.wav_ctx_patches * cfg.wav_patch_len
+        _is_wavband = cfg.norm_type.lower() in {"wavband", "wavband_b"}
+        if ctx_len > 0 and _is_wavband:
+            x_ctx  = batch_x[:, :ctx_len, :]
+            x_main = batch_x[:, ctx_len:, :]
+            x_enc_main = batch_x_enc[:, ctx_len:, :]
+            if model.nm is not None and hasattr(model.nm, "set_ctx_history"):
+                model.nm.set_ctx_history(x_ctx)
+            if model.is_former:
+                label_len = min(cfg.label_len or (cfg.window // 2), x_main.size(1))
+                dec_inp, dec_inp_enc = _make_dec_inputs(
+                    x_main, batch_y_enc, x_enc_main, label_len
+                )
+        else:
+            x_main, x_enc_main = batch_x, batch_x_enc
+            if model.is_former:
+                label_len = min(cfg.label_len or (cfg.window // 2), batch_x.size(1))
+                dec_inp, dec_inp_enc = _make_dec_inputs(
+                    batch_x, batch_y_enc, batch_x_enc, label_len
+                )
+
         # UB-1 / UB-2: oracle future stats used during evaluation
         if cfg.wav_oracle_mode in {"eval_stats", "train_eval_stats"}:
             _maybe_set_oracle_future(model, cfg, batch_y)
-        pred = model(batch_x, batch_x_enc, dec_inp, dec_inp_enc)
+        pred = model(x_main, x_enc_main, dec_inp, dec_inp_enc)
         if cfg.wav_oracle_mode in {"eval_stats", "train_eval_stats"}:
             _maybe_clear_oracle_future(model, cfg)
+        if ctx_len > 0 and _is_wavband:
+            if model.nm is not None and hasattr(model.nm, "clear_ctx_history"):
+                model.nm.clear_ctx_history()
 
         if has_nm_aux:
             model.nm.loss()
