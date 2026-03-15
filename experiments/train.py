@@ -436,6 +436,7 @@ class TrainConfig:
     # FAN (frequency adaptive normalization)
     fan_freq_topk: int = 20
     fan_rfft: bool = True
+    fan_ablation_mode: str = "original"   # "original" | "low_only" | "topk_exclude_low"
     # DishTS
     dish_init: str = "uniform"   # "standard" | "avg" | "uniform"
     # SAN (seasonal adaptive normalization)
@@ -527,6 +528,7 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             enc_in=num_features,
             freq_topk=cfg.fan_freq_topk,
             rfft=cfg.fan_rfft,
+            ablation_mode=cfg.fan_ablation_mode,
         )
 
     elif _nt == "dishts":
@@ -1573,6 +1575,11 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int,
 @torch.no_grad()
 def evaluate(model, loader, cfg, scaler, debug_prefix: str | None = None):
     model.eval()
+    # Reset FAN frequency-bin stats at the start of each evaluation phase
+    _nm_fan = getattr(model, "nm", None)
+    _is_fan = _nm_fan is not None and hasattr(_nm_fan, "reset_freq_stats")
+    if _is_fan:
+        _nm_fan.reset_freq_stats()
     metrics = _build_metrics(torch.device(cfg.device))
     for metric in metrics.values():
         metric.reset()
@@ -1691,6 +1698,10 @@ def evaluate(model, loader, cfg, scaler, debug_prefix: str | None = None):
             f" update_rate={ttn_st['update_rate']:.4f}"
         )
 
+    # FAN frequency-bin statistics (collected over the full eval pass)
+    if _is_fan:
+        results.update(_nm_fan.get_freq_stats())
+
     return results
 
 
@@ -1750,6 +1761,8 @@ def main(argv: list[str] | None = None):
     scheduler = CosineAnnealingLR(optimizer, T_max=cfg.epochs)
 
     run_name = cfg.run_name or f"{cfg.dataset_type}_{cfg.backbone_type}_{cfg.norm_type}"
+    if not cfg.run_name and cfg.norm_type.lower() == "fan":
+        run_name = f"{run_name}_{cfg.fan_ablation_mode}"
     result_root = cfg.result_dir
     if cfg.norm_type.lower() in {"none", "baseline", "no"}:
         result_root = os.path.join(cfg.result_dir, cfg.baseline_subdir)
@@ -1878,6 +1891,12 @@ def main(argv: list[str] | None = None):
             and cfg.wav_stage_train
             and cfg.wav_freeze_pred_in_stage2
         )
+        # Reset FAN stats before the training pass
+        _nm_fan_ep = getattr(model, "nm", None)
+        _is_fan_ep = _nm_fan_ep is not None and hasattr(_nm_fan_ep, "reset_freq_stats")
+        if _is_fan_ep:
+            _nm_fan_ep.reset_freq_stats()
+
         result = train_one_epoch(
             model, dataloader.train_loader, optimizer, cfg, scaler,
             epoch_idx=epoch, oracle_prob=_oracle_p,
@@ -1892,6 +1911,9 @@ def main(argv: list[str] | None = None):
             train_loss = result
             gate_info = ""
             train_stat = {}
+
+        # Collect FAN stats for the just-completed training pass
+        _train_fan_stats = _nm_fan_ep.get_freq_stats() if _is_fan_ep else {}
 
         # ── Stage1: val_aux early stop, then skip full val/test evaluation ────
         if _in_stage1_main:
@@ -2018,6 +2040,13 @@ def main(argv: list[str] | None = None):
                 val_stat_str = f" | aux_total={val_metrics['aux_total']:.6e}"
 
             print(f"Epoch: {epoch + 1} Training loss: {train_loss:.6f}{gate_info}{train_stat_str}")
+            if _train_fan_stats:
+                print(
+                    f"Epoch: {epoch + 1} [fan_train]"
+                    f" selected_bin_mean={_train_fan_stats['selected_bin_mean']:.2f}"
+                    f" selected_bin_std={_train_fan_stats['selected_bin_std']:.2f}"
+                    f" selected_low_ratio={_train_fan_stats['selected_low_ratio']:.4f}"
+                )
             print(
                 "vali_results: "
                 f"{{'mae': {val_metrics['mae']:.6f}, "
@@ -2097,6 +2126,10 @@ def main(argv: list[str] | None = None):
                 "dataset": cfg.dataset_type,
                 "backbone": cfg.backbone_type,
                 "norm_type": cfg.norm_type,
+                "fan_ablation_mode": cfg.fan_ablation_mode,
+                "selected_bin_mean":  test_metrics.get("selected_bin_mean"),
+                "selected_bin_std":   test_metrics.get("selected_bin_std"),
+                "selected_low_ratio": test_metrics.get("selected_low_ratio"),
                 "epochs": cfg.epochs,
                 "batch_size": cfg.batch_size,
                 "window": cfg.window,
