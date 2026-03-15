@@ -45,6 +45,15 @@ class SAN(nn.Module):
         sigma_min: float = 1e-3,   # clamp std from below after inpainting
         z_clip: float = 8.0,       # clamp z-scores; <=0 disables
         r_max: float = 0.08,       # fail-safe: revert when spike_rate > r_max
+        # ---- TTN (test-time normalization) options ----
+        ttn_enabled: bool = False,
+        ttn_calib_batches: int = 200,
+        ttn_momentum: float = 0.95,      # EMA momentum: fraction retained from old
+        ttn_alpha_max: float = 0.5,      # max blend weight toward target stats
+        ttn_tau_low: float = 0.05,       # drift below this → alpha = 0 (no update)
+        ttn_tau_high: float = 0.20,      # drift above this → alpha = ttn_alpha_max
+        ttn_use_mem: bool = True,        # use EMA memory (False → direct target stats)
+        ttn_eps: float = 1e-6,
     ):
         super().__init__()
         self.seq_len = seq_len
@@ -66,6 +75,16 @@ class SAN(nn.Module):
         self.z_clip = z_clip
         self.r_max = r_max
 
+        # TTN options
+        self.ttn_enabled = bool(ttn_enabled)
+        self.ttn_calib_batches = int(ttn_calib_batches)
+        self.ttn_momentum = float(ttn_momentum)
+        self.ttn_alpha_max = float(ttn_alpha_max)
+        self.ttn_tau_low = float(ttn_tau_low)
+        self.ttn_tau_high = float(ttn_tau_high)
+        self.ttn_use_mem = bool(ttn_use_mem)
+        self.ttn_eps = float(ttn_eps)
+
         self.seq_len_new = int(self.seq_len / self.period_len)
         self.pred_len_new = int(self.pred_len / self.period_len)
         self.epsilon = 1e-5
@@ -80,6 +99,99 @@ class SAN(nn.Module):
         self._last_spike_thr_mean: float = 0.0
         self._last_clip_frac: float = 0.0
         self._last_sigma_min_frac: float = 0.0
+
+        # TTN buffers: source stats (calibrated from train), EMA memory, init flag
+        # Shapes: (P, 1, C) where P = seq_len_new = seq_len // period_len
+        P = self.seq_len_new
+        C = enc_in
+        self.register_buffer("_ttn_source_mu",    torch.zeros(P, 1, C))
+        self.register_buffer("_ttn_source_sigma", torch.ones(P, 1, C))
+        self.register_buffer("_ttn_mem_mu",       torch.zeros(P, 1, C))
+        self.register_buffer("_ttn_mem_sigma",    torch.zeros(P, 1, C))
+        self.register_buffer("_ttn_initialized",  torch.zeros(1, dtype=torch.bool))
+        # Source-readiness flag: persists in state_dict so checkpoint restore
+        # automatically recovers calibration status alongside source stats.
+        # reset_ttn_state() must NOT clear this flag.
+        self.register_buffer("_ttn_source_ready", torch.zeros(1, dtype=torch.bool))
+
+        # Per-eval-pass batch counters (reset in reset_ttn_state)
+        self._ttn_n_batches: int = 0
+        self._ttn_n_updated: int = 0
+
+        # Cached blended stats from the most recent normalize() (for denorm consistency)
+        self._ttn_use_mu:    Optional[torch.Tensor] = None
+        self._ttn_use_sigma: Optional[torch.Tensor] = None
+
+        # TTN diagnostic scalars (updated each normalize() eval call)
+        self._last_ttn_drift:  float = 0.0
+        self._last_ttn_alpha:  float = 0.0
+        self._last_ttn_d_mu:   float = 0.0
+        self._last_ttn_d_sigma: float = 0.0
+
+    # ------------------------------------------------------------------
+    # TTN helpers
+    # ------------------------------------------------------------------
+
+    def extract_state(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute per-period mean and std from x (B, T, C).
+
+        Returns:
+            mu:    (P, 1, C) mean over B and patch positions
+            sigma: (P, 1, C) std  over B and patch positions
+        where P = seq_len // period_len.
+        """
+        bs, length, dim = x.shape
+        x_s = x.reshape(bs, -1, self.period_len, dim)        # (B, P, period_len, C)
+        mu    = x_s.mean(dim=-2)                              # (B, P, C)
+        sigma = x_s.std(dim=-2).clamp(min=self.sigma_min)    # (B, P, C)
+        # Average over batch → (P, 1, C)
+        return mu.mean(dim=0, keepdim=False).unsqueeze(1), \
+               sigma.mean(dim=0, keepdim=False).unsqueeze(1)
+
+    def set_ttn_source_state(self, mu: torch.Tensor, sigma: torch.Tensor) -> None:
+        """Store calibrated source stats.
+
+        Does NOT seed EMA memory — memory is zeroed by reset_ttn_state() before
+        each eval pass and seeded from the first batch of that pass.
+
+        Args:
+            mu:    (P, 1, C)
+            sigma: (P, 1, C)
+        """
+        self._ttn_source_mu.copy_(mu)
+        self._ttn_source_sigma.copy_(sigma)
+        self._ttn_source_ready.fill_(True)
+
+    def reset_ttn_state(self) -> None:
+        """Reset EMA memory before a new eval/test pass.
+
+        Zeros memory and marks it as uninitialized so the first batch of the
+        new pass seeds it from live stats.  Source readiness is preserved.
+        """
+        self._ttn_mem_mu.zero_()
+        self._ttn_mem_sigma.zero_()
+        self._ttn_initialized.fill_(False)
+        # Reset diagnostics and batch counters
+        self._last_ttn_drift   = 0.0
+        self._last_ttn_alpha   = 0.0
+        self._last_ttn_d_mu    = 0.0
+        self._last_ttn_d_sigma = 0.0
+        self._ttn_n_batches    = 0
+        self._ttn_n_updated    = 0
+        self._ttn_use_mu       = None
+        self._ttn_use_sigma    = None
+
+    def get_last_ttn_stats(self) -> dict:
+        """Return TTN diagnostics from the most recent normalize() call."""
+        update_rate = (self._ttn_n_updated / self._ttn_n_batches
+                       if self._ttn_n_batches > 0 else 0.0)
+        return {
+            "drift":       self._last_ttn_drift,
+            "alpha":       self._last_ttn_alpha,
+            "d_mu":        self._last_ttn_d_mu,
+            "d_sigma":     self._last_ttn_d_sigma,
+            "update_rate": update_rate,
+        }
 
     # ------------------------------------------------------------------
     def _spike_inpaint(
@@ -177,7 +289,108 @@ class SAN(nn.Module):
                 std_clamped = std
                 self._last_sigma_min_frac = 0.0
 
-            # --- Normalize x_used with (optionally clamped) statistics ---
+            # --- TTN: eval-only test-time normalization stat blending ----------
+            if self.ttn_enabled and not self.training:
+                # Strict check: source must be calibrated before any eval pass
+                if not bool(self._ttn_source_ready.item()):
+                    raise RuntimeError(
+                        "SAN TTN is enabled but source stats have not been calibrated. "
+                        "Call calibrate_ttn() (which calls set_ttn_source_state()) "
+                        "before running evaluation."
+                    )
+
+                # Batch-average target stats: (P, 1, C)
+                tgt_mu    = mean.mean(dim=0)        # (P, 1, C)
+                tgt_sigma = std_clamped.mean(dim=0)  # (P, 1, C)
+
+                if self.ttn_use_mem:
+                    if not bool(self._ttn_initialized.item()):
+                        # First batch of this eval pass: seed memory from live stats
+                        self._ttn_mem_mu.copy_(tgt_mu)
+                        self._ttn_mem_sigma.copy_(tgt_sigma)
+                        self._ttn_initialized.fill_(True)
+                    else:
+                        # EMA: retain momentum fraction of old, blend in (1-m) of new
+                        m = self.ttn_momentum
+                        self._ttn_mem_mu.copy_(
+                            m * self._ttn_mem_mu + (1.0 - m) * tgt_mu
+                        )
+                        self._ttn_mem_sigma.copy_(
+                            m * self._ttn_mem_sigma + (1.0 - m) * tgt_sigma
+                        )
+                    eff_mu    = self._ttn_mem_mu
+                    eff_sigma = self._ttn_mem_sigma
+                else:
+                    eff_mu    = tgt_mu
+                    eff_sigma = tgt_sigma
+                    self._ttn_initialized.fill_(True)
+
+                # Drift metrics
+                # d_mu: per-element normalised by |src_sigma|
+                d_mu_t = (eff_mu - self._ttn_source_mu).abs() / (
+                    self._ttn_source_sigma.abs() + self.ttn_eps
+                )
+                d_mu = float(d_mu_t.mean().item())
+                # d_sigma: log-space comparison
+                d_sigma_t = (
+                    torch.log(eff_sigma + self.ttn_eps)
+                    - torch.log(self._ttn_source_sigma + self.ttn_eps)
+                ).abs()
+                d_sigma = float(d_sigma_t.mean().item())
+                drift = d_mu + d_sigma
+
+                # Alpha gate: linear ramp from 0 to ttn_alpha_max
+                tau_lo, tau_hi = self.ttn_tau_low, self.ttn_tau_high
+                if tau_hi <= tau_lo:
+                    # Degenerate config: step function at tau_lo
+                    alpha = self.ttn_alpha_max if drift > tau_lo else 0.0
+                elif drift <= tau_lo:
+                    alpha = 0.0
+                elif drift >= tau_hi:
+                    alpha = self.ttn_alpha_max
+                else:
+                    alpha = self.ttn_alpha_max * (drift - tau_lo) / (tau_hi - tau_lo)
+                alpha = float(alpha)
+
+                # Blending: use_* = (1-alpha)*source + alpha*eff
+                use_mu    = (1.0 - alpha) * self._ttn_source_mu    + alpha * eff_mu
+                use_sigma = (
+                    (1.0 - alpha) * self._ttn_source_sigma + alpha * eff_sigma
+                ).clamp(min=self.sigma_min)
+
+                # NaN/Inf fallback: revert to source, mark alpha=0
+                if not (torch.isfinite(use_mu).all() and torch.isfinite(use_sigma).all()):
+                    use_mu    = self._ttn_source_mu.clone()
+                    use_sigma = self._ttn_source_sigma.clone().clamp(min=self.sigma_min)
+                    alpha     = 0.0
+
+                # Cache blended stats for denorm consistency
+                self._ttn_use_mu    = use_mu    # (P, 1, C)
+                self._ttn_use_sigma = use_sigma  # (P, 1, C)
+
+                # Override mean/std with blended stats (broadcast over batch dim)
+                mean        = use_mu.unsqueeze(0).expand_as(mean)
+                std_clamped = use_sigma.unsqueeze(0).expand_as(std_clamped)
+
+                # Update per-pass counters and diagnostics
+                self._ttn_n_batches += 1
+                if alpha > 0.0:
+                    self._ttn_n_updated += 1
+                self._last_ttn_drift   = drift
+                self._last_ttn_alpha   = alpha
+                self._last_ttn_d_mu    = d_mu
+                self._last_ttn_d_sigma = d_sigma
+            else:
+                # Not in TTN eval mode: clear cache and diagnostics
+                self._ttn_use_mu    = None
+                self._ttn_use_sigma = None
+                self._last_ttn_drift   = 0.0
+                self._last_ttn_alpha   = 0.0
+                self._last_ttn_d_mu    = 0.0
+                self._last_ttn_d_sigma = 0.0
+            # --- end TTN ---
+
+            # --- Normalize x_used with (optionally clamped / TTN-blended) statistics ---
             x_used_r  = x_used.reshape(bs, -1, self.period_len, dim)
             norm_input = (x_used_r - mean) / (std_clamped + self.epsilon)
 
@@ -200,6 +413,28 @@ class SAN(nn.Module):
             outputs_std = self.model_std(std_clamped.squeeze(2), x_flat)
             outputs = torch.cat([outputs_mean, outputs_std], dim=-1)
             self._pred_stats = outputs[:, -self.pred_len_new:, :]
+
+            # TTN consistency: override _pred_stats so denorm reads the exact same
+            # use_mu/use_sigma that normalize applied.  No statistical summarisation
+            # is performed; the only operations are positional index mapping and
+            # expand (broadcast), preserving every period's TTN value unchanged.
+            #
+            # Mapping rule: future period i ← input period (P - Q + i), i.e. the
+            # last Q input periods map one-to-one onto the Q future periods.
+            # When Q > P (rare) the input is tiled before slicing.
+            if self.ttn_enabled and not self.training and self._ttn_use_mu is not None:
+                Q     = self.pred_len_new
+                P_src = self._ttn_use_mu.shape[0]   # = seq_len_new
+                if Q <= P_src:
+                    pred_mu    = self._ttn_use_mu[-Q:, 0, :]    # (Q, C)
+                    pred_sigma = self._ttn_use_sigma[-Q:, 0, :]  # (Q, C)
+                else:
+                    repeats    = (Q + P_src - 1) // P_src
+                    pred_mu    = self._ttn_use_mu[:, 0, :].repeat(repeats, 1)[:Q]    # (Q, C)
+                    pred_sigma = self._ttn_use_sigma[:, 0, :].repeat(repeats, 1)[:Q]  # (Q, C)
+                ttn_pred_mean = pred_mu.unsqueeze(0).expand(bs, Q, self.channels)
+                ttn_pred_std  = pred_sigma.unsqueeze(0).expand(bs, Q, self.channels)
+                self._pred_stats = torch.cat([ttn_pred_mean, ttn_pred_std], dim=-1)
 
             return norm_input.reshape(bs, length, dim)
         else:

@@ -446,6 +446,15 @@ class TrainConfig:
     san_ms_sigma_min: float = 1e-3
     san_ms_lambda_std: float = 1.0
     san_ms_ent_weight: float = 0.0
+    # SAN TTN (test-time normalization) options
+    ttn_enabled: bool = False
+    ttn_calib_batches: int = 200
+    ttn_momentum: float = 0.95
+    ttn_alpha_max: float = 0.5
+    ttn_tau_low: float = 0.05
+    ttn_tau_high: float = 0.20
+    ttn_use_mem: bool = True
+    ttn_eps: float = 1e-6
     # SAN spike-robust stat estimation (used by norm_type="san_spike")
     spike_q: float = 0.99
     spike_dilate: int = 1
@@ -470,7 +479,6 @@ class TrainConfig:
     wav_cond: str = "rho_h"          # "none" | "rho_h" | "rho_all"
     wav_sigma_min: float = 1e-3
     wav_stats_loss_weight: float = 0.1
-    wav_rho_loss_weight: float = 0.1
     wav_oracle_mode: str = "none"    # "none" | "eval_stats" | "train_eval_stats" | "train_oracle"
     wav_pred_use_wave: bool = False  # if True, append normalized low/mid waveforms to predictor input
     wav_ctx_patches: int = 0         # extra history patches fed to predictor (loader window enlarged)
@@ -484,7 +492,6 @@ class TrainConfig:
     wav_use_soft_split: bool = False  # if True, use learnable soft band split with band_logits
     wav_gate_tau: float = 1.0         # soft-split temperature (smaller → harder split)
     wav_split_reg_weight: float = 1e-2  # monotone regularisation weight for band-split gates
-    wav_detach_pred_stats: bool = True  # detach predictor stats in denormalize() to isolate task grad
     wav_pretrain_use_early_stop: bool = True   # enable early stop during stage1 pretraining
     wav_pretrain_patience: int = 8             # stage1 early stop patience (epochs)
     wav_pretrain_min_epochs: int = 10          # minimum stage1 epochs before early stop kicks in
@@ -535,6 +542,14 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             pred_len=cfg.pred_len,
             period_len=cfg.san_period_len,
             enc_in=num_features,
+            ttn_enabled=cfg.ttn_enabled,
+            ttn_calib_batches=cfg.ttn_calib_batches,
+            ttn_momentum=cfg.ttn_momentum,
+            ttn_alpha_max=cfg.ttn_alpha_max,
+            ttn_tau_low=cfg.ttn_tau_low,
+            ttn_tau_high=cfg.ttn_tau_high,
+            ttn_use_mem=cfg.ttn_use_mem,
+            ttn_eps=cfg.ttn_eps,
         )
 
     elif _nt == "san_spike":
@@ -547,6 +562,14 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             spike_q=cfg.spike_q,
             spike_dilate=cfg.spike_dilate,
             spike_mode=cfg.spike_mode,
+            ttn_enabled=cfg.ttn_enabled,
+            ttn_calib_batches=cfg.ttn_calib_batches,
+            ttn_momentum=cfg.ttn_momentum,
+            ttn_alpha_max=cfg.ttn_alpha_max,
+            ttn_tau_low=cfg.ttn_tau_low,
+            ttn_tau_high=cfg.ttn_tau_high,
+            ttn_use_mem=cfg.ttn_use_mem,
+            ttn_eps=cfg.ttn_eps,
         )
 
     elif _nt in {"sanms", "san_ms"}:
@@ -578,14 +601,12 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             cond=cfg.wav_cond,
             sigma_min=cfg.wav_sigma_min,
             stats_loss_weight=cfg.wav_stats_loss_weight,
-            rho_loss_weight=cfg.wav_rho_loss_weight,
             pred_use_wave=cfg.wav_pred_use_wave,
             ctx_patches=cfg.wav_ctx_patches,
             pad_mode=cfg.wav_pad_mode,
             wav_use_soft_split=cfg.wav_use_soft_split,
             wav_gate_tau=cfg.wav_gate_tau,
             wav_split_reg_weight=cfg.wav_split_reg_weight,
-            detach_pred_stats=cfg.wav_detach_pred_stats,
         )
         # Adjust backbone enc_in to include conditioning channels
         num_features += norm_model.cond_channels
@@ -802,6 +823,64 @@ def calibrate_thresholds(
     return delta_E_mask, delta_P_mask
 
 
+@torch.no_grad()
+def calibrate_ttn(
+    model: nn.Module,
+    train_loader,
+    cfg: TrainConfig,
+) -> None:
+    """Calibrate TTN source stats for SAN from training data.
+
+    Runs up to cfg.ttn_calib_batches forward passes (normalize only),
+    averages the per-period mean and std across all batches, then calls
+    model.nm.set_ttn_source_state(mu, sigma).
+
+    Only active for norm_type "san" / "san_spike" with ttn_enabled=True.
+    Raises RuntimeError if calibration produces no batches or source is not
+    marked ready afterwards.
+    """
+    if cfg.norm_type.lower() not in {"san", "san_spike"}:
+        return
+    nm = getattr(model, "nm", None)
+    if nm is None or not getattr(nm, "ttn_enabled", False):
+        return
+
+    model.eval()
+    all_mu:    list[torch.Tensor] = []
+    all_sigma: list[torch.Tensor] = []
+    max_batches = int(cfg.ttn_calib_batches)
+
+    for i, batch_data in enumerate(train_loader):
+        if i >= max_batches:
+            break
+        bx = batch_data[0].to(cfg.device).float()
+        mu, sigma = nm.extract_state(bx)     # (P, 1, C)
+        all_mu.append(mu.cpu())
+        all_sigma.append(sigma.cpu())
+
+    if not all_mu:
+        raise RuntimeError(
+            "calibrate_ttn: train_loader produced no batches — "
+            "cannot set TTN source stats."
+        )
+
+    src_mu    = torch.stack(all_mu,    dim=0).mean(dim=0).to(cfg.device)   # (P, 1, C)
+    src_sigma = torch.stack(all_sigma, dim=0).mean(dim=0).to(cfg.device)
+    nm.set_ttn_source_state(src_mu, src_sigma)
+
+    if not getattr(nm, "_ttn_source_ready", False):
+        raise RuntimeError(
+            "calibrate_ttn: set_ttn_source_state() was called but "
+            "_ttn_source_ready is still False — unexpected internal error."
+        )
+
+    print(
+        f"ttn_calib: batches={len(all_mu)}"
+        f" mean_abs_mu={src_mu.abs().mean().item():.4f}"
+        f" mean_sigma={src_sigma.mean().item():.4f}"
+    )
+
+
 def _sq(t: torch.Tensor, q: float) -> float:
     """Safe quantile on a flattened tensor; returns nan if empty."""
     t = t.float().flatten()
@@ -855,7 +934,38 @@ def collect_and_print_debug(
     nan = float("nan")
     eps = 1e-12
 
-    # Fetch summary dicts once
+    # For wavband_b, skip LocalTF-specific diagnostic blocks (they print NaN)
+    _is_wavband_dbg = cfg.norm_type.lower() in {"wavband", "wavband_b"}
+    if _is_wavband_dbg:
+        # Only print wavband-relevant blocks; skip LocalTF blocks
+        if nm is not None and hasattr(nm, "get_last_diag"):
+            d = nm.get_last_diag()
+            print(
+                f"[{prefix}][WAVBAND]"
+                f" sigL={d.get('sig_L_mean', nan):.4f}"
+                f" sigDj={d.get('sig_Dj_mean', nan):.4f}"
+                f" rhoH_mean={d.get('rho_H_mean', nan):.4f}"
+                f" rhoH_p10={d.get('rho_H_p10', nan):.4f}"
+                f" rhoH_p90={d.get('rho_H_p90', nan):.4f}"
+                f" L_stats={d.get('L_stats', nan):.6f}"
+                f" L_split={d.get('L_split', nan):.6f}"
+                f" oracle_recon_mse={d.get('oracle_recon_mse', nan):.2e}"
+            )
+        if nm is not None and hasattr(nm, "get_split_stats"):
+            ss = nm.get_split_stats()
+            print(
+                f"[{prefix}][WAVBAND_GATES]"
+                f" g_mean={ss['g_mean']:.4f}"
+                f" g_min={ss['g_min']:.4f}"
+                f" g_max={ss['g_max']:.4f}"
+                f" split_reg={ss['split_reg']:.6f}"
+            )
+            if prefix == "TRAIN_DBG":
+                g_vec_str = " ".join(f"{g:.4f}" for g in ss["g_vec"])
+                print(f"[{prefix}][WAVBAND_GATES] g_vec=[{g_vec_str}]")
+        return
+
+    # Fetch summary dicts once (non-wavband path)
     gate_stats = nm.get_last_gate_stats() if nm is not None and hasattr(nm, "get_last_gate_stats") else {}
     decomp_stats = nm.get_last_decomp_stats() if nm is not None and hasattr(nm, "get_last_decomp_stats") else {}
     aux_stats = nm.get_last_aux_stats() if nm is not None and hasattr(nm, "get_last_aux_stats") else {}
@@ -1084,33 +1194,7 @@ def collect_and_print_debug(
             f" B_std={tfbg_stats['B_std']:.6f}"
         )
 
-    # ------------------------------------------------------------------ WAVBAND
-    if nm is not None and hasattr(nm, "get_last_diag"):
-        d = nm.get_last_diag()
-        print(
-            f"[{prefix}][WAVBAND]"
-            f" sigL={d.get('sig_L_mean', nan):.4f}"
-            f" sigM={d.get('sig_M_mean', nan):.4f}"
-            f" rhoH_mean={d.get('rho_H_mean', nan):.4f}"
-            f" rhoH_p10={d.get('rho_H_p10', nan):.4f}"
-            f" rhoH_p90={d.get('rho_H_p90', nan):.4f}"
-            f" L_stats={d.get('L_stats', nan):.6f}"
-            f" L_rho={d.get('L_rho', nan):.6f}"
-            f" L_split={d.get('L_split', nan):.6f}"
-            f" oracle_recon_mse={d.get('oracle_recon_mse', nan):.2e}"
-        )
-        if hasattr(nm, "get_split_stats"):
-            ss = nm.get_split_stats()
-            print(
-                f"[{prefix}][WAVBAND_GATES]"
-                f" g_mean={ss['g_mean']:.4f}"
-                f" g_min={ss['g_min']:.4f}"
-                f" g_max={ss['g_max']:.4f}"
-                f" split_reg={ss['split_reg']:.6f}"
-            )
-            if prefix == "TRAIN_DBG":
-                g_vec_str = " ".join(f"{g:.4f}" for g in ss["g_vec"])
-                print(f"[{prefix}][WAVBAND_GATES] g_vec=[{g_vec_str}]")
+    # ------------------------------------------------------------------ WAVBAND (non-wavband path: skip)
 
     # ------------------------------------------------------------------ GRAD
     gi = grad_info or {}
@@ -1215,17 +1299,17 @@ def _set_requires_grad(module: nn.Module, flag: bool) -> None:
 
 
 def _wav_pred_params(model: nn.Module) -> list:
-    """Return predictor + band_logits parameters from model.nm, or empty list if absent."""
+    """Return predictor + band_logits parameters from model.nm that require grad."""
     nm = getattr(model, "nm", None)
     if nm is None:
         return []
     params: list = []
     predictor = getattr(nm, "predictor", None)
     if predictor is not None:
-        params.extend(predictor.parameters())
-    # Include learnable band split logits if present
+        params.extend(p for p in predictor.parameters() if p.requires_grad)
+    # Include learnable band split logits if trainable
     band_logits = getattr(nm, "band_logits", None)
-    if band_logits is not None and isinstance(band_logits, torch.nn.Parameter):
+    if band_logits is not None and isinstance(band_logits, torch.nn.Parameter) and band_logits.requires_grad:
         params.append(band_logits)
     return params
 
@@ -1303,13 +1387,10 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int,
         print(f"[stage1] epoch {epoch_idx}: predictor-only training (frozen backbone)")
     else:
         _set_requires_grad(model, True)
-        # Re-apply predictor freeze for stage2 (wav_freeze_pred_in_stage2=True)
+        # In stage2: re-freeze only band_logits (predictor stays trainable)
         if freeze_wav_pred:
             _nm_fp = getattr(model, "nm", None)
             if _nm_fp is not None:
-                _pred_fp = getattr(_nm_fp, "predictor", None)
-                if _pred_fp is not None:
-                    _set_requires_grad(_pred_fp, False)
                 _bl_fp = getattr(_nm_fp, "band_logits", None)
                 if _bl_fp is not None and isinstance(_bl_fp, torch.nn.Parameter):
                     _bl_fp.requires_grad = False
@@ -1597,6 +1678,19 @@ def evaluate(model, loader, cfg, scaler, debug_prefix: str | None = None):
         d = _nm_eval.get_last_diag()
         results.setdefault("wav_L_split", d.get("L_split", 0.0))
 
+    # TTN diagnostics
+    if _nm_eval is not None and getattr(_nm_eval, "ttn_enabled", False) and hasattr(_nm_eval, "get_last_ttn_stats"):
+        ttn_st = _nm_eval.get_last_ttn_stats()
+        _pfx = f"[{debug_prefix}]" if debug_prefix is not None else ""
+        print(
+            f"{_pfx}ttn_stats:"
+            f" drift={ttn_st['drift']:.4f}"
+            f" alpha={ttn_st['alpha']:.4f}"
+            f" d_mu={ttn_st['d_mu']:.4f}"
+            f" d_sigma={ttn_st['d_sigma']:.4f}"
+            f" update_rate={ttn_st['update_rate']:.4f}"
+        )
+
     return results
 
 
@@ -1662,6 +1756,7 @@ def main(argv: list[str] | None = None):
     os.makedirs(result_root, exist_ok=True)
     result_path = os.path.join(result_root, f"{run_name}.json")
     best_checkpoint_path = os.path.join(result_root, f"{run_name}_best.pth")
+    _wavband_metrics_path = os.path.join(result_root, f"{run_name}_wavband_epoch_metrics.jsonl")
 
     print(f"Train config: {cfg}")
     print(f"[OracleEval] wav_oracle_mode={cfg.wav_oracle_mode} eval_uses_oracle={cfg.wav_oracle_mode == 'eval_stats'}")
@@ -1750,15 +1845,16 @@ def main(argv: list[str] | None = None):
                 if "band_logits" in _s1_ckpt:
                     _nm_tr.band_logits.data.copy_(_s1_ckpt["band_logits"].to(cfg.device))
                 print(f"[stage2] loaded stage1 best predictor → {_pred_best_path}")
-            # Optionally freeze predictor + band_logits in stage2 (after loading)
-            if cfg.wav_freeze_pred_in_stage2 and _nm_tr is not None:
-                _pred_s2 = getattr(_nm_tr, "predictor", None)
-                if _pred_s2 is not None:
-                    _set_requires_grad(_pred_s2, False)
+            # In stage2: freeze only band_logits; predictor stays trainable with reduced lr
+            if _nm_tr is not None:
                 _bl_s2 = getattr(_nm_tr, "band_logits", None)
                 if _bl_s2 is not None and isinstance(_bl_s2, torch.nn.Parameter):
                     _bl_s2.requires_grad = False
-                print(f"[stage2] predictor+band_logits frozen (wav_freeze_pred_in_stage2=True)")
+                    print(f"[stage2] band_logits frozen")
+            # Set predictor lr = backbone_lr * 0.1 for stage2
+            cfg.wav_pred_lr = cfg.lr * 0.1
+            cfg.wav_pred_weight_decay = 0.0
+            print(f"[stage2] predictor lr={cfg.wav_pred_lr:.2e} wd=0.0 (trainable)")
             optimizer = _build_optimizer(model, cfg)
             remaining_epochs = cfg.epochs - epoch
             scheduler = CosineAnnealingLR(optimizer, T_max=max(remaining_epochs, 1))
@@ -1840,45 +1936,103 @@ def main(argv: list[str] | None = None):
             scheduler.step()
             continue
 
+        # TTN calibration before eval (calibrate source stats, then reset memory)
+        _nm_ttn = getattr(model, "nm", None)
+        _ttn_active = _nm_ttn is not None and getattr(_nm_ttn, "ttn_enabled", False)
+        if _ttn_active:
+            calibrate_ttn(model, dataloader.train_loader, cfg)
+            _nm_ttn.reset_ttn_state()
+
         val_metrics = evaluate(model, dataloader.val_loader, cfg, scaler, debug_prefix="VAL_DBG")
+
+        if _ttn_active:
+            _nm_ttn.reset_ttn_state()
+
         test_metrics = evaluate(model, dataloader.test_loader, cfg, scaler)
 
-        # Build aux info strings
-        train_stat_str = ""
-        if train_stat:
-            train_stat_str = f" | task={train_stat.get('task_loss', 0.0):.6f}"
-            if "aux_total" in train_stat:
-                train_stat_str += (
-                    f" aux_total={train_stat['aux_total']:.6e}"
-                    f" (L_easy={train_stat.get('L_easy', 0.0):.3e}"
-                    f" L_white={train_stat.get('L_white', 0.0):.3e}"
-                    f" L_js={train_stat.get('L_js', 0.0):.3e}"
-                    f" L_w1={train_stat.get('L_w1', 0.0):.3e}"
-                    f" L_min={train_stat.get('L_min', 0.0):.3e}"
-                    f" L_e_tv={train_stat.get('L_e_tv', 0.0):.3e}"
-                    f" L_sparse={train_stat.get('L_sparse', 0.0):.3e}"
-                    f" L_u_tv={train_stat.get('L_u_tv', 0.0):.3e})"
-                )
-        val_stat_str = ""
-        if "aux_total" in val_metrics:
-            val_stat_str = f" | aux_total={val_metrics['aux_total']:.6e}"
+        if _is_wavband_main:
+            # ── Wavband: 1 train line + 1 val line ───────────────────────────
+            _nm_ep = getattr(model, "nm", None)
+            _diag = _nm_ep.get_last_diag() if _nm_ep is not None and hasattr(_nm_ep, "get_last_diag") else {}
+            _ss   = _nm_ep.get_split_stats() if _nm_ep is not None and hasattr(_nm_ep, "get_split_stats") else {}
+            print(
+                f"Epoch {epoch + 1} [train]"
+                f" loss={train_loss:.6f}"
+                f" task={train_stat.get('task_loss', 0.0):.6f}"
+                f" aux={train_stat.get('aux_loss', 0.0):.6f}"
+            )
+            print(
+                f"Epoch {epoch + 1} [val]"
+                f" mse={val_metrics['mse']:.6f} mae={val_metrics['mae']:.6f}"
+                f" | sigL={_diag.get('sig_L_mean', float('nan')):.4f}"
+                f" sigDj={_diag.get('sig_Dj_mean', float('nan')):.4f}"
+                f" L_stats={_diag.get('L_stats', float('nan')):.4f}"
+                f" L_split={_diag.get('L_split', float('nan')):.4f}"
+                f" g_mean={_ss.get('g_mean', float('nan')):.4f}"
+            )
+            # Write per-epoch metrics to JSONL file
+            _epoch_row = {
+                "epoch": epoch + 1,
+                "stage": "stage1" if _in_stage1_main else "stage2",
+                "train_loss":    train_loss,
+                "train_task":    train_stat.get("task_loss", 0.0),
+                "train_aux":     train_stat.get("aux_loss", 0.0),
+                "val_mse":       val_metrics["mse"],
+                "val_mae":       val_metrics["mae"],
+                "val_rmse":      val_metrics.get("rmse", float("nan")),
+                "test_mse":      test_metrics["mse"],
+                "test_mae":      test_metrics["mae"],
+                "test_rmse":     test_metrics.get("rmse", float("nan")),
+                "sig_L_mean":    _diag.get("sig_L_mean", float("nan")),
+                "sig_Dj_mean":   _diag.get("sig_Dj_mean", float("nan")),
+                "rho_H_mean":    _diag.get("rho_H_mean", float("nan")),
+                "L_stats":       _diag.get("L_stats", float("nan")),
+                "L_split":       _diag.get("L_split", float("nan")),
+                "g_mean":        _ss.get("g_mean", float("nan")),
+                "g_min":         _ss.get("g_min", float("nan")),
+                "g_max":         _ss.get("g_max", float("nan")),
+                "g_vec":         _ss.get("g_vec", []),
+                "split_reg":     _ss.get("split_reg", float("nan")),
+            }
+            with open(_wavband_metrics_path, "a", encoding="utf-8") as _mf:
+                _mf.write(json.dumps(_epoch_row) + "\n")
+        else:
+            # ── Non-wavband: standard verbose output ──────────────────────────
+            train_stat_str = ""
+            if train_stat:
+                train_stat_str = f" | task={train_stat.get('task_loss', 0.0):.6f}"
+                if "aux_total" in train_stat:
+                    train_stat_str += (
+                        f" aux_total={train_stat['aux_total']:.6e}"
+                        f" (L_easy={train_stat.get('L_easy', 0.0):.3e}"
+                        f" L_white={train_stat.get('L_white', 0.0):.3e}"
+                        f" L_js={train_stat.get('L_js', 0.0):.3e}"
+                        f" L_w1={train_stat.get('L_w1', 0.0):.3e}"
+                        f" L_min={train_stat.get('L_min', 0.0):.3e}"
+                        f" L_e_tv={train_stat.get('L_e_tv', 0.0):.3e}"
+                        f" L_sparse={train_stat.get('L_sparse', 0.0):.3e}"
+                        f" L_u_tv={train_stat.get('L_u_tv', 0.0):.3e})"
+                    )
+            val_stat_str = ""
+            if "aux_total" in val_metrics:
+                val_stat_str = f" | aux_total={val_metrics['aux_total']:.6e}"
 
-        print(f"Epoch: {epoch + 1} Training loss: {train_loss:.6f}{gate_info}{train_stat_str}")
-        print(
-            "vali_results: "
-            f"{{'mae': {val_metrics['mae']:.6f}, "
-            f"'mape': {val_metrics['mape']:.6f}, "
-            f"'mse': {val_metrics['mse']:.6f}, "
-            f"'rmse': {val_metrics['rmse']:.6f}}}"
-            f"{val_stat_str}"
-        )
-        print(
-            "test_results: "
-            f"{{'mae': {test_metrics['mae']:.6f}, "
-            f"'mape': {test_metrics['mape']:.6f}, "
-            f"'mse': {test_metrics['mse']:.6f}, "
-            f"'rmse': {test_metrics['rmse']:.6f}}}"
-        )
+            print(f"Epoch: {epoch + 1} Training loss: {train_loss:.6f}{gate_info}{train_stat_str}")
+            print(
+                "vali_results: "
+                f"{{'mae': {val_metrics['mae']:.6f}, "
+                f"'mape': {val_metrics['mape']:.6f}, "
+                f"'mse': {val_metrics['mse']:.6f}, "
+                f"'rmse': {val_metrics['rmse']:.6f}}}"
+                f"{val_stat_str}"
+            )
+            print(
+                "test_results: "
+                f"{{'mae': {test_metrics['mae']:.6f}, "
+                f"'mape': {test_metrics['mape']:.6f}, "
+                f"'mse': {test_metrics['mse']:.6f}, "
+                f"'rmse': {test_metrics['rmse']:.6f}}}"
+            )
 
         best_val = min(best_val, val_metrics["mse"])
         if test_metrics["mse"] < best_test_seen:
@@ -1921,6 +2075,12 @@ def main(argv: list[str] | None = None):
 
     if os.path.exists(best_checkpoint_path):
         model.load_state_dict(torch.load(best_checkpoint_path, map_location=cfg.device))
+
+    # Final TTN calibration + reset before final test
+    _nm_final = getattr(model, "nm", None)
+    if _nm_final is not None and getattr(_nm_final, "ttn_enabled", False):
+        calibrate_ttn(model, dataloader.train_loader, cfg)
+        _nm_final.reset_ttn_state()
 
     test_metrics = evaluate(model, dataloader.test_loader, cfg, scaler)
     print(
