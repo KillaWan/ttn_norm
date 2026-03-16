@@ -6,5 +6,6 @@ from .san import SAN
 from .san_ms import SANMS
 from .tf_bg import TFBackgroundNorm
 from .wavband_b import WaveBandNormB
+from .lfan import LFAN
 
-__all__ = ["No", "RevIN", "FAN", "DishTS", "SAN", "SANMS", "TFBackgroundNorm", "WaveBandNormB"]
+__all__ = ["No", "RevIN", "FAN", "DishTS", "SAN", "SANMS", "TFBackgroundNorm", "WaveBandNormB", "LFAN"]

@@ -16,7 +16,7 @@ from tqdm import tqdm
 from torchmetrics import MeanAbsoluteError, MeanAbsolutePercentageError, MeanSquaredError
 
 from ttn_norm.models import LocalTFNorm, TTNModel
-from ttn_norm.normalizations import DishTS, FAN, No, RevIN, SAN, SANMS, TFBackgroundNorm, WaveBandNormB
+from ttn_norm.normalizations import DishTS, FAN, LFAN, No, RevIN, SAN, SANMS, TFBackgroundNorm, WaveBandNormB
 from ttn_norm.utils.metrics import RMSE
 
 
@@ -503,6 +503,23 @@ class TrainConfig:
     wav_oracle_anneal_epochs: int = 50         # number of stage2 epochs over which oracle prob anneals
     wav_freeze_pred_in_stage2: bool = True     # freeze predictor+band_logits during stage2 joint training
     wav_pretrain_stop_to_stage2: bool = True   # if True, stage1 early-stop immediately advances to stage2
+    # LFAN (norm_type="lfan")
+    lfan_k_low:          int   = 8
+    lfan_burst_smooth:   int   = 5
+    lfan_burst_mix:      float = 0.7
+    lfan_gate_segments:  int   = 8
+    lfan_remove_quiet:   float = 0.98
+    lfan_remove_burst:   float = 0.30
+    lfan_gate_gamma:     float = 4.0
+    lfan_gate_tau:       float = 0.20
+    lfan_remove_floor:   float = 0.0
+    lfan_sigma_min:      float = 1e-5
+    lfan_hidden_dim:     int   = 64
+    lfan_loss_low_coeff: float = 1.0
+    lfan_loss_low_shape: float = 0.5
+    lfan_loss_mu:        float = 0.2
+    lfan_loss_sigma:     float = 0.2
+    lfan_loss_res:       float = 0.2
 
 
 def _next_power_of_two(n: int) -> int:
@@ -620,6 +637,29 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             time_kernel=cfg.tfbg_time_kernel,
             freq_kernel=cfg.tfbg_freq_kernel,
             bmax=cfg.tfbg_bmax,
+        )
+
+    elif _nt == "lfan":
+        norm_model = LFAN(
+            seq_len=cfg.window,
+            pred_len=cfg.pred_len,
+            enc_in=num_features,
+            k_low=cfg.lfan_k_low,
+            burst_smooth=cfg.lfan_burst_smooth,
+            burst_mix=cfg.lfan_burst_mix,
+            gate_segments=cfg.lfan_gate_segments,
+            remove_quiet=cfg.lfan_remove_quiet,
+            remove_burst=cfg.lfan_remove_burst,
+            gate_gamma=cfg.lfan_gate_gamma,
+            gate_tau=cfg.lfan_gate_tau,
+            remove_floor=cfg.lfan_remove_floor,
+            sigma_min=cfg.lfan_sigma_min,
+            hidden_dim=cfg.lfan_hidden_dim,
+            loss_low_coeff=cfg.lfan_loss_low_coeff,
+            loss_low_shape=cfg.lfan_loss_low_shape,
+            loss_mu=cfg.lfan_loss_mu,
+            loss_sigma=cfg.lfan_loss_sigma,
+            loss_res=cfg.lfan_loss_res,
         )
 
     else:
@@ -1374,6 +1414,10 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int,
     aux_stat_keys = ["aux_total", "L_easy", "L_white", "L_js", "L_w1", "L_min", "L_e_tv",
                      "ratio_n_bc_mean", "ratio_n_bc_min", "ratio_n_bc_max", "loss_n_ratio_budget",
                      "pred_n_loss", "L_sparse", "L_u_tv"]
+    # LFAN debug scalar accumulators
+    _nm_lfan_tr = getattr(model, "nm", None)
+    _has_lfan_dbg = _nm_lfan_tr is not None and hasattr(_nm_lfan_tr, "get_debug_scalars")
+    _lfan_dbg_accum: dict[str, list[float]] = {}
     aux_stat_vals: dict[str, list[float]] = {k: [] for k in aux_stat_keys}
 
     has_nm_aux = (
@@ -1543,6 +1587,10 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int,
                 s = model.nm.get_last_aux_stats()
                 for k in aux_stat_keys:
                     aux_stat_vals[k].append(float(s.get(k, 0.0)))
+            if _has_lfan_dbg:
+                _ds = _nm_lfan_tr.get_debug_scalars()
+                for k, v in _ds.items():
+                    _lfan_dbg_accum.setdefault(k, []).append(float(v))
 
             pbar.update(batch_x.size(0))
             pbar.set_postfix(
@@ -1568,6 +1616,9 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int,
     if has_nm_aux and aux_stat_vals["aux_total"]:
         for k in aux_stat_keys:
             train_stat[k] = float(np.mean(aux_stat_vals[k]))
+    if _has_lfan_dbg and _lfan_dbg_accum:
+        for k, vs in _lfan_dbg_accum.items():
+            train_stat[k] = float(np.mean(vs))
 
     return float(np.mean(losses)) if losses else 0.0, gate_stats_str, train_stat
 
@@ -1594,6 +1645,12 @@ def evaluate(model, loader, cfg, scaler, debug_prefix: str | None = None):
                      "ratio_n_bc_mean", "ratio_n_bc_min", "ratio_n_bc_max", "loss_n_ratio_budget",
                      "pred_n_loss", "L_sparse", "L_u_tv"]
     aux_stat_vals: dict[str, list[float]] = {k: [] for k in aux_stat_keys}
+
+    # LFAN debug scalar accumulators
+    _nm_lfan_ev = getattr(model, "nm", None)
+    _has_lfan_ev = _nm_lfan_ev is not None and hasattr(_nm_lfan_ev, "get_debug_scalars")
+    _lfan_ev_accum: dict[str, list[float]] = {}
+    _lfan_last_text: str = ""
 
     first_batch_done = False
     for batch_x, batch_y, origin_y, batch_x_enc, batch_y_enc in loader:
@@ -1642,6 +1699,16 @@ def evaluate(model, loader, cfg, scaler, debug_prefix: str | None = None):
             s = model.nm.get_last_aux_stats()
             for k in aux_stat_keys:
                 aux_stat_vals[k].append(float(s.get(k, 0.0)))
+        if _has_lfan_ev:
+            try:
+                _nm_lfan_ev.loss(batch_y)
+            except Exception:
+                pass
+            _ds = _nm_lfan_ev.get_debug_scalars()
+            for k, v in _ds.items():
+                _lfan_ev_accum.setdefault(k, []).append(float(v))
+            if hasattr(_nm_lfan_ev, "get_debug_text"):
+                _lfan_last_text = _nm_lfan_ev.get_debug_text()
 
         # First-batch debug print for val/test
         if debug_prefix is not None and not first_batch_done:
@@ -1701,6 +1768,13 @@ def evaluate(model, loader, cfg, scaler, debug_prefix: str | None = None):
     # FAN frequency-bin statistics (collected over the full eval pass)
     if _is_fan:
         results.update(_nm_fan.get_freq_stats())
+
+    # LFAN averaged diagnostics
+    if _has_lfan_ev and _lfan_ev_accum:
+        for k, vs in _lfan_ev_accum.items():
+            results[k] = float(np.mean(vs))
+        if debug_prefix is not None and _lfan_last_text:
+            print(f"[{debug_prefix}][LFAN] {_lfan_last_text}")
 
     return results
 
@@ -2047,6 +2121,17 @@ def main(argv: list[str] | None = None):
                     f" selected_bin_std={_train_fan_stats['selected_bin_std']:.2f}"
                     f" selected_low_ratio={_train_fan_stats['selected_low_ratio']:.4f}"
                 )
+            # LFAN epoch-averaged training diagnostics
+            _lfan_tr_keys = [k for k in train_stat if k.startswith("lf_")]
+            if _lfan_tr_keys:
+                _core = ["lf_low_energy_ratio_x", "lf_removed_energy_ratio_x",
+                         "lf_high_score_fraction", "lf_score_mean", "lf_corr_score_remove",
+                         "lf_removed_coeff_mae", "lf_removed_shape_mae",
+                         "lf_pred_removed_energy_ratio", "lf_true_removed_energy_ratio"]
+                parts = " ".join(
+                    f"{k}={train_stat[k]:.4f}" for k in _core if k in train_stat
+                )
+                print(f"Epoch: {epoch + 1} [lfan_train] {parts}")
             print(
                 "vali_results: "
                 f"{{'mae': {val_metrics['mae']:.6f}, "
