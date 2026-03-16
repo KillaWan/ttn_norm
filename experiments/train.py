@@ -514,6 +514,7 @@ class TrainConfig:
     lfan_gate_tau:       float = 0.20
     lfan_remove_floor:   float = 0.0
     lfan_sigma_min:      float = 1e-5
+    lfan_fan_equiv:      bool  = False
     lfan_hidden_dim:     int   = 64
     lfan_loss_low_coeff: float = 1.0
     lfan_loss_low_shape: float = 0.5
@@ -654,6 +655,7 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             gate_tau=cfg.lfan_gate_tau,
             remove_floor=cfg.lfan_remove_floor,
             sigma_min=cfg.lfan_sigma_min,
+            fan_equiv=cfg.lfan_fan_equiv,
             hidden_dim=cfg.lfan_hidden_dim,
             loss_low_coeff=cfg.lfan_loss_low_coeff,
             loss_low_shape=cfg.lfan_loss_low_shape,

@@ -170,6 +170,7 @@ class LFAN(nn.Module):
         loss_mu:         float = 0.2,
         loss_sigma:      float = 0.2,
         loss_res:        float = 0.2,
+        fan_equiv:       bool  = False,
         **kwargs,
     ):
         super().__init__()
@@ -209,23 +210,42 @@ class LFAN(nn.Module):
         self.loss_mu        = loss_mu
         self.loss_sigma     = loss_sigma
         self.loss_res       = loss_res
+        self.fan_equiv      = fan_equiv
 
-        # ── Heads: (B, C, 2*k_low + 6) → output ────────────────────────────
-        _head_in = 2 * k_low + 6
-
-        # low_head → predicts future *removed component* coefficients
-        self.low_head = nn.Sequential(
-            nn.Linear(_head_in, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 2 * k_low),
-        )
-
-        # stat_head → predicts future residual (mu, log_sigma)
-        self.stat_head = nn.Sequential(
-            nn.Linear(_head_in, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 2),
-        )
+        # ── Heads ────────────────────────────────────────────────────────────
+        if fan_equiv:
+            # FAN-equivalent: low_head_fan takes (low_x, x) per channel → pred_len
+            # Input: (B, C, 2*seq_len),  Output: (B, C, pred_len)
+            self.low_head_fan = nn.Sequential(
+                nn.Linear(2 * seq_len, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, pred_len),
+            )
+            # stat_head still defined but unused in fan_equiv (avoids param-count skew)
+            _head_in_std = 2 * k_low + 6
+            self.low_head  = nn.Sequential(
+                nn.Linear(_head_in_std, hidden_dim), nn.GELU(),
+                nn.Linear(hidden_dim, 2 * k_low),
+            )
+            self.stat_head = nn.Sequential(
+                nn.Linear(_head_in_std, hidden_dim), nn.GELU(),
+                nn.Linear(hidden_dim, 2),
+            )
+        else:
+            # Original LFAN heads
+            _head_in = 2 * k_low + 6
+            # low_head → predicts future *removed component* coefficients
+            self.low_head = nn.Sequential(
+                nn.Linear(_head_in, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 2 * k_low),
+            )
+            # stat_head → predicts future residual (mu, log_sigma)
+            self.stat_head = nn.Sequential(
+                nn.Linear(_head_in, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 2),
+            )
 
         # ── Cache fields ─────────────────────────────────────────────────────
         # normalize() caches
@@ -269,14 +289,60 @@ class LFAN(nn.Module):
         self._last_lfan_removed_shape_mae:       float = float("nan")
         self._last_lfan_bin_mae_list:            list  = [float("nan")] * k_low
 
+        # fan_equiv mode caches
+        self._cache_x:            Optional[Tensor] = None
+        self._cache_low_x:        Optional[Tensor] = None
+        self._cache_removed_x:    Optional[Tensor] = None
+        self._cache_res_x:        Optional[Tensor] = None
+        self._cache_pred_low:     Optional[Tensor] = None
+        self._fan_pred_residual:  Optional[Tensor] = None
+        self._fan_y_hat:          Optional[Tensor] = None
+
     # ------------------------------------------------------------------
     def normalize(self, x: Tensor) -> Tensor:
-        """(B, T, C) → (B, T, C) normalised residual z_x."""
+        """(B, T, C) → backbone input tensor."""
         B, T, C = x.shape
 
-        # ── 1. Low-pass ──────────────────────────────────────────────────────
+        # ── 1. Low-pass (shared) ─────────────────────────────────────────────
         full_fft_x, _, low_x = _rfft_low(x, self.k_low)
         high_x = x - low_x
+
+        # ── FAN-equivalent branch ─────────────────────────────────────────────
+        if self.fan_equiv:
+            removed_x = low_x           # remove all low freq
+            x_res     = x - low_x       # backbone sees high-freq residual (no inst-norm)
+
+            # low_head_fan: input = (low_x, x) per channel → pred_len
+            lx_t    = low_x.permute(0, 2, 1)                          # (B, C, T)
+            x_t     = x.permute(0, 2, 1)                              # (B, C, T)
+            head_in = torch.cat([lx_t, x_t], dim=-1)                  # (B, C, 2T)
+            pred_low = self.low_head_fan(head_in).permute(0, 2, 1)    # (B, pred_len, C)
+
+            # minimal caches required
+            self._cache_x         = x
+            self._cache_low_x     = low_x
+            self._cache_removed_x = removed_x
+            self._cache_res_x     = x_res
+            self._cache_pred_low  = pred_low
+            self._fan_pred_residual = None   # reset; set in denormalize()
+
+            # also keep shared LFAN fields as nan so get_debug_scalars is safe
+            self._last_lfan_low_x   = low_x
+            self._last_lfan_high_x  = high_x
+            self._last_lfan_score_t  = None
+            self._last_lfan_remove_t = None
+            self._last_lfan_keep_t   = None
+            sum_x2 = x.pow(2).sum(dim=1).clamp(min=1e-8)
+            self._last_lfan_low_energy_ratio_x     = float((low_x.pow(2).sum(dim=1) / sum_x2).mean().item())
+            self._last_lfan_high_energy_ratio_x    = float((high_x.pow(2).sum(dim=1) / sum_x2).mean().item())
+            self._last_lfan_removed_energy_ratio_x = float((removed_x.pow(2).sum(dim=1) / sum_x2).mean().item())
+            self._last_lfan_gate_segment_values    = None
+            self._last_lfan_mu_x     = None
+            self._last_lfan_sigma_x  = None
+
+            return x_res
+
+        # ── Original LFAN branch ──────────────────────────────────────────────
 
         # ── 2. Score + segment gate ──────────────────────────────────────────
         score_t, remove_t, keep_t, remove_seg = _burst_and_gate(
@@ -299,7 +365,7 @@ class LFAN(nn.Module):
         f2_bc  = high_x.pow(2).sum(dim=1)   / sum_x2   # high energy ratio
         f3_bc  = removed_x.pow(2).sum(dim=1) / sum_x2  # removed energy ratio
         f4_bc  = remove_t.mean(dim=1)                   # mean remove per (B,C)
-        f5_bc  = score_t.mean(dim=1)                   # mean score per (B,C)
+        f5_bc  = score_t.mean(dim=1)                    # mean score per (B,C)
         f6_bc  = sigma_x.squeeze(1)                     # sigma_x per (B,C)
 
         # ── 5. Head forward ──────────────────────────────────────────────────
@@ -339,6 +405,16 @@ class LFAN(nn.Module):
     # ------------------------------------------------------------------
     def denormalize(self, y_norm: Tensor) -> Tensor:
         """(B, O, C) → (B, O, C) reconstructed forecast."""
+        # ── FAN-equivalent branch ─────────────────────────────────────────────
+        if self.fan_equiv:
+            # y_norm is the backbone output = pred_residual (high-freq prediction)
+            pred_low      = self._cache_pred_low       # (B, pred_len, C)
+            y_hat         = pred_low + y_norm
+            self._fan_pred_residual = y_norm
+            self._fan_y_hat         = y_hat
+            return y_hat
+
+        # ── Original LFAN branch ──────────────────────────────────────────────
         self._last_lfan_pred_res_norm = y_norm
 
         B, O, C      = y_norm.shape
@@ -368,6 +444,25 @@ class LFAN(nn.Module):
     # ------------------------------------------------------------------
     def loss(self, y_true: Tensor) -> Tensor:
         """Auxiliary supervision loss.  Must be called after denormalize()."""
+        # ── FAN-equivalent branch ─────────────────────────────────────────────
+        if self.fan_equiv:
+            if self._fan_pred_residual is None:
+                raise RuntimeError(
+                    "LFAN(fan_equiv=True).loss() called before denormalize()."
+                )
+            _, _, low_y = _rfft_low(y_true, self.k_low)
+            res_y       = y_true - low_y
+            pred_low    = self._cache_pred_low
+            pred_res    = self._fan_pred_residual
+
+            low_loss = F.mse_loss(pred_low, low_y)
+            res_loss = F.mse_loss(pred_res, res_y)
+
+            self._last_lfan_low_y   = low_y
+            self._last_lfan_res_y   = res_y
+            return low_loss + res_loss
+
+        # ── Original LFAN branch ──────────────────────────────────────────────
         if self._last_lfan_pred_res_norm is None:
             raise RuntimeError(
                 "LFAN.loss() called before denormalize(). "
