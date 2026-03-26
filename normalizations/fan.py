@@ -91,6 +91,12 @@ class FAN(nn.Module):
         self._freq_stat_sum_low_ratio: float = 0.0
         self._freq_stat_count:         int   = 0
 
+        # Per-batch prediction quality diagnostics (set in loss(), read via get_debug_scalars())
+        self._last_fan_main_mse:          float = float("nan")
+        self._last_fan_res_mse:           float = float("nan")
+        self._last_fan_main_energy_ratio: float = float("nan")
+        self._last_fan_res_energy_ratio:  float = float("nan")
+
         self._build_model()
         self.weight = nn.Parameter(torch.ones(2, self.enc_in))
 
@@ -126,7 +132,30 @@ class FAN(nn.Module):
             true, self.freq_topk, self.rfft, self.ablation_mode
         )
         lf = nn.functional.mse_loss
-        return lf(self.pred_main_freq_signal, pred_main) + lf(residual, self.pred_residual)
+        main_mse = lf(self.pred_main_freq_signal, pred_main)
+        res_mse  = lf(self.pred_residual, residual)
+
+        with torch.no_grad():
+            sum_y2 = true.pow(2).sum(dim=1).clamp(min=1e-8)          # (B, N)
+            self._last_fan_main_mse          = float(main_mse.item())
+            self._last_fan_res_mse           = float(res_mse.item())
+            self._last_fan_main_energy_ratio = float(
+                (pred_main.pow(2).sum(dim=1) / sum_y2).mean().item()
+            )
+            self._last_fan_res_energy_ratio  = float(
+                (residual.pow(2).sum(dim=1) / sum_y2).mean().item()
+            )
+
+        return main_mse + res_mse
+
+    def get_debug_scalars(self) -> dict:
+        """Return per-batch prediction quality metrics (epoch-averageable)."""
+        return {
+            "fan_main_mse":          self._last_fan_main_mse,
+            "fan_res_mse":           self._last_fan_res_mse,
+            "fan_main_energy_ratio": self._last_fan_main_energy_ratio,
+            "fan_res_energy_ratio":  self._last_fan_res_energy_ratio,
+        }
 
     def normalize(self, input):
         # (B, T, N)

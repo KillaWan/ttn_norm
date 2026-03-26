@@ -447,8 +447,20 @@ class TrainConfig:
     san_ms_sigma_min: float = 1e-3
     san_ms_lambda_std: float = 1.0
     san_ms_ent_weight: float = 0.0
-    # SAN TTN (test-time normalization) options
+    # SAN TTN (learned future-stats refinement) options
     ttn_enabled: bool = False
+    ttn_hidden_dim: int = 64
+    ttn_num_layers: int = 2
+    ttn_dropout: float = 0.0
+    ttn_use_direct_head: bool = True
+    ttn_use_delta2: bool = True
+    ttn_gate_hidden_dim: int = 64
+    ttn_stats_loss_weight: float = 0.5
+    ttn_base_stats_loss_weight: float = 0.25
+    ttn_detach_base_stats: bool = False
+    ttn_logsigma_min: float = -6.0
+    ttn_logsigma_max: float = 6.0
+    # Old TTN CLI params kept for backward compat (ignored by SAN internally)
     ttn_calib_batches: int = 200
     ttn_momentum: float = 0.95
     ttn_alpha_max: float = 0.5
@@ -507,11 +519,11 @@ class TrainConfig:
     lfan_k_low:          int   = 8
     lfan_burst_smooth:   int   = 5
     lfan_burst_mix:      float = 0.7
-    lfan_gate_segments:  int   = 8
+    lfan_gate_segments:  int   = 16
     lfan_remove_quiet:   float = 0.98
-    lfan_remove_burst:   float = 0.30
-    lfan_gate_gamma:     float = 4.0
-    lfan_gate_tau:       float = 0.20
+    lfan_remove_burst:   float = 0.05
+    lfan_gate_gamma:     float = 3.0
+    lfan_gate_tau:       float = 1.0
     lfan_remove_floor:   float = 0.0
     lfan_sigma_min:      float = 1e-5
     lfan_fan_equiv:      bool  = False
@@ -563,13 +575,17 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             period_len=cfg.san_period_len,
             enc_in=num_features,
             ttn_enabled=cfg.ttn_enabled,
-            ttn_calib_batches=cfg.ttn_calib_batches,
-            ttn_momentum=cfg.ttn_momentum,
-            ttn_alpha_max=cfg.ttn_alpha_max,
-            ttn_tau_low=cfg.ttn_tau_low,
-            ttn_tau_high=cfg.ttn_tau_high,
-            ttn_use_mem=cfg.ttn_use_mem,
-            ttn_eps=cfg.ttn_eps,
+            ttn_hidden_dim=cfg.ttn_hidden_dim,
+            ttn_num_layers=cfg.ttn_num_layers,
+            ttn_dropout=cfg.ttn_dropout,
+            ttn_use_direct_head=cfg.ttn_use_direct_head,
+            ttn_use_delta2=cfg.ttn_use_delta2,
+            ttn_gate_hidden_dim=cfg.ttn_gate_hidden_dim,
+            ttn_stats_loss_weight=cfg.ttn_stats_loss_weight,
+            ttn_base_stats_loss_weight=cfg.ttn_base_stats_loss_weight,
+            ttn_detach_base_stats=cfg.ttn_detach_base_stats,
+            ttn_logsigma_min=cfg.ttn_logsigma_min,
+            ttn_logsigma_max=cfg.ttn_logsigma_max,
         )
 
     elif _nt == "san_spike":
@@ -583,13 +599,17 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             spike_dilate=cfg.spike_dilate,
             spike_mode=cfg.spike_mode,
             ttn_enabled=cfg.ttn_enabled,
-            ttn_calib_batches=cfg.ttn_calib_batches,
-            ttn_momentum=cfg.ttn_momentum,
-            ttn_alpha_max=cfg.ttn_alpha_max,
-            ttn_tau_low=cfg.ttn_tau_low,
-            ttn_tau_high=cfg.ttn_tau_high,
-            ttn_use_mem=cfg.ttn_use_mem,
-            ttn_eps=cfg.ttn_eps,
+            ttn_hidden_dim=cfg.ttn_hidden_dim,
+            ttn_num_layers=cfg.ttn_num_layers,
+            ttn_dropout=cfg.ttn_dropout,
+            ttn_use_direct_head=cfg.ttn_use_direct_head,
+            ttn_use_delta2=cfg.ttn_use_delta2,
+            ttn_gate_hidden_dim=cfg.ttn_gate_hidden_dim,
+            ttn_stats_loss_weight=cfg.ttn_stats_loss_weight,
+            ttn_base_stats_loss_weight=cfg.ttn_base_stats_loss_weight,
+            ttn_detach_base_stats=cfg.ttn_detach_base_stats,
+            ttn_logsigma_min=cfg.ttn_logsigma_min,
+            ttn_logsigma_max=cfg.ttn_logsigma_max,
         )
 
     elif _nt in {"sanms", "san_ms"}:
@@ -873,56 +893,9 @@ def calibrate_ttn(
     train_loader,
     cfg: TrainConfig,
 ) -> None:
-    """Calibrate TTN source stats for SAN from training data.
-
-    Runs up to cfg.ttn_calib_batches forward passes (normalize only),
-    averages the per-period mean and std across all batches, then calls
-    model.nm.set_ttn_source_state(mu, sigma).
-
-    Only active for norm_type "san" / "san_spike" with ttn_enabled=True.
-    Raises RuntimeError if calibration produces no batches or source is not
-    marked ready afterwards.
-    """
-    if cfg.norm_type.lower() not in {"san", "san_spike"}:
-        return
-    nm = getattr(model, "nm", None)
-    if nm is None or not getattr(nm, "ttn_enabled", False):
-        return
-
-    model.eval()
-    all_mu:    list[torch.Tensor] = []
-    all_sigma: list[torch.Tensor] = []
-    max_batches = int(cfg.ttn_calib_batches)
-
-    for i, batch_data in enumerate(train_loader):
-        if i >= max_batches:
-            break
-        bx = batch_data[0].to(cfg.device).float()
-        mu, sigma = nm.extract_state(bx)     # (P, 1, C)
-        all_mu.append(mu.cpu())
-        all_sigma.append(sigma.cpu())
-
-    if not all_mu:
-        raise RuntimeError(
-            "calibrate_ttn: train_loader produced no batches — "
-            "cannot set TTN source stats."
-        )
-
-    src_mu    = torch.stack(all_mu,    dim=0).mean(dim=0).to(cfg.device)   # (P, 1, C)
-    src_sigma = torch.stack(all_sigma, dim=0).mean(dim=0).to(cfg.device)
-    nm.set_ttn_source_state(src_mu, src_sigma)
-
-    if not getattr(nm, "_ttn_source_ready", False):
-        raise RuntimeError(
-            "calibrate_ttn: set_ttn_source_state() was called but "
-            "_ttn_source_ready is still False — unexpected internal error."
-        )
-
-    print(
-        f"ttn_calib: batches={len(all_mu)}"
-        f" mean_abs_mu={src_mu.abs().mean().item():.4f}"
-        f" mean_sigma={src_sigma.mean().item():.4f}"
-    )
+    """No-op: the old source-calibration EMA-TTN has been replaced by a
+    learned _TTNRefiner inside SAN.  This function is kept only so that
+    existing call-sites in the training loop do not break."""
 
 
 def _sq(t: torch.Tensor, q: float) -> float:
@@ -1213,6 +1186,19 @@ def collect_and_print_debug(
             f" spike_thr_mean={spike_stats['spike_thr_mean']:.6e}"
             f" clip_frac={spike_stats['clip_frac']:.6f}"
             f" sigma_min_frac={spike_stats['sigma_min_frac']:.6f}"
+        )
+
+    # ------------------------------------------------------------------ SAN-TTN (learned refinement)
+    if nm is not None and getattr(nm, "ttn_enabled", False) and hasattr(nm, "get_last_ttn_stats"):
+        ttn_st = nm.get_last_ttn_stats()
+        print(
+            f"[{prefix}][TTN]"
+            f" ttn_enabled={ttn_st['enabled']}"
+            f" ttn_alpha_mean={ttn_st['alpha_mean']:.4f}"
+            f" ttn_corr_abs_mean={ttn_st['corr_abs_mean']:.4f}"
+            f" ttn_direct_abs_mean={ttn_st['direct_abs_mean']:.4f}"
+            f" ttn_refine_delta_mu_abs_mean={ttn_st['refine_delta_mu_abs_mean']:.4f}"
+            f" ttn_refine_delta_sigma_abs_mean={ttn_st['refine_delta_sigma_abs_mean']:.4f}"
         )
 
     # ------------------------------------------------------------------ ORACLE (oracle gate ablation)
@@ -1754,29 +1740,39 @@ def evaluate(model, loader, cfg, scaler, debug_prefix: str | None = None):
         d = _nm_eval.get_last_diag()
         results.setdefault("wav_L_split", d.get("L_split", 0.0))
 
-    # TTN diagnostics
+    # TTN diagnostics (learned _TTNRefiner)
     if _nm_eval is not None and getattr(_nm_eval, "ttn_enabled", False) and hasattr(_nm_eval, "get_last_ttn_stats"):
         ttn_st = _nm_eval.get_last_ttn_stats()
         _pfx = f"[{debug_prefix}]" if debug_prefix is not None else ""
         print(
             f"{_pfx}ttn_stats:"
-            f" drift={ttn_st['drift']:.4f}"
-            f" alpha={ttn_st['alpha']:.4f}"
-            f" d_mu={ttn_st['d_mu']:.4f}"
-            f" d_sigma={ttn_st['d_sigma']:.4f}"
-            f" update_rate={ttn_st['update_rate']:.4f}"
+            f" enabled={ttn_st['enabled']}"
+            f" alpha_mean={ttn_st['alpha_mean']:.4f}"
+            f" corr_abs_mean={ttn_st['corr_abs_mean']:.4f}"
+            f" direct_abs_mean={ttn_st['direct_abs_mean']:.4f}"
+            f" refine_delta_mu={ttn_st['refine_delta_mu_abs_mean']:.4f}"
+            f" refine_delta_sigma={ttn_st['refine_delta_sigma_abs_mean']:.4f}"
         )
 
     # FAN frequency-bin statistics (collected over the full eval pass)
     if _is_fan:
         results.update(_nm_fan.get_freq_stats())
 
-    # LFAN averaged diagnostics
+    # FAN / LFAN averaged diagnostics (both expose get_debug_scalars())
     if _has_lfan_ev and _lfan_ev_accum:
         for k, vs in _lfan_ev_accum.items():
             results[k] = float(np.mean(vs))
-        if debug_prefix is not None and _lfan_last_text:
-            print(f"[{debug_prefix}][LFAN] {_lfan_last_text}")
+        if debug_prefix is not None:
+            if "fan_main_mse" in results:
+                print(
+                    f"[{debug_prefix}][FAN_DBG]"
+                    f" fan_main_mse={results['fan_main_mse']:.6f}"
+                    f" fan_res_mse={results['fan_res_mse']:.6f}"
+                    f" fan_main_energy_ratio={results['fan_main_energy_ratio']:.4f}"
+                    f" fan_res_energy_ratio={results['fan_res_energy_ratio']:.4f}"
+                )
+            if _lfan_last_text:
+                print(f"[{debug_prefix}][LFAN] {_lfan_last_text}")
 
     return results
 
@@ -2122,6 +2118,15 @@ def main(argv: list[str] | None = None):
                     f" selected_bin_mean={_train_fan_stats['selected_bin_mean']:.2f}"
                     f" selected_bin_std={_train_fan_stats['selected_bin_std']:.2f}"
                     f" selected_low_ratio={_train_fan_stats['selected_low_ratio']:.4f}"
+                )
+            # FAN epoch-averaged prediction quality diagnostics
+            if "fan_main_mse" in train_stat:
+                print(
+                    f"Epoch: {epoch + 1} [fan_dbg]"
+                    f" fan_main_mse={train_stat['fan_main_mse']:.6f}"
+                    f" fan_res_mse={train_stat['fan_res_mse']:.6f}"
+                    f" fan_main_energy_ratio={train_stat['fan_main_energy_ratio']:.4f}"
+                    f" fan_res_energy_ratio={train_stat['fan_res_energy_ratio']:.4f}"
                 )
             # LFAN epoch-averaged training diagnostics
             _lfan_tr_keys = [k for k in train_stat if k.startswith("lf_")]

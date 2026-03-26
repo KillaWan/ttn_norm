@@ -5,14 +5,16 @@ Structure
 Input side
   1. Fixed rFFT → keep first k_low bins → low_x
   2. high_x = x - low_x
-  3. burst_raw from smoothed |diff(high_x)| + |high_x|
-  4. Absolute segment score: score_seg = mean_t(burst_raw) / (rms(high_x) + 1e-8)
-  5. Gate: remove_seg = clamp(remove_floor + (remove_quiet - remove_floor)
+  3. Energy-ratio score per segment: score_seg = rms(high_x_seg) / (rms(low_x_seg) + 1e-8)
+     score < 1  → low-freq dominant (smooth) → quiet segment
+     score > 1  → high-freq comparable to low-freq → burst segment
+  4. Gate: remove_seg = clamp(remove_floor + (remove_quiet - remove_floor)
                               * sigmoid(gate_gamma * (gate_tau - score_seg)),
                               remove_burst, remove_quiet)
      score << gate_tau → remove ≈ remove_quiet;  score >> gate_tau → remove ≈ remove_burst
   6. removed_x = remove_t * low_x;  x_res = x - removed_x
-  7. Global instance-norm on x_res → z_x
+  7. Background-weighted instance-norm on x_res → z_x
+     weights = remove_t  (quiet segments dominate stats; burst leakage not inflating σ)
 
 Output side
   8. low_head  : history low-freq coeff → future *removed* component coeff
@@ -71,51 +73,49 @@ def _smooth_time(x: Tensor, kernel_size: int) -> Tensor:
     return out.permute(0, 2, 1)
 
 
-def _burst_and_gate(signal: Tensor, burst_smooth: int, burst_mix: float,
+def _burst_and_gate(high_signal: Tensor, low_signal: Tensor,
                     gate_segments: int, remove_quiet: float,
                     remove_burst: float, gate_gamma: float,
                     gate_tau: float, remove_floor: float):
-    """Absolute-score burst detection + segment gate.
+    """Energy-ratio burst detection + segment gate.
+
+    Score = rms(high_signal_seg) / (rms(low_signal_seg) + eps)
+    score << gate_tau → quiet segment → remove ≈ remove_quiet
+    score >> gate_tau → burst segment → remove ≈ remove_burst
 
     Args:
-        signal: (B, T, C) – high-frequency component (high_x or high_y)
+        high_signal : (B, T, C) – high-frequency component (high_x or high_y)
+        low_signal  : (B, T, C) – low-frequency component  (low_x or low_y)
 
     Returns:
-        score_t    : (B, T, C) piecewise-constant absolute score (tiled from score_seg)
+        score_t    : (B, T, C) piecewise-constant energy-ratio score
         remove_t   : (B, T, C) piecewise-constant removal fraction
         keep_t     : (B, T, C)
         remove_seg : (B, S, C) per-segment removal fraction
     """
-    B, T, C = signal.shape
-
-    # ── burst_raw (no sample-level normalisation) ─────────────────────────────
-    dh        = torch.diff(signal, dim=1)
-    dh        = F.pad(dh, (0, 0, 1, 0))
-    e1        = _smooth_time(dh.abs(),     burst_smooth)
-    e2        = _smooth_time(signal.abs(), burst_smooth)
-    burst_raw = burst_mix * e1 + (1.0 - burst_mix) * e2  # (B, T, C)
-
-    # ── Absolute segment score ───────────────────────────────────────────────
-    rms_signal = signal.pow(2).mean(dim=1, keepdim=True).sqrt()  # (B, 1, C)
+    B, T, C = high_signal.shape
 
     S       = gate_segments
     seg_len = max(1, T // S)
     T_use   = seg_len * S
 
-    if T_use <= T:
-        br_use = burst_raw[:, :T_use, :]
-    else:
-        pad_len = T_use - T
-        br_use  = torch.cat([
-            burst_raw,
-            burst_raw[:, -1:, :].expand(B, pad_len, C)
-        ], dim=1)
+    def _pad_to_T_use(t: Tensor) -> Tensor:
+        if t.shape[1] >= T_use:
+            return t[:, :T_use, :]
+        extra = t[:, -1:, :].expand(B, T_use - t.shape[1], C)
+        return torch.cat([t, extra], dim=1)
 
-    # (B, S, C): per-segment mean of burst_raw
-    burst_seg = br_use.reshape(B, S, seg_len, C).mean(dim=2)
+    high_use = _pad_to_T_use(high_signal)   # (B, T_use, C)
+    low_use  = _pad_to_T_use(low_signal)    # (B, T_use, C)
 
-    # Normalise by rms of the high-freq signal (absolute, not relative to peer segs)
-    score_seg = burst_seg / (rms_signal + 1e-8)  # (B, S, C)
+    # ── Per-segment energy-ratio score ───────────────────────────────────────
+    # rms(high_seg) / (rms(low_seg) + eps)  ∈ [0, ∞)
+    # Interpretable threshold: gate_tau=1 means "high ≈ low energy"
+    high_pow_seg = high_use.reshape(B, S, seg_len, C).pow(2).mean(dim=2)  # (B, S, C)
+    low_pow_seg  = low_use.reshape( B, S, seg_len, C).pow(2).mean(dim=2)  # (B, S, C)
+    rms_high_seg = high_pow_seg.sqrt()
+    rms_low_seg  = low_pow_seg.sqrt()
+    score_seg    = rms_high_seg / (rms_low_seg + 1e-8)                    # (B, S, C)
 
     # ── Gate: threshold at gate_tau, clamped to [remove_burst, remove_quiet] ──
     remove_seg = (
@@ -127,8 +127,6 @@ def _burst_and_gate(signal: Tensor, burst_smooth: int, burst_mix: float,
     # ── Tile back to T ────────────────────────────────────────────────────────
     score_t  = score_seg.repeat_interleave(seg_len, dim=1)   # (B, T_use, C)
     remove_t = remove_seg.repeat_interleave(seg_len, dim=1)  # (B, T_use, C)
-    for t in (score_t, remove_t):
-        pass  # placeholders; we trim/pad below
 
     def _fit_to_T(t: Tensor) -> Tensor:
         if t.shape[1] > T:
@@ -157,11 +155,11 @@ class LFAN(nn.Module):
         k_low:           int   = 8,
         burst_smooth:    int   = 5,
         burst_mix:       float = 0.7,
-        gate_segments:   int   = 8,
+        gate_segments:   int   = 16,
         remove_quiet:    float = 0.98,
-        remove_burst:    float = 0.30,
-        gate_gamma:      float = 4.0,
-        gate_tau:        float = 0.20,
+        remove_burst:    float = 0.05,
+        gate_gamma:      float = 3.0,
+        gate_tau:        float = 1.0,
         remove_floor:    float = 0.0,
         sigma_min:       float = 1e-5,
         hidden_dim:      int   = 64,
@@ -346,17 +344,23 @@ class LFAN(nn.Module):
 
         # ── 2. Score + segment gate ──────────────────────────────────────────
         score_t, remove_t, keep_t, remove_seg = _burst_and_gate(
-            high_x, self.burst_smooth, self.burst_mix,
+            high_x, low_x,
             self.gate_segments, self.remove_quiet, self.remove_burst,
             self.gate_gamma, self.gate_tau, self.remove_floor,
         )
 
-        # ── 3. Remove + instance norm ────────────────────────────────────────
+        # ── 3. Remove + background-weighted instance norm ────────────────────
         removed_x = remove_t * low_x
         x_res     = x - removed_x
 
-        mu_x    = x_res.mean(dim=1, keepdim=True)
-        sigma_x = x_res.std(dim=1, keepdim=True).clamp(min=self.sigma_min)
+        # Use remove_t as weights: quiet segments (remove_t ≈ remove_quiet) dominate
+        # the statistics; burst/event segments (remove_t ≈ remove_burst) contribute
+        # little → their leakage into x_res doesn't inflate sigma_x.
+        w_x     = remove_t                                              # (B, T, C)
+        w_x_sum = w_x.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        mu_x    = (w_x * x_res).sum(dim=1, keepdim=True) / w_x_sum    # (B, 1, C)
+        var_x   = (w_x * (x_res - mu_x).pow(2)).sum(dim=1, keepdim=True) / w_x_sum
+        sigma_x = var_x.sqrt().clamp(min=self.sigma_min)               # (B, 1, C)
         z_x     = (x_res - mu_x) / sigma_x
 
         # ── 4. Per-(B,C) features for heads ─────────────────────────────────
@@ -476,15 +480,20 @@ class LFAN(nn.Module):
         high_y = y_true - low_y
 
         _, remove_y, _, _ = _burst_and_gate(
-            high_y, self.burst_smooth, self.burst_mix,
+            high_y, low_y,
             self.gate_segments, self.remove_quiet, self.remove_burst,
             self.gate_gamma, self.gate_tau, self.remove_floor,
         )
 
-        removed_y     = remove_y * low_y
-        res_y         = y_true - removed_y
-        true_mu_y     = res_y.mean(dim=1, keepdim=True)
-        true_sigma_y  = res_y.std(dim=1, keepdim=True).clamp(min=self.sigma_min)
+        removed_y = remove_y * low_y
+        res_y     = y_true - removed_y
+
+        # Background-weighted stats (mirror normalize()):
+        w_y     = remove_y
+        w_y_sum = w_y.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        true_mu_y    = (w_y * res_y).sum(dim=1, keepdim=True) / w_y_sum
+        true_var_y   = (w_y * (res_y - true_mu_y).pow(2)).sum(dim=1, keepdim=True) / w_y_sum
+        true_sigma_y = true_var_y.sqrt().clamp(min=self.sigma_min)
         true_log_sig_y = true_sigma_y.log()
         true_res_norm  = (res_y - true_mu_y) / true_sigma_y
 
