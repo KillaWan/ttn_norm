@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import dataclasses
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -441,37 +442,58 @@ class TrainConfig:
     dish_init: str = "uniform"   # "standard" | "avg" | "uniform"
     # SAN (seasonal adaptive normalization)
     san_period_len: int = 12
+    san_stride: int = 0
+    san_base_stride: int = 0
+    san_force_extra_levels: int = -1
     # SANMS (multi-scale SAN)
     san_ms_scales: str = "1,2,4"
     san_ms_tau: float = 1.0
     san_ms_sigma_min: float = 1e-3
     san_ms_lambda_std: float = 1.0
     san_ms_ent_weight: float = 0.0
-    # SAN TTN (learned future-stats refinement) options
-    ttn_enabled: bool = False
-    ttn_hidden_dim: int = 64
-    ttn_num_layers: int = 2
-    ttn_dropout: float = 0.0
+    # SAN TTN (overlap-consistency calibrator, eval-only) options
+    # OSTN: overlap-to-statistics test-time normalization
+    ostn_enabled:                       bool  = False
+    ostn_hidden_dim:                    int   = 64
+    ostn_num_layers:                    int   = 2
+    ostn_dropout:                       float = 0.0
+    ostn_pos_dim:                       int   = 16
+    ostn_use_patchwise_overlap_summary: bool  = True
+    ostn_alpha_l1:                      float = 1e-3
+    ostn_overlap_weight:                float = 1.0
+    ostn_stats_weight:                  float = 1.0
+    ostn_logsigma_min:                  float = -6.0
+    ostn_logsigma_max:                  float = 6.0
+    ostn_reset_each_eval:               bool  = True
+
+    # OSTN stage2 finetuning settings
+    ostn_stage2_train:                  bool  = False
+    ostn_stage2_epochs:                 int   = 20
+    ostn_stage2_lr:                     float = 1e-3
+    ostn_stage2_weight_decay:           float = 0.0
+    ostn_stage2_patience:               int   = 5
+    ostn_stage2_min_epochs:             int   = 5
+    ostn_stage2_metric:                 str   = "val_mse"
+
+    # Oracle stats injection modes (eval only, for upper-bound analysis)
+    # san_oracle_norm:      true mean + true std
+    # san_oracle_mean_only: true mean + predicted std
+    # san_oracle_std_only:  predicted mean + true std
+    san_oracle_norm:      bool = False
+    san_oracle_mean_only: bool = False
+    san_oracle_std_only:  bool = False
+    # Old compat params silently ignored
+    ttn_calib_batches: int = 200
+    ttn_backcast_patches: int = 3
+    ttn_pad_mode: str = "replicate"
+    ttn_mean_loss_weight: float = 0.1
+    ttn_stage2_only: bool = False
+    ttn_debug_print: bool = False
     ttn_use_direct_head: bool = True
     ttn_use_delta2: bool = True
     ttn_gate_hidden_dim: int = 64
     ttn_stats_loss_weight: float = 0.5
     ttn_base_stats_loss_weight: float = 0.25
-    ttn_detach_base_stats: bool = False
-    ttn_logsigma_min: float = -6.0
-    ttn_logsigma_max: float = 6.0
-    # Old TTN CLI params kept for backward compat (ignored by SAN internally)
-    ttn_calib_batches: int = 200
-    ttn_momentum: float = 0.95
-    ttn_alpha_max: float = 0.5
-    ttn_tau_low: float = 0.05
-    ttn_tau_high: float = 0.20
-    ttn_use_mem: bool = True
-    ttn_eps: float = 1e-6
-    # SAN spike-robust stat estimation (used by norm_type="san_spike")
-    spike_q: float = 0.99
-    spike_dilate: int = 1
-    spike_mode: str = "mad"
     # TFBackgroundNorm (norm_type="tf_bg")
     tfbg_n_fft: int = 0        # 0 = auto (next power of 2 above T//4)
     tfbg_hop: int = 0          # 0 = auto (n_fft // 4)
@@ -573,43 +595,22 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             seq_len=cfg.window,
             pred_len=cfg.pred_len,
             period_len=cfg.san_period_len,
+            stride=cfg.san_stride,
+            base_stride=cfg.san_base_stride,
+            force_extra_levels=cfg.san_force_extra_levels,
             enc_in=num_features,
-            ttn_enabled=cfg.ttn_enabled,
-            ttn_hidden_dim=cfg.ttn_hidden_dim,
-            ttn_num_layers=cfg.ttn_num_layers,
-            ttn_dropout=cfg.ttn_dropout,
-            ttn_use_direct_head=cfg.ttn_use_direct_head,
-            ttn_use_delta2=cfg.ttn_use_delta2,
-            ttn_gate_hidden_dim=cfg.ttn_gate_hidden_dim,
-            ttn_stats_loss_weight=cfg.ttn_stats_loss_weight,
-            ttn_base_stats_loss_weight=cfg.ttn_base_stats_loss_weight,
-            ttn_detach_base_stats=cfg.ttn_detach_base_stats,
-            ttn_logsigma_min=cfg.ttn_logsigma_min,
-            ttn_logsigma_max=cfg.ttn_logsigma_max,
-        )
-
-    elif _nt == "san_spike":
-        norm_model = SAN(
-            seq_len=cfg.window,
-            pred_len=cfg.pred_len,
-            period_len=cfg.san_period_len,
-            enc_in=num_features,
-            spike_stats=True,
-            spike_q=cfg.spike_q,
-            spike_dilate=cfg.spike_dilate,
-            spike_mode=cfg.spike_mode,
-            ttn_enabled=cfg.ttn_enabled,
-            ttn_hidden_dim=cfg.ttn_hidden_dim,
-            ttn_num_layers=cfg.ttn_num_layers,
-            ttn_dropout=cfg.ttn_dropout,
-            ttn_use_direct_head=cfg.ttn_use_direct_head,
-            ttn_use_delta2=cfg.ttn_use_delta2,
-            ttn_gate_hidden_dim=cfg.ttn_gate_hidden_dim,
-            ttn_stats_loss_weight=cfg.ttn_stats_loss_weight,
-            ttn_base_stats_loss_weight=cfg.ttn_base_stats_loss_weight,
-            ttn_detach_base_stats=cfg.ttn_detach_base_stats,
-            ttn_logsigma_min=cfg.ttn_logsigma_min,
-            ttn_logsigma_max=cfg.ttn_logsigma_max,
+            ostn_enabled=cfg.ostn_enabled,
+            ostn_hidden_dim=cfg.ostn_hidden_dim,
+            ostn_num_layers=cfg.ostn_num_layers,
+            ostn_dropout=cfg.ostn_dropout,
+            ostn_pos_dim=cfg.ostn_pos_dim,
+            ostn_use_patchwise_overlap_summary=cfg.ostn_use_patchwise_overlap_summary,
+            ostn_alpha_l1=cfg.ostn_alpha_l1,
+            ostn_overlap_weight=cfg.ostn_overlap_weight,
+            ostn_stats_weight=cfg.ostn_stats_weight,
+            ostn_logsigma_min=cfg.ostn_logsigma_min,
+            ostn_logsigma_max=cfg.ostn_logsigma_max,
+            ostn_reset_each_eval=cfg.ostn_reset_each_eval,
         )
 
     elif _nt in {"sanms", "san_ms"}:
@@ -888,14 +889,27 @@ def calibrate_thresholds(
 
 
 @torch.no_grad()
-def calibrate_ttn(
+def _maybe_update_ostn_cache(
     model: nn.Module,
-    train_loader,
+    pred: torch.Tensor,
     cfg: TrainConfig,
 ) -> None:
-    """No-op: the old source-calibration EMA-TTN has been replaced by a
-    learned _TTNRefiner inside SAN.  This function is kept only so that
-    existing call-sites in the training loop do not break."""
+    """Update OSTN stream cache from the current batch's final prediction.
+
+    Must be called AFTER model.forward() returns during eval.
+    pred: (B, pred_len, C) — denormalized prediction.
+    """
+    nm = getattr(model, "nm", None)
+    if nm is None:
+        return
+    if not getattr(nm, "ostn_enabled", False):
+        return
+    if model.training:
+        return
+    if not hasattr(nm, "update_ostn_stream_cache"):
+        return
+    nm.update_ostn_stream_cache(pred)
+
 
 
 def _sq(t: torch.Tensor, q: float) -> float:
@@ -1177,28 +1191,23 @@ def collect_and_print_debug(
             f" mask_full_rate={mask_full_rate:.4f}"
         )
 
-    # ------------------------------------------------------------------ SPIKE (SAN spike-robust stats)
-    if nm is not None and hasattr(nm, "get_last_spike_stats"):
-        spike_stats = nm.get_last_spike_stats()
+    # ------------------------------------------------------------------ OSTN diagnostics
+    if nm is not None and getattr(nm, "ostn_enabled", False) and hasattr(nm, "get_last_ostn_stats"):
+        ostn_st = nm.get_last_ostn_stats()
         print(
-            f"[{prefix}][SPIKE]"
-            f" spike_rate={spike_stats['spike_rate']:.6f}"
-            f" spike_thr_mean={spike_stats['spike_thr_mean']:.6e}"
-            f" clip_frac={spike_stats['clip_frac']:.6f}"
-            f" sigma_min_frac={spike_stats['sigma_min_frac']:.6f}"
-        )
-
-    # ------------------------------------------------------------------ SAN-TTN (learned refinement)
-    if nm is not None and getattr(nm, "ttn_enabled", False) and hasattr(nm, "get_last_ttn_stats"):
-        ttn_st = nm.get_last_ttn_stats()
-        print(
-            f"[{prefix}][TTN]"
-            f" ttn_enabled={ttn_st['enabled']}"
-            f" ttn_alpha_mean={ttn_st['alpha_mean']:.4f}"
-            f" ttn_corr_abs_mean={ttn_st['corr_abs_mean']:.4f}"
-            f" ttn_direct_abs_mean={ttn_st['direct_abs_mean']:.4f}"
-            f" ttn_refine_delta_mu_abs_mean={ttn_st['refine_delta_mu_abs_mean']:.4f}"
-            f" ttn_refine_delta_sigma_abs_mean={ttn_st['refine_delta_sigma_abs_mean']:.4f}"
+            f"[{prefix}][OSTN]"
+            f" enabled={ostn_st['enabled']}"
+            f" applied={ostn_st['applied']}"
+            f" alpha_mean={ostn_st['alpha_mean']:.4f}"
+            f" alpha_max={ostn_st['alpha_max']:.4f}"
+            f" delta_mu_abs={ostn_st['delta_mu_abs_mean']:.4f}"
+            f" delta_lsig_abs={ostn_st['delta_logsigma_abs_mean']:.4f}"
+            f" base_olap={ostn_st['base_overlap_loss']:.6f}"
+            f" refined_olap={ostn_st['refined_overlap_loss']:.6f}"
+            f" base_mu={ostn_st['base_mu_abs_mean']:.4f}"
+            f" refined_mu={ostn_st['refined_mu_abs_mean']:.4f}"
+            f" base_sigma={ostn_st['base_sigma_mean']:.4f}"
+            f" refined_sigma={ostn_st['refined_sigma_mean']:.4f}"
         )
 
     # ------------------------------------------------------------------ ORACLE (oracle gate ablation)
@@ -1344,6 +1353,14 @@ def _wav_pred_params(model: nn.Module) -> list:
     return params
 
 
+def _ostn_params(model: nn.Module) -> list:
+    """Return OSTN corrector parameters only."""
+    nm = getattr(model, "nm", None)
+    if nm is None or not hasattr(nm, "ostn_corrector"):
+        return []
+    return [p for p in model.nm.ostn_corrector.parameters() if p.requires_grad]
+
+
 def _freeze_all_except_wav_predictor(model: nn.Module) -> None:
     """Freeze the entire model, then unfreeze model.nm.predictor and band_logits."""
     _set_requires_grad(model, False)
@@ -1355,6 +1372,14 @@ def _freeze_all_except_wav_predictor(model: nn.Module) -> None:
         band_logits = getattr(nm, "band_logits", None)
         if band_logits is not None and isinstance(band_logits, torch.nn.Parameter):
             band_logits.requires_grad = True
+
+
+def _freeze_all_except_ostn_corrector(model: nn.Module) -> None:
+    """Freeze entire model, then unfreeze only OSTN corrector."""
+    _set_requires_grad(model, False)
+    nm = getattr(model, "nm", None)
+    if nm is not None and hasattr(nm, "ostn_corrector"):
+        _set_requires_grad(nm.ostn_corrector, True)
 
 
 @torch.no_grad()
@@ -1398,6 +1423,7 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int,
     losses = []
     task_losses = []
     aux_losses = []
+    aux_to_task_ratios = []
     # Aux stats accumulators
     aux_stat_keys = ["aux_total", "L_easy", "L_white", "L_js", "L_w1", "L_min", "L_e_tv",
                      "ratio_n_bc_mean", "ratio_n_bc_min", "ratio_n_bc_max", "loss_n_ratio_budget",
@@ -1487,6 +1513,7 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int,
                 losses.append(loss.item())
                 task_losses.append(task_loss.item())
                 aux_losses.append(aux_loss.item())
+                aux_to_task_ratios.append(0.0)
                 pbar.update(batch_x.size(0))
                 pbar.set_postfix(
                     stage="pretrain",
@@ -1571,6 +1598,9 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int,
             losses.append(loss.item())
             task_losses.append(task_loss.item())
             aux_losses.append(aux_loss.item())
+            aux_to_task_ratios.append(
+                float((aux_loss.detach().item() * aux_scale) / (task_loss.detach().item() + 1e-8))
+            )
             if has_nm_aux:
                 s = model.nm.get_last_aux_stats()
                 for k in aux_stat_keys:
@@ -1600,6 +1630,7 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int,
     train_stat: dict[str, float] = {
         "task_loss": float(np.mean(task_losses)) if task_losses else 0.0,
         "aux_loss": float(np.mean(aux_losses)) if aux_losses else 0.0,
+        "aux_to_task_ratio": float(np.mean(aux_to_task_ratios)) if aux_to_task_ratios else 0.0,
     }
     if has_nm_aux and aux_stat_vals["aux_total"]:
         for k in aux_stat_keys:
@@ -1611,9 +1642,73 @@ def train_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int,
     return float(np.mean(losses)) if losses else 0.0, gate_stats_str, train_stat
 
 
+def train_ostn_stage2_one_epoch(model, loader, optimizer, cfg, scaler, epoch_idx: int):
+    """Stage2 OSTN corrector fine-tuning loop.
+
+    - model.eval(), but OSTN corrector train mode
+    - freeze all params except model.nm.ostn_corrector
+    - use adjacent within-batch pairs (i and i+1)
+    - skip batches with batch_size <= 1
+    - average B-1 pair losses per batch
+    """
+    model.eval()
+    nm = getattr(model, "nm", None)
+    if nm is None or not hasattr(nm, "ostn_train_loss") or not hasattr(nm, "ostn_corrector"):
+        raise RuntimeError("model.nm must have ostn_train_loss and ostn_corrector for OSTN stage2")
+
+    if not _ostn_params(model):
+        raise RuntimeError("No OSTN corrector parameters found for stage2 training")
+
+    nm.ostn_corrector.train()
+    _freeze_all_except_ostn_corrector(model)
+
+    total_loss = 0.0
+    batch_count = 0
+
+    for batch_x, batch_y, origin_y, batch_x_enc, batch_y_enc in loader:
+        batch_x = batch_x.to(cfg.device).float()
+        batch_y = batch_y.to(cfg.device).float()
+
+        B = batch_x.size(0)
+        if B <= 1:
+            continue
+
+        loss_accum = 0.0
+        pair_cnt = 0
+
+        for i in range(B - 1):
+            x_t = batch_x[i : i + 1]
+            y_t = batch_y[i : i + 1]
+            x_t1 = batch_x[i + 1 : i + 2]
+            y_t1 = batch_y[i + 1 : i + 2]
+
+            loss_pair = nm.ostn_train_loss(x_t, y_t, x_t1, y_t1, prev_overlap_summary=None)
+            loss_accum = loss_accum + loss_pair
+            pair_cnt += 1
+
+        if pair_cnt == 0:
+            continue
+
+        batch_loss = loss_accum / float(pair_cnt)
+
+        optimizer.zero_grad()
+        batch_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+        optimizer.step()
+
+        total_loss += float(batch_loss.item())
+        batch_count += 1
+
+    return float(total_loss / batch_count) if batch_count > 0 else 0.0
+
+
 @torch.no_grad()
 def evaluate(model, loader, cfg, scaler, debug_prefix: str | None = None):
     model.eval()
+    # Reset TTN eval state (prev-batch overlap cache) at the start of each phase
+    _nm_ostn_ev = getattr(model, "nm", None)
+    if _nm_ostn_ev is not None and hasattr(_nm_ostn_ev, "reset_ostn_eval_state"):
+        _nm_ostn_ev.reset_ostn_eval_state()
     # Reset FAN frequency-bin stats at the start of each evaluation phase
     _nm_fan = getattr(model, "nm", None)
     _is_fan = _nm_fan is not None and hasattr(_nm_fan, "reset_freq_stats")
@@ -1675,9 +1770,23 @@ def evaluate(model, loader, cfg, scaler, debug_prefix: str | None = None):
         # Oracle future stats used during evaluation (only explicit eval_stats mode)
         if cfg.wav_oracle_mode == "eval_stats":
             _maybe_set_oracle_future(model, cfg, batch_y)
+        # SAN oracle norm: inject true future patch stats (upper-bound test)
+        _nm_oracle = getattr(model, "nm", None)
+        _oracle_mode = (
+            "both"      if cfg.san_oracle_norm      else
+            "mean_only" if cfg.san_oracle_mean_only else
+            "std_only"  if cfg.san_oracle_std_only  else
+            None
+        )
+        if _oracle_mode is not None and _nm_oracle is not None and hasattr(_nm_oracle, "set_oracle_stats"):
+            _nm_oracle.set_oracle_stats(batch_y, mode=_oracle_mode)
         pred = model(x_main, x_enc_main, dec_inp, dec_inp_enc)
         if cfg.wav_oracle_mode == "eval_stats":
             _maybe_clear_oracle_future(model, cfg)
+        if _oracle_mode is not None and _nm_oracle is not None and hasattr(_nm_oracle, "clear_oracle_stats"):
+            _nm_oracle.clear_oracle_stats()
+        # OSTN: update stream cache from current final prediction
+        _maybe_update_ostn_cache(model, pred.detach(), cfg)
         if ctx_len > 0 and _is_wavband:
             if model.nm is not None and hasattr(model.nm, "clear_ctx_history"):
                 model.nm.clear_ctx_history()
@@ -1740,18 +1849,24 @@ def evaluate(model, loader, cfg, scaler, debug_prefix: str | None = None):
         d = _nm_eval.get_last_diag()
         results.setdefault("wav_L_split", d.get("L_split", 0.0))
 
-    # TTN diagnostics (learned _TTNRefiner)
-    if _nm_eval is not None and getattr(_nm_eval, "ttn_enabled", False) and hasattr(_nm_eval, "get_last_ttn_stats"):
-        ttn_st = _nm_eval.get_last_ttn_stats()
+    # OSTN diagnostics
+    if _nm_eval is not None and getattr(_nm_eval, "ostn_enabled", False) and hasattr(_nm_eval, "get_last_ostn_stats"):
+        ostn_st = _nm_eval.get_last_ostn_stats()
         _pfx = f"[{debug_prefix}]" if debug_prefix is not None else ""
         print(
-            f"{_pfx}ttn_stats:"
-            f" enabled={ttn_st['enabled']}"
-            f" alpha_mean={ttn_st['alpha_mean']:.4f}"
-            f" corr_abs_mean={ttn_st['corr_abs_mean']:.4f}"
-            f" direct_abs_mean={ttn_st['direct_abs_mean']:.4f}"
-            f" refine_delta_mu={ttn_st['refine_delta_mu_abs_mean']:.4f}"
-            f" refine_delta_sigma={ttn_st['refine_delta_sigma_abs_mean']:.4f}"
+            f"{_pfx}[OSTN]"
+            f" enabled={ostn_st['enabled']}"
+            f" applied={ostn_st['applied']}"
+            f" alpha_mean={ostn_st['alpha_mean']:.4f}"
+            f" alpha_max={ostn_st['alpha_max']:.4f}"
+            f" delta_mu_abs={ostn_st['delta_mu_abs_mean']:.4f}"
+            f" delta_lsig_abs={ostn_st['delta_logsigma_abs_mean']:.4f}"
+            f" base_olap={ostn_st['base_overlap_loss']:.6f}"
+            f" refined_olap={ostn_st['refined_overlap_loss']:.6f}"
+            f" base_mu={ostn_st['base_mu_abs_mean']:.4f}"
+            f" refined_mu={ostn_st['refined_mu_abs_mean']:.4f}"
+            f" base_sigma={ostn_st['base_sigma_mean']:.4f}"
+            f" refined_sigma={ostn_st['refined_sigma_mean']:.4f}"
         )
 
     # FAN frequency-bin statistics (collected over the full eval pass)
@@ -1835,6 +1950,14 @@ def main(argv: list[str] | None = None):
     run_name = cfg.run_name or f"{cfg.dataset_type}_{cfg.backbone_type}_{cfg.norm_type}"
     if not cfg.run_name and cfg.norm_type.lower() == "fan":
         run_name = f"{run_name}_{cfg.fan_ablation_mode}"
+    if not cfg.run_name and cfg.norm_type.lower() == "san":
+        _san_base_stride = cfg.san_base_stride if cfg.san_base_stride > 0 else cfg.san_period_len
+        run_name = (
+            f"{run_name}_p{cfg.san_period_len}"
+            f"_bs{_san_base_stride}"
+            f"_hs{cfg.san_stride}"
+            f"_l{cfg.san_force_extra_levels}"
+        )
     result_root = cfg.result_dir
     if cfg.norm_type.lower() in {"none", "baseline", "no"}:
         result_root = os.path.join(cfg.result_dir, cfg.baseline_subdir)
@@ -2030,17 +2153,15 @@ def main(argv: list[str] | None = None):
             scheduler.step()
             continue
 
-        # TTN calibration before eval (calibrate source stats, then reset memory)
-        _nm_ttn = getattr(model, "nm", None)
-        _ttn_active = _nm_ttn is not None and getattr(_nm_ttn, "ttn_enabled", False)
-        if _ttn_active:
-            calibrate_ttn(model, dataloader.train_loader, cfg)
-            _nm_ttn.reset_ttn_state()
+        # Reset OSTN stream cache before each eval phase
+        _nm_ostn = getattr(model, "nm", None)
+        if _nm_ostn is not None and hasattr(_nm_ostn, "reset_ostn_eval_state"):
+            _nm_ostn.reset_ostn_eval_state()
 
         val_metrics = evaluate(model, dataloader.val_loader, cfg, scaler, debug_prefix="VAL_DBG")
 
-        if _ttn_active:
-            _nm_ttn.reset_ttn_state()
+        if _nm_ostn is not None and hasattr(_nm_ostn, "reset_ostn_eval_state"):
+            _nm_ostn.reset_ostn_eval_state()
 
         test_metrics = evaluate(model, dataloader.test_loader, cfg, scaler)
 
@@ -2054,6 +2175,7 @@ def main(argv: list[str] | None = None):
                 f" loss={train_loss:.6f}"
                 f" task={train_stat.get('task_loss', 0.0):.6f}"
                 f" aux={train_stat.get('aux_loss', 0.0):.6f}"
+                f" aux_to_task={train_stat.get('aux_to_task_ratio', 0.0):.6f}"
             )
             print(
                 f"Epoch {epoch + 1} [val]"
@@ -2071,6 +2193,7 @@ def main(argv: list[str] | None = None):
                 "train_loss":    train_loss,
                 "train_task":    train_stat.get("task_loss", 0.0),
                 "train_aux":     train_stat.get("aux_loss", 0.0),
+                "train_aux_to_task": train_stat.get("aux_to_task_ratio", 0.0),
                 "val_mse":       val_metrics["mse"],
                 "val_mae":       val_metrics["mae"],
                 "val_rmse":      val_metrics.get("rmse", float("nan")),
@@ -2095,6 +2218,7 @@ def main(argv: list[str] | None = None):
             train_stat_str = ""
             if train_stat:
                 train_stat_str = f" | task={train_stat.get('task_loss', 0.0):.6f}"
+                train_stat_str += f" aux_to_task={train_stat.get('aux_to_task_ratio', 0.0):.6f}"
                 if "aux_total" in train_stat:
                     train_stat_str += (
                         f" aux_total={train_stat['aux_total']:.6e}"
@@ -2194,14 +2318,23 @@ def main(argv: list[str] | None = None):
 
         scheduler.step()
 
+    # Load the best training checkpoint before final evaluation.
     if os.path.exists(best_checkpoint_path):
-        model.load_state_dict(torch.load(best_checkpoint_path, map_location=cfg.device))
+        try:
+            model.load_state_dict(torch.load(best_checkpoint_path, map_location=cfg.device))
+        except RuntimeError as exc:
+            print(
+                f"[WARN] Failed to reload best checkpoint from {best_checkpoint_path}: {exc}"
+            )
+            print(
+                "[WARN] This usually means another run wrote an incompatible SAN checkpoint to the same path. "
+                "Continuing with the in-memory model from the current run."
+            )
 
-    # Final TTN calibration + reset before final test
+    # Reset OSTN stream cache before final test
     _nm_final = getattr(model, "nm", None)
-    if _nm_final is not None and getattr(_nm_final, "ttn_enabled", False):
-        calibrate_ttn(model, dataloader.train_loader, cfg)
-        _nm_final.reset_ttn_state()
+    if _nm_final is not None and hasattr(_nm_final, "reset_ostn_eval_state"):
+        _nm_final.reset_ostn_eval_state()
 
     test_metrics = evaluate(model, dataloader.test_loader, cfg, scaler)
     print(
@@ -2211,6 +2344,32 @@ def main(argv: list[str] | None = None):
         f"'mse': {test_metrics['mse']:.6f}, "
         f"'rmse': {test_metrics['rmse']:.6f}}}"
     )
+
+    # Oracle-norm upper bound analysis (three modes)
+    _nm_oracle_final = getattr(model, "nm", None)
+    if _nm_oracle_final is not None and hasattr(_nm_oracle_final, "set_oracle_stats"):
+        _oracle_runs = [
+            ("oracle_mean_only (true mean + pred std)", "mean_only",
+             dataclasses.replace(cfg, san_oracle_mean_only=True, san_oracle_norm=False, san_oracle_std_only=False, ostn_enabled=False)),
+            ("oracle_std_only  (pred mean + true std)", "std_only",
+             dataclasses.replace(cfg, san_oracle_std_only=True,  san_oracle_norm=False, san_oracle_mean_only=False, ostn_enabled=False)),
+            ("oracle_both      (true mean + true std)", "both",
+             dataclasses.replace(cfg, san_oracle_norm=True, san_oracle_mean_only=False, san_oracle_std_only=False, ostn_enabled=False)),
+        ]
+        for label, _mode, _ocfg in _oracle_runs:
+            if hasattr(_nm_oracle_final, "reset_ostn_eval_state"):
+                _nm_oracle_final.reset_ostn_eval_state()
+            _om = evaluate(model, dataloader.test_loader, _ocfg, scaler)
+            print(
+                f"{label}: "
+                f"mse={_om['mse']:.6f}  mae={_om['mae']:.6f}  "
+                f"Δmse={_om['mse'] - test_metrics['mse']:+.6f}  "
+                f"Δmae={_om['mae'] - test_metrics['mae']:+.6f}"
+            )
+
+    _norm_plot_path = os.path.join(result_root, f"{run_name}_norm_stats.png")
+    plot_norm_stats(model, dataloader, cfg, _norm_plot_path)
+
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(
             {
@@ -2250,6 +2409,142 @@ def main(argv: list[str] | None = None):
             f,
             indent=2,
         )
+
+
+def plot_norm_stats(model, dataloader, cfg, save_path: str) -> None:
+    """Compare SAN predicted future window stats vs oracle stats across train/val/test.
+
+    oracle : per-window mean/std computed directly from batch_y (ground-truth future)
+    predicted : per-window mean/std from nm._refined_pred_stats by default, plus
+    a separate level-0 base predictor curve from nm._base_pred_stats.
+
+    Both are in the same space (after global scaler).  SAN is supervised on exactly
+    these quantities, so the two lines should overlap in the training split and diverge
+    in val/test when distribution shifts.
+
+    Each point = one batch, value = mean over (B, N_pred, C).
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[NORM_STATS] matplotlib not available, skipping plot.")
+        return
+
+    nm = getattr(model, "nm", None)
+    if nm is None or not hasattr(nm, "normalize") or not hasattr(nm, "_pred_stats"):
+        print("[NORM_STATS] no SAN normalization module, skipping plot.")
+        return
+
+    C = getattr(nm, "channels", getattr(nm, "enc_in", None))
+    if C is None or not hasattr(nm, "_extract_windows") or not hasattr(nm, "_compute_window_stats"):
+        print("[NORM_STATS] SAN window-stat helpers not found, skipping plot.")
+        return
+
+    device = torch.device(cfg.device)
+
+    pred_base_mean_vals, pred_refined_mean_vals, oracle_mean_vals = [], [], []
+    pred_base_std_vals, pred_refined_std_vals, oracle_std_vals = [], [], []
+    split_boundaries = []   # batch indices where a new split begins
+
+    splits = [
+        ("train", dataloader.train_loader),
+        ("val",   dataloader.val_loader),
+        ("test",  dataloader.test_loader),
+    ]
+
+    model.eval()
+    with torch.no_grad():
+        total = 0
+        for split_name, loader in splits:
+            split_boundaries.append(total)
+            # Reset OSTN stream cache so it doesn't bleed across splits during viz pass
+            if hasattr(nm, "reset_ostn_eval_state"):
+                nm.reset_ostn_eval_state()
+            for batch_x, batch_y, _origin_y, _batch_x_enc, _batch_y_enc in loader:
+                batch_x = batch_x.to(device).float()
+                batch_y = batch_y.to(device).float()
+
+                nm.normalize(batch_x)
+
+                ps_refined = getattr(nm, "_refined_pred_stats", nm._pred_stats)
+                ps_base = getattr(nm, "_base_pred_stats", None)
+                if ps_refined is None:
+                    continue
+
+                pred_refined_mean_vals.append(float(ps_refined[:, :, :C].mean().item()))
+                pred_refined_std_vals.append(float(ps_refined[:, :, C:].mean().item()))
+
+                if ps_base is None:
+                    pred_base_mean_vals.append(float("nan"))
+                    pred_base_std_vals.append(float("nan"))
+                else:
+                    pred_base_mean_vals.append(float(ps_base[:, :, :C].mean().item()))
+                    pred_base_std_vals.append(float(ps_base[:, :, C:].mean().item()))
+
+                # Oracle: extract sliding windows, compute window-level stats
+                y_w = nm._extract_windows(batch_y)
+                y_mean, y_std = nm._compute_window_stats(y_w)
+                oracle_mean_vals.append(float(y_mean.mean().item()))
+                oracle_std_vals.append( float(y_std.mean().item()))
+                total += 1
+
+    if not pred_refined_mean_vals:
+        print("[NORM_STATS] no data collected, skipping plot.")
+        return
+
+    xs          = np.arange(len(pred_refined_mean_vals))
+    split_ends  = split_boundaries[1:] + [len(xs)]   # end index for each split
+    split_names = ["train", "val", "test"]
+    split_colors = ["#2196F3", "#FF9800", "#4CAF50"]
+
+    fig, (ax_mean, ax_std) = plt.subplots(2, 1, figsize=(16, 8), sharex=True)
+    fig.suptitle(
+        f"SAN Predicted vs Oracle Window Stats"
+        f" — {cfg.norm_type} | {cfg.dataset_type} | pred={cfg.pred_len}",
+        fontsize=13,
+    )
+
+    def _draw_splits(ax):
+        for i, (s, e) in enumerate(zip(split_boundaries, split_ends)):
+            ax.axvspan(s, e, alpha=0.07, color=split_colors[i], zorder=0)
+            ax.axvline(s, color=split_colors[i], linestyle="--",
+                       linewidth=0.9, zorder=1)
+            mid = (s + e) / 2
+            ax.text(mid, ax.get_ylim()[1], split_names[i],
+                    ha="center", va="top", fontsize=9,
+                    color=split_colors[i], fontweight="bold")
+
+    # ---- Mean panel ----
+    ax_mean.plot(xs, oracle_mean_vals, color="steelblue",  linewidth=0.9,
+                 alpha=0.9, label="oracle mean")
+    ax_mean.plot(xs, pred_base_mean_vals, color="darkorange", linewidth=0.9,
+                 alpha=0.8, label="base mean", linestyle="--")
+    ax_mean.plot(xs, pred_refined_mean_vals, color="seagreen", linewidth=1.0,
+                 alpha=0.9, label="refined mean")
+    ax_mean.set_ylabel("Window Mean", fontsize=10)
+    ax_mean.legend(fontsize=9, loc="upper right")
+    ax_mean.grid(True, alpha=0.25)
+    _draw_splits(ax_mean)
+
+    # ---- Std panel ----
+    ax_std.plot(xs, oracle_std_vals, color="steelblue",  linewidth=0.9,
+                alpha=0.9, label="oracle std")
+    ax_std.plot(xs, pred_base_std_vals, color="darkorange", linewidth=0.9,
+                alpha=0.8, label="base std", linestyle="--")
+    ax_std.plot(xs, pred_refined_std_vals, color="seagreen", linewidth=1.0,
+                alpha=0.9, label="refined std")
+    ax_std.set_ylabel("Window Std", fontsize=10)
+    ax_std.set_xlabel("Batch index", fontsize=10)
+    ax_std.legend(fontsize=9, loc="upper right")
+    ax_std.grid(True, alpha=0.25)
+    _draw_splits(ax_std)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[NORM_STATS] plot saved → {save_path}")
 
 
 if __name__ == "__main__":
