@@ -4,8 +4,13 @@ from .fan import FAN
 from .dish_ts import DishTS
 from .san import SAN
 from .san_ms import SANMS
+from .san_route_norm import SANRouteNorm
 from .tf_bg import TFBackgroundNorm
 from .wavband_b import WaveBandNormB
 from .lfan import LFAN
 
-__all__ = ["No", "RevIN", "FAN", "DishTS", "SAN", "SANMS", "TFBackgroundNorm", "WaveBandNormB", "LFAN"]
+__all__ = [
+    "No", "RevIN", "FAN", "DishTS",
+    "SAN", "SANMS", "SANRouteNorm",
+    "TFBackgroundNorm", "WaveBandNormB", "LFAN",
+]

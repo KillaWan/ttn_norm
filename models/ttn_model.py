@@ -7,7 +7,7 @@ import torch.nn as nn
 
 from ttn_norm.backbones import build_backbone
 from ttn_norm.models.local_tf_norm.local_norm import LocalTFNorm, LocalTFNormState
-from ttn_norm.normalizations import DishTS, FAN, No, RevIN, SAN
+from ttn_norm.normalizations import DishTS, FAN, No, RevIN, SAN, SANRouteNorm
 
 
 class TTNModel(nn.Module):
@@ -47,8 +47,8 @@ class TTNModel(nn.Module):
             # normalize() returns (normalized_x, normalized_dec_inp)
             batch_x, dec_inp = nm.normalize(batch_x, dec_inp)
 
-        elif isinstance(nm, SAN):
-            # Adapted SAN: normalize() stores pred_stats internally, returns tensor.
+        elif isinstance(nm, (SAN, SANRouteNorm)):
+            # normalize() stores pred stats internally, returns normalized tensor.
             batch_x = nm.normalize(batch_x)
 
         elif isinstance(nm, FAN):
@@ -73,8 +73,8 @@ class TTNModel(nn.Module):
         elif isinstance(nm, (RevIN, DishTS, FAN)):
             return nm.denormalize(pred)
 
-        elif isinstance(nm, SAN):
-            # Uses internally stored _pred_stats from last normalize() call.
+        elif isinstance(nm, (SAN, SANRouteNorm)):
+            # Uses internally stored pred stats from last normalize() call.
             return nm.denormalize(pred)
 
         elif isinstance(nm, No):

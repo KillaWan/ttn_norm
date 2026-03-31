@@ -445,6 +445,10 @@ class TrainConfig:
     san_stride: int = 0
     san_base_stride: int = 0
     san_force_extra_levels: int = -1
+    # SANRouteNorm (norm_type="san_route") — single-level SAN base
+    san_sigma_min: float = 1e-3
+    san_w_mu: float = 1.0
+    san_w_std: float = 1.0
     # SANMS (multi-scale SAN)
     san_ms_scales: str = "1,2,4"
     san_ms_tau: float = 1.0
@@ -556,6 +560,19 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             base_stride=cfg.san_base_stride,
             force_extra_levels=cfg.san_force_extra_levels,
             enc_in=num_features,
+        )
+
+    elif _nt == "san_route":
+        from ttn_norm.normalizations import SANRouteNorm
+        norm_model = SANRouteNorm(
+            seq_len=cfg.window,
+            pred_len=cfg.pred_len,
+            period_len=cfg.san_period_len,
+            enc_in=num_features,
+            stride=cfg.san_stride,
+            sigma_min=cfg.san_sigma_min,
+            w_mu=cfg.san_w_mu,
+            w_std=cfg.san_w_std,
         )
 
     elif _nt in {"sanms", "san_ms"}:
