@@ -1,24 +1,34 @@
-# Sliding-window SAN with full mean/std hierarchy prediction.
+# Sliding-window SAN with uniform multi-level hierarchy prediction.
 #
-# Level-0 behavior depends on depth:
-#   - num_levels == 1: keep original SAN absolute heads (self.model + self.model_std)
-#   - num_levels >= 2: disable level0 absolute-mean head (self.model is None)
-#     and obtain level0 mean only from hierarchy reconstruction future_mean_recon[0]
-#     while keeping level0 std on the original model_std path
+# Design principle: every level first performs a full original-SAN-style base
+# prediction using that level's own history stats, xbar signal, and that level's
+# own history-mean anchor. Hierarchy then acts only outside the base predictor,
+# adding a second-order norm on mean for non-top levels.
 #
-# Full mean/std hierarchy (num_levels >= 2):
-#   - hier_stats_predictors[l-1] predicts absolute future_mean_pred[l] + future_std_pred[l]
-#     for levels l = 1..L.  Both outputs have direct oracle loss (L_stats[l]).
-#   - hier_norm_predictors[l] predicts normalized future_mean_norm_pred[l] for levels l = 0..L-1.
-#     Each output has direct oracle loss (L_norm[l]).
-#   - Top-down reconstruction: future_mean_recon[L] = future_mean_pred[L];
-#     for l=L-1..0: future_mean_recon[l] = future_mean_norm_pred[l] * lift(future_std_pred[l+1])
-#                                           + lift(future_mean_pred[l+1]).
-#   - Middle-level consistency: L_cons[l] = MSE(future_mean_recon[l], future_mean_pred[l])
-#     for l = 1..L-1.
+# Per-level structure (every level l = 0..L):
+#   - mean head: anchor + residual style (same as original single-level SAN)
+#       anchor_l = hist_mean_seq[l].mean(dim=1, keepdim=True)
+#       future_mean_base[l] = mean_head_l(hist_mean_seq[l], xbar_levels[l], anchor_l)
+#   - std head:  direct sigma prediction style
+#       future_std_base[l] = std_head_l(hist_std[l], xbar[l])
+#   Both heads receive the level's own xbar_levels[l] auxiliary signal.
+#   Only the top level base-mean head is directly supervised against oracle
+#   future mean. Std heads remain supervised at every level. Non-top mean
+#   supervision is applied only on future_mean_final[l]. The z branch remains
+#   an implicit latent path used to construct future_mean_final[l], but it no
+#   longer receives its own explicit oracle-MSE target.
 #
-# Level-0 denorm always uses future_mean_recon[0] and future_std0_pred (from model_std).
-# OSTN remains compatible and only refines level-0 future stats at eval/test.
+# Second-order norm (for non-top levels l < L only):
+#   hist_norm_z[l]        = (hist_mean_seq[l] - lift(hist_mean_seq[l+1]))
+#                           / (lift(hist_std_seq[l+1]) + eps)
+#   future_norm_z_pred[l] = norm_z_head_l(...)
+#   Final mean:           future_mean_final[l] = lift(future_mean_final[l+1])
+#                         + future_norm_z_pred[l] * (lift(future_std_base[l+1]) + eps)
+#
+# Top level (l == L):
+#   future_mean_final[L] = future_mean_base[L]  (no upper level)
+#
+# Level-0 denorm uses future_mean_final[0] and future_std_base[0].
 from __future__ import annotations
 
 from typing import Optional
@@ -26,106 +36,6 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-class _OSTNStatsCorrector(nn.Module):
-    """GRU + MLP stats corrector for OSTN."""
-
-    D_HIST: int = 4
-    D_OLAP: int = 4
-
-    def __init__(
-        self,
-        hidden_dim: int,
-        num_layers: int,
-        dropout: float,
-        pos_dim: int,
-        pred_stat_len: int,
-        use_patchwise_overlap: bool,
-    ):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.pos_dim = pos_dim
-        self.pred_stat_len = pred_stat_len
-        self.use_patchwise_overlap = use_patchwise_overlap
-
-        self.hist_gru = nn.GRU(
-            input_size=self.D_HIST,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            dropout=dropout if num_layers > 1 else 0.0,
-            batch_first=True,
-        )
-        self.olap_enc = nn.Sequential(
-            nn.Linear(self.D_OLAP, hidden_dim),
-            nn.GELU(),
-        )
-        self.pos_emb = nn.Parameter(torch.randn(pred_stat_len, pos_dim) * 0.01)
-
-        in_corr = 2 * hidden_dim + 2 + pos_dim
-        self.delta_mu_head = nn.Sequential(
-            nn.Linear(in_corr, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-        )
-        self.delta_lsig_head = nn.Sequential(
-            nn.Linear(in_corr, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-        )
-        self.alpha_head = nn.Sequential(
-            nn.Linear(2 * hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-        )
-
-        nn.init.zeros_(self.delta_mu_head[-1].weight)
-        nn.init.zeros_(self.delta_mu_head[-1].bias)
-        nn.init.zeros_(self.delta_lsig_head[-1].weight)
-        nn.init.zeros_(self.delta_lsig_head[-1].bias)
-        nn.init.zeros_(self.alpha_head[-1].weight)
-        nn.init.constant_(self.alpha_head[-1].bias, -3.0)
-
-    def forward(
-        self,
-        hist_stats_seq: torch.Tensor,
-        base_future_mean: torch.Tensor,
-        base_future_logsigma: torch.Tensor,
-        prev_overlap_summary: torch.Tensor,
-    ):
-        batch_size, hist_len, channels, _ = hist_stats_seq.shape
-        pred_len = base_future_mean.shape[1]
-
-        x_gru = hist_stats_seq.permute(0, 2, 1, 3).reshape(
-            batch_size * channels, hist_len, self.D_HIST
-        )
-        _, h_n = self.hist_gru(x_gru)
-        hist_ctx = h_n[-1].reshape(batch_size, channels, self.hidden_dim)
-
-        if self.use_patchwise_overlap and prev_overlap_summary.dim() == 4:
-            olap_in = prev_overlap_summary.mean(dim=1)
-        else:
-            olap_in = prev_overlap_summary
-        olap_ctx = self.olap_enc(olap_in)
-
-        ctx = torch.cat([hist_ctx, olap_ctx], dim=-1)
-        alpha = torch.sigmoid(
-            self.alpha_head(ctx.reshape(batch_size * channels, 2 * self.hidden_dim)).reshape(
-                batch_size, channels, 1
-            )
-        ).permute(0, 2, 1)
-
-        ctx_exp = ctx.unsqueeze(1).expand(batch_size, pred_len, channels, 2 * self.hidden_dim)
-        pos_exp = self.pos_emb[:pred_len].unsqueeze(0).unsqueeze(2).expand(
-            batch_size, pred_len, channels, self.pos_dim
-        )
-        base_in = torch.stack([base_future_mean, base_future_logsigma], dim=-1)
-        feat = torch.cat([ctx_exp, base_in, pos_exp], dim=-1)
-        feat_flat = feat.reshape(batch_size * pred_len * channels, -1)
-
-        delta_mu = self.delta_mu_head(feat_flat).reshape(batch_size, pred_len, channels)
-        delta_lsig = self.delta_lsig_head(feat_flat).reshape(batch_size, pred_len, channels)
-        return delta_mu, delta_lsig, alpha
 
 
 class SAN(nn.Module):
@@ -143,18 +53,6 @@ class SAN(nn.Module):
         base_stride: int = 0,
         force_extra_levels: int = -1,
         sigma_min: float = 1e-3,
-        ostn_enabled: bool = False,
-        ostn_hidden_dim: int = 64,
-        ostn_num_layers: int = 2,
-        ostn_dropout: float = 0.0,
-        ostn_pos_dim: int = 16,
-        ostn_use_patchwise_overlap_summary: bool = True,
-        ostn_alpha_l1: float = 1e-3,
-        ostn_overlap_weight: float = 1.0,
-        ostn_stats_weight: float = 1.0,
-        ostn_logsigma_min: float = -6.0,
-        ostn_logsigma_max: float = 6.0,
-        ostn_reset_each_eval: bool = True,
         **kwargs,
     ):
         super().__init__()
@@ -177,19 +75,6 @@ class SAN(nn.Module):
                 f"got {self.force_extra_levels}."
             )
 
-        self.ostn_enabled = bool(ostn_enabled)
-        self.ostn_hidden_dim = int(ostn_hidden_dim)
-        self.ostn_num_layers = int(ostn_num_layers)
-        self.ostn_dropout = float(ostn_dropout)
-        self.ostn_pos_dim = int(ostn_pos_dim)
-        self.ostn_use_patchwise_overlap_summary = bool(ostn_use_patchwise_overlap_summary)
-        self.ostn_alpha_l1 = float(ostn_alpha_l1)
-        self.ostn_overlap_weight = float(ostn_overlap_weight)
-        self.ostn_stats_weight = float(ostn_stats_weight)
-        self.ostn_logsigma_min = float(ostn_logsigma_min)
-        self.ostn_logsigma_max = float(ostn_logsigma_max)
-        self.ostn_reset_each_eval = bool(ostn_reset_each_eval)
-
         self._validate_config_lengths()
         self.hist_stat_len = self._compute_n_windows(self.seq_len)
         self.pred_stat_len = self._compute_n_windows(self.pred_len)
@@ -198,52 +83,15 @@ class SAN(nn.Module):
         self._build_model()
         self._reset_prediction_cache()
 
-        self._prev_stream_final_pred: Optional[torch.Tensor] = None
-        self._prev_stream_refined_mean: Optional[torch.Tensor] = None
-        self._prev_stream_refined_logsigma: Optional[torch.Tensor] = None
-        self._prev_stream_base_final_pred: Optional[torch.Tensor] = None
-        self._prev_stream_refined_final_pred: Optional[torch.Tensor] = None
-        self._prev_stream_overlap_summary: Optional[torch.Tensor] = None
-        self._prev_stream_valid: bool = False
-
-        self._curr_refined_mean: Optional[torch.Tensor] = None
-        self._curr_refined_logsigma: Optional[torch.Tensor] = None
-        self._curr_base_mean: Optional[torch.Tensor] = None
-        self._curr_base_logsigma: Optional[torch.Tensor] = None
-
-        self._last_ostn_applied: bool = False
-        self._last_ostn_alpha_mean: float = 0.0
-        self._last_ostn_alpha_max: float = 0.0
-        self._last_ostn_delta_mu_abs_mean: float = 0.0
-        self._last_ostn_delta_lsig_abs_mean: float = 0.0
-        self._last_ostn_base_overlap_loss: float = 0.0
-        self._last_ostn_refined_overlap_loss: float = 0.0
-        self._last_ostn_base_mu_abs_mean: float = 0.0
-        self._last_ostn_refined_mu_abs_mean: float = 0.0
-        self._last_ostn_base_sigma_mean: float = 0.0
-        self._last_ostn_refined_sigma_mean: float = 0.0
-
-        self._oracle_pred_stats: Optional[torch.Tensor] = None
-        self._oracle_mode: str = 'both'
-
     def _reset_prediction_cache(self) -> None:
         self._pred_stats: Optional[torch.Tensor] = None
-        self._base_pred_stats: Optional[torch.Tensor] = None
-        self._refined_pred_stats: Optional[torch.Tensor] = None
         self._pred_time_stats: Optional[torch.Tensor] = None
-        self._base_pred_time_stats: Optional[torch.Tensor] = None
-        self._refined_pred_time_stats: Optional[torch.Tensor] = None
 
         self._level0_hist_mu: Optional[torch.Tensor] = None
         self._level0_hist_std: Optional[torch.Tensor] = None
         self._level0_hist_lambda: Optional[torch.Tensor] = None
-        self._level0_future_base_mu: Optional[torch.Tensor] = None
-        self._level0_future_base_lambda: Optional[torch.Tensor] = None
         self._level0_future_final_mu: Optional[torch.Tensor] = None
         self._level0_future_final_lambda: Optional[torch.Tensor] = None
-        self._level0_future_ostn_mu: Optional[torch.Tensor] = None
-        self._level0_future_ostn_lambda: Optional[torch.Tensor] = None
-        self._final_future_time_stats: Optional[torch.Tensor] = None
 
         self._hierarchy_cache: list[dict] = []
         self._coarse_level_cache: list[dict] = []
@@ -251,10 +99,12 @@ class SAN(nn.Module):
         self._last_total_stats_loss: float = 0.0
         self._last_recon0_loss: float = 0.0
         self._last_std0_loss: float = 0.0
-        # Per-level diagnostics for the full mean/std hierarchy
-        self._last_norm_losses: dict[int, float] = {}    # L_norm[l] for l=0..L-1
-        self._last_stats_losses: dict[int, float] = {}   # L_stats[l] for l=1..L
-        self._last_cons_losses: dict[int, float] = {}    # L_cons[l] for l=1..L-1
+        # Per-level diagnostics
+        self._last_base_mean_losses: dict[int, float] = {}   # L_base_mean[l] for l=0..L
+        self._last_std_losses: dict[int, float] = {}         # L_std[l] for l=0..L
+        self._last_final_mean_losses: dict[int, float] = {}  # L_final_mean[l] for l=0..L-1
+        self._last_top_base_mean_loss: float = 0.0
+        self._last_weighted_base_loss: float = 0.0
         self._last_weighted_hier_loss: float = 0.0
         self._last_hier_to_level0_ratio: float = 0.0
 
@@ -327,10 +177,7 @@ class SAN(nn.Module):
         self.num_levels = len(self.level_hist_lens)
 
     def _std_to_logsigma(self, std: torch.Tensor) -> torch.Tensor:
-        return torch.log(std.clamp(min=self.sigma_min)).clamp(
-            min=self.ostn_logsigma_min,
-            max=self.ostn_logsigma_max,
-        )
+        return torch.log(std.clamp(min=self.sigma_min)).clamp(min=-6.0, max=6.0)
 
     def _logsigma_to_std(self, logsigma: torch.Tensor) -> torch.Tensor:
         return logsigma.exp().clamp(min=self.sigma_min)
@@ -524,28 +371,16 @@ class SAN(nn.Module):
     ) -> torch.Tensor:
         return self._lift_seq_stats(stats_seq, target_len, meta_patch, meta_stride)
 
-    def _compute_roughness(self, stats_seq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if stats_seq.shape[1] <= 1:
-            roughness = torch.zeros(
-                stats_seq.shape[0],
-                1,
-                stats_seq.shape[2],
-                device=stats_seq.device,
-                dtype=stats_seq.dtype,
-            )
-        else:
-            delta = stats_seq[:, 1:, :] - stats_seq[:, :-1, :]
-            seq_std = stats_seq.std(dim=1, keepdim=True, unbiased=False)
-            roughness = delta.abs().mean(dim=1, keepdim=True) / (seq_std + self.epsilon)
-        alpha = 1.0 / (1.0 + roughness)
-        return roughness, alpha
-
-    def _build_recursive_mean_hierarchy(
+    def _build_recursive_stats_hierarchy(
         self,
         level0_mean_seq: torch.Tensor,
+        level0_std_seq: torch.Tensor,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Build hierarchy where level0 std is real window std and higher-level std
+        is the patch std of the previous level mean sequence.
+        """
         level_mean_seqs: list[torch.Tensor] = [level0_mean_seq]
-        level_std_seqs: list[torch.Tensor] = [torch.zeros_like(level0_mean_seq)]
+        level_std_seqs: list[torch.Tensor] = [level0_std_seq]
         current_mean_seq = level0_mean_seq
 
         for spec in self.level_transition_specs:
@@ -582,156 +417,28 @@ class SAN(nn.Module):
 
         return levels
 
-    def _build_hist_stats_seq_from_stats(
-        self,
-        hist_mean: torch.Tensor,
-        hist_std: torch.Tensor,
-    ) -> torch.Tensor:
-        hist_logsigma = self._std_to_logsigma(hist_std)
-        delta_mean = torch.zeros_like(hist_mean)
-        delta_logsigma = torch.zeros_like(hist_logsigma)
-        delta_mean[:, 1:, :] = hist_mean[:, 1:, :] - hist_mean[:, :-1, :]
-        delta_logsigma[:, 1:, :] = hist_logsigma[:, 1:, :] - hist_logsigma[:, :-1, :]
-        return torch.stack([hist_mean, hist_logsigma, delta_mean, delta_logsigma], dim=-1)
-
-    def _build_hist_stats_seq(self, x: torch.Tensor) -> torch.Tensor:
-        hist_windows = self._extract_windows(x)
-        hist_mean, hist_std = self._compute_window_stats(hist_windows)
-        return self._build_hist_stats_seq_from_stats(hist_mean, hist_std)
-
     def _build_model(self):
         self.level_raw_hist_lens = [hist_len * self.window_len for hist_len in self.level_hist_lens]
-        # level0 absolute-mean head exists only in single-level SAN.
-        self.model: Optional[nn.Module]
-        if self.num_levels == 1:
-            self.model = _MLP(
-                hist_stat_len=self.level_hist_lens[0],
-                raw_hist_len=self.level_raw_hist_lens[0],
-                pred_stat_len=self.level_pred_lens[0],
-                enc_in=self.enc_in,
-                mode='mu',
-            ).float()
-        else:
-            self.model = None
-
-        # level0 std head is always active and remains separate from hierarchy stats predictors.
-        self.model_std = _MLP(
-            hist_stat_len=self.level_hist_lens[0],
-            raw_hist_len=self.level_raw_hist_lens[0],
-            pred_stat_len=self.level_pred_lens[0],
-            enc_in=self.enc_in,
-            mode='lambda',
-        ).float()
-        # hier_norm_predictors[l] handles level l (0..num_levels-2): predicts future_mean_norm_pred[l]
-        # hier_stats_predictors[l-1] handles level l (1..num_levels-1): predicts future_mean_pred[l] + future_std_pred[l]
-        self.hier_norm_predictors = nn.ModuleList()
-        self.hier_stats_predictors = nn.ModuleList()
-
-        if self.num_levels >= 2:
-            # Norm predictors for levels 0..L-1 (one per level that has an upper context)
-            self.hier_norm_predictors = nn.ModuleList(
-                [
-                    _HierNormPredictor(
-                        hist_stat_len=self.level_hist_lens[level_idx],
-                        raw_hist_len=self.level_raw_hist_lens[level_idx],
-                        pred_stat_len=self.level_pred_lens[level_idx],
-                        enc_in=self.enc_in,
-                    ).float()
-                    for level_idx in range(self.num_levels - 1)   # 0 .. L-1
-                ]
-            )
-            # Stats predictors for levels 1..L (one per level above zero)
-            self.hier_stats_predictors = nn.ModuleList(
-                [
-                    _HierStatsPredictor(
-                        hist_stat_len=self.level_hist_lens[level_idx],
-                        raw_hist_len=self.level_raw_hist_lens[level_idx],
-                        pred_stat_len=self.level_pred_lens[level_idx],
-                        enc_in=self.enc_in,
-                        sigma_min=self.sigma_min,
-                    ).float()
-                    for level_idx in range(1, self.num_levels)    # 1 .. L
-                ]
-            )
-        if self.ostn_enabled:
-            self.ostn_corrector = _OSTNStatsCorrector(
-                hidden_dim=self.ostn_hidden_dim,
-                num_layers=self.ostn_num_layers,
-                dropout=self.ostn_dropout,
-                pos_dim=self.ostn_pos_dim,
-                pred_stat_len=self.pred_stat_len,
-                use_patchwise_overlap=self.ostn_use_patchwise_overlap_summary,
-            )
-
-    def set_oracle_stats(self, batch_y: torch.Tensor, mode: str = 'both') -> None:
-        if self.station_type != 'adaptive':
-            return
-        oracle_windows = self._extract_windows(batch_y)
-        oracle_mean, oracle_std = self._compute_window_stats(oracle_windows)
-        self._oracle_pred_stats = torch.cat([oracle_mean, oracle_std], dim=-1)
-        self._oracle_mode = mode
-
-    def clear_oracle_stats(self) -> None:
-        self._oracle_pred_stats = None
-        self._oracle_mode = 'both'
-
-    def extract_state(self, x: torch.Tensor):
-        hist_windows = self._extract_windows(x)
-        mean, sigma = self._compute_window_stats(hist_windows)
-        return mean.mean(0).unsqueeze(1), sigma.mean(0).unsqueeze(1)
-
-    def _get_mu_predictor(self, level_idx: int) -> nn.Module:
-        if level_idx != 0:
-            raise ValueError("_get_mu_predictor is only valid for level0.")
-        if self.model is None:
-            raise ValueError(
-                "hierarchy 模式下 level0 absolute mean head 已禁用; "
-                "level0 mean 必须通过 hier_norm_predictors[0] + upper stats denorm 获得."
-            )
-        return self.model
-
-    def _get_lambda_predictor(self, level_idx: int) -> nn.Module:
-        if level_idx != 0:
-            raise ValueError("_get_lambda_predictor is only valid for level0.")
-        return self.model_std
-
-    def _predict_level0_absolute_mean_std(
-        self,
-        hist_mu: torch.Tensor,
-        hist_scale: torch.Tensor,
-        xbar_raw_like: torch.Tensor,
-        global_mean: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Single-level SAN only: predict level0 absolute mean + logsigma."""
-        if self.num_levels != 1:
-            raise ValueError(
-                "_predict_level0_absolute_mean_std is only valid when num_levels == 1."
-            )
-        global_hist = global_mean.expand(-1, hist_mu.shape[1], -1)
-        mu_pred = self._get_mu_predictor(0)(
-            hist_mu - global_hist,
-            xbar_raw_like,
-            global_mean,
+        # One _SANLevelPredictor per level, all structurally identical.
+        # Each predictor has: mean head (anchor+residual), std head, and — for non-top levels —
+        # a norm-z head that predicts the second-order normed residual under the upper level.
+        self.level_predictors = nn.ModuleList(
+            [
+                _SANLevelPredictor(
+                    hist_stat_len=self.level_hist_lens[l],
+                    raw_hist_len=self.level_raw_hist_lens[l],
+                    pred_stat_len=self.level_pred_lens[l],
+                    enc_in=self.enc_in,
+                    sigma_min=self.sigma_min,
+                    has_norm_z_head=(l < self.num_levels - 1),
+                ).float()
+                for l in range(self.num_levels)
+            ]
         )
-        scale_pred = self._get_lambda_predictor(0)(
-            hist_scale,
-            xbar_raw_like,
-            None,
-        ).clamp(min=self.sigma_min)
-        return mu_pred, self._std_to_logsigma(scale_pred)
-
-    def _predict_level0_std_only(
-        self,
-        hist_scale: torch.Tensor,
-        xbar_raw_like: torch.Tensor,
-    ) -> torch.Tensor:
-        """Predict level0 logsigma via model_std. Valid for both single-level and hierarchy modes."""
-        scale_pred = self._get_lambda_predictor(0)(
-            hist_scale,
-            xbar_raw_like,
-            None,
-        ).clamp(min=self.sigma_min)
-        return self._std_to_logsigma(scale_pred)
+        # Keep legacy attribute references for external code that inspects self.model / self.model_std.
+        # Both point into level_predictors[0] sub-modules so no extra parameters are created.
+        self.model = self.level_predictors[0].mean_head
+        self.model_std = self.level_predictors[0].std_head
 
     def _predict_hierarchical_future_stats(
         self,
@@ -740,112 +447,116 @@ class SAN(nn.Module):
         norm_input: torch.Tensor,
         global_mean: torch.Tensor,
     ) -> list[dict]:
+        """Predict future stats for all levels using the uniform SAN-style design.
+
+        Every level first produces its own original-SAN-style base outputs using:
+            hist_mean_seq[l], hist_std_seq[l], xbar_levels[l], anchor_l
+        where anchor_l = hist_mean_seq[l].mean(dim=1, keepdim=True).
+
+        Non-top levels then apply an outer mean-only second-order norm:
+            future_mean_final[l] = lift(future_mean_final[l+1])
+                                   + zhat_l * (lift(future_std_base[l+1]) + eps)
+        while the top level keeps future_mean_final[top] = future_mean_base[top].
+        """
         max_level = self.num_levels - 1
-        hist_mean_seq, hist_std_seq = self._build_recursive_mean_hierarchy(hist_window_mean)
+        hist_mean_seq, hist_std_seq = self._build_recursive_stats_hierarchy(
+            hist_window_mean,
+            hist_window_std,
+        )
         xbar_levels = self._build_xbar_hierarchy(norm_input)
 
-        hist_lambda0 = self._std_to_logsigma(hist_window_std)
-        # Level-0 std prediction: always use model_std (unchanged path, output endpoint)
-        future_std0_logsigma = self._predict_level0_std_only(
-            hist_lambda0,
-            xbar_levels[0],
-        )
-        future_std0_pred = self._logsigma_to_std(future_std0_logsigma)
+        # Storage
+        future_mean_base: dict[int, torch.Tensor] = {}
+        future_std_base: dict[int, torch.Tensor] = {}
+        future_mean_final: dict[int, torch.Tensor] = {}
+        # For non-top levels: hist normed-z and predicted normed-z
+        hist_norm_z: dict[int, torch.Tensor] = {}       # z_l computed from hist
+        future_norm_z_pred: dict[int, torch.Tensor] = {}  # zhat_l predicted
 
-        future_mean_norm_pred: dict[int, torch.Tensor] = {}
-        future_mean_pred: dict[int, torch.Tensor] = {}
-        future_std_pred: dict[int, torch.Tensor] = {}
-        future_mean_recon: dict[int, torch.Tensor] = {}
-        hist_mean_norm_under: dict[tuple[int, int], torch.Tensor] = {}
+        # ---------------------------------------------------------------
+        # Step 1: every level independently performs a base SAN prediction using
+        # that level's own history-mean anchor.
+        # ---------------------------------------------------------------
+        for level_idx in range(max_level, -1, -1):
+            predictor = self.level_predictors[level_idx]
+            anchor = hist_mean_seq[level_idx].mean(dim=1, keepdim=True)
+
+            mb, sb = predictor.predict_base(
+                hist_mean_seq[level_idx],
+                hist_std_seq[level_idx],
+                xbar_levels[level_idx],
+                anchor,
+            )
+            future_mean_base[level_idx] = mb
+            future_std_base[level_idx] = sb
+
+        # ---------------------------------------------------------------
+        # Step 2: compute hist normed-z for non-top levels (needed as input to norm_z_head).
+        # z_l = (hist_mean[l] - lift(hist_mean[l+1])) / (lift(hist_std[l+1]) + eps)
+        # level0 std comes from real window std; level>=1 std comes from patch std
+        # of the previous level mean sequence.
+        # ---------------------------------------------------------------
+        for level_idx in range(max_level):
+            spec = self.level_transition_specs[level_idx]
+            upper_hist_mean_lift = self._lift_seq_stats(
+                hist_mean_seq[level_idx + 1],
+                target_len=hist_mean_seq[level_idx].shape[1],
+                meta_patch=spec['meta_patch'],
+                meta_stride=spec['meta_stride'],
+            )
+            upper_hist_std_lift = self._lift_seq_stats(
+                hist_std_seq[level_idx + 1],
+                target_len=hist_mean_seq[level_idx].shape[1],
+                meta_patch=spec['meta_patch'],
+                meta_stride=spec['meta_stride'],
+            )
+            hist_norm_z[level_idx] = (
+                hist_mean_seq[level_idx] - upper_hist_mean_lift
+            ) / (upper_hist_std_lift + self.epsilon)
+
+        # ---------------------------------------------------------------
+        # Step 3: for non-top levels, predict zhat_l and compute final mean.
+        # final_mean[l] = lift(final_mean[l+1]) + zhat_l * (lift(std_base[l+1]) + eps)
+        # ---------------------------------------------------------------
+        future_mean_final[max_level] = future_mean_base[max_level]
+
+        for level_idx in range(max_level - 1, -1, -1):
+            spec = self.level_transition_specs[level_idx]
+            upper_mean_lift = self._lift_seq_stats(
+                future_mean_final[level_idx + 1],
+                target_len=self.level_pred_lens[level_idx],
+                meta_patch=spec['meta_patch'],
+                meta_stride=spec['meta_stride'],
+            )
+            upper_std_lift = self._lift_seq_stats(
+                future_std_base[level_idx + 1],
+                target_len=self.level_pred_lens[level_idx],
+                meta_patch=spec['meta_patch'],
+                meta_stride=spec['meta_stride'],
+            )
+            # Upper-std context in hist domain (for norm_z_head input)
+            upper_hist_std_lift = self._lift_seq_stats(
+                hist_std_seq[level_idx + 1],
+                target_len=hist_mean_seq[level_idx].shape[1],
+                meta_patch=spec['meta_patch'],
+                meta_stride=spec['meta_stride'],
+            )
+            zhat = self.level_predictors[level_idx].predict_norm_z(
+                hist_mean_seq[level_idx],
+                upper_hist_std_lift,
+                xbar_levels[level_idx],
+                hist_norm_z[level_idx],
+            )
+            future_norm_z_pred[level_idx] = zhat
+            future_mean_final[level_idx] = upper_mean_lift + zhat * (upper_std_lift + self.epsilon)
 
         if max_level == 0:
-            # No hierarchy: self.model predicts absolute mean
-            future_mean_recon_0, _ = self._predict_level0_absolute_mean_std(
-                hist_window_mean,
-                hist_lambda0,
-                xbar_levels[0],
-                global_mean,
-            )
-            future_mean_recon[0] = future_mean_recon_0
-        else:
-            # Build hist hierarchy-normalized representations for levels 0..L-1
-            for level_idx in range(max_level):
-                spec = self.level_transition_specs[level_idx]
-                lifted_mean = self._lift_seq_stats(
-                    hist_mean_seq[level_idx + 1],
-                    target_len=hist_mean_seq[level_idx].shape[1],
-                    meta_patch=spec['meta_patch'],
-                    meta_stride=spec['meta_stride'],
-                )
-                lifted_std = self._lift_seq_stats(
-                    hist_std_seq[level_idx + 1],
-                    target_len=hist_mean_seq[level_idx].shape[1],
-                    meta_patch=spec['meta_patch'],
-                    meta_stride=spec['meta_stride'],
-                )
-                hist_mean_norm_under[(level_idx + 1, level_idx)] = (
-                    hist_mean_seq[level_idx] - lifted_mean
-                ) / (lifted_std + self.epsilon)
+            # Single-level: no upper level, final == base.
+            future_mean_final[0] = future_mean_base[0]
 
-            # Step 1: predict absolute future stats (mean + std) for levels 1..L
-            for level_idx in range(1, self.num_levels):
-                m_pred, s_pred = self.hier_stats_predictors[level_idx - 1](
-                    hist_mean_seq[level_idx],
-                    hist_std_seq[level_idx],
-                    xbar_levels[level_idx],
-                )
-                future_mean_pred[level_idx] = m_pred
-                future_std_pred[level_idx] = s_pred
-
-            # Step 2: predict normalized future mean for levels 0..L-1
-            # level-0: uses lifted hist_std_seq[1] as upper-std context branch
-            # levels 1..L-1: uses hist_std_seq[level] directly
-            for level_idx in range(max_level):
-                spec = self.level_transition_specs[level_idx]
-                if level_idx == 0:
-                    lifted_upper_std = self._lift_seq_stats(
-                        hist_std_seq[1],
-                        target_len=hist_mean_seq[0].shape[1],
-                        meta_patch=spec['meta_patch'],
-                        meta_stride=spec['meta_stride'],
-                    )
-                    future_mean_norm_pred[0] = self.hier_norm_predictors[0](
-                        hist_mean_seq[0],
-                        lifted_upper_std,
-                        xbar_levels[0],
-                        hist_mean_norm_under[(1, 0)],
-                    )
-                else:
-                    future_mean_norm_pred[level_idx] = self.hier_norm_predictors[level_idx](
-                        hist_mean_seq[level_idx],
-                        hist_std_seq[level_idx],
-                        xbar_levels[level_idx],
-                        hist_mean_norm_under[(level_idx + 1, level_idx)],
-                    )
-
-            # Step 3: top-down reconstruction
-            # future_mean_recon[L] = future_mean_pred[L]
-            # future_mean_recon[l] = future_mean_norm_pred[l] * lift(future_std_pred[l+1]) + lift(future_mean_pred[l+1])
-            future_mean_recon[max_level] = future_mean_pred[max_level]
-            for level_idx in range(max_level - 1, -1, -1):
-                spec = self.level_transition_specs[level_idx]
-                upper_mean_lift = self._lift_seq_stats(
-                    future_mean_pred[level_idx + 1],
-                    target_len=self.level_pred_lens[level_idx],
-                    meta_patch=spec['meta_patch'],
-                    meta_stride=spec['meta_stride'],
-                )
-                upper_std_lift = self._lift_seq_stats(
-                    future_std_pred[level_idx + 1],
-                    target_len=self.level_pred_lens[level_idx],
-                    meta_patch=spec['meta_patch'],
-                    meta_stride=spec['meta_stride'],
-                )
-                future_mean_recon[level_idx] = (
-                    future_mean_norm_pred[level_idx] * (upper_std_lift + self.epsilon)
-                    + upper_mean_lift
-                )
-
+        # ---------------------------------------------------------------
+        # Assemble level cache
+        # ---------------------------------------------------------------
         level_cache: list[dict] = []
         for level_idx in range(self.num_levels):
             cache = {
@@ -854,102 +565,28 @@ class SAN(nn.Module):
                 'hist_len': self.level_hist_lens[level_idx],
                 'future_len': self.level_pred_lens[level_idx],
                 'meta_patch': self.level_transition_specs[level_idx]['meta_patch']
-                if level_idx < len(self.level_transition_specs)
-                else 0,
+                if level_idx < len(self.level_transition_specs) else 0,
                 'meta_stride': self.level_transition_specs[level_idx]['meta_stride']
-                if level_idx < len(self.level_transition_specs)
-                else 0,
+                if level_idx < len(self.level_transition_specs) else 0,
                 'hist_mean_seq': hist_mean_seq[level_idx],
                 'hist_std_seq': hist_std_seq[level_idx],
                 'hist_xbar': xbar_levels[level_idx],
-                'future_mean_recon': future_mean_recon[level_idx],
+                'future_mean_base': future_mean_base[level_idx],
+                'future_std_base': future_std_base[level_idx],
+                'future_mean_final': future_mean_final[level_idx],
+                # legacy key used by denorm / loss callers
+                'future_mean_recon': future_mean_final[level_idx],
                 'stats_loss': 0.0,
             }
-            if max_level > 0 and level_idx < max_level:
-                cache['hist_mean_norm_under'] = hist_mean_norm_under[(level_idx + 1, level_idx)]
-                cache['future_mean_norm_pred'] = future_mean_norm_pred[level_idx]
-            if max_level > 0 and level_idx >= 1:
-                cache['future_mean_pred'] = future_mean_pred[level_idx]
-                cache['future_std_pred'] = future_std_pred[level_idx]
+            if level_idx < max_level:
+                cache['hist_norm_z'] = hist_norm_z[level_idx]
+                cache['future_norm_z_pred'] = future_norm_z_pred[level_idx]
             level_cache.append(cache)
 
-        level_cache[0]['future_std0_pred'] = future_std0_pred
-        level_cache[0]['future_std0_logsigma'] = self._std_to_logsigma(future_std0_pred)
+        # Level-0 std bookkeeping (used by denorm)
+        level_cache[0]['future_std0_pred'] = future_std_base[0]
+        level_cache[0]['future_std0_logsigma'] = self._std_to_logsigma(future_std_base[0])
         return level_cache
-
-    def _build_overlap_summary(
-        self,
-        prev_pred: torch.Tensor,
-        curr_pred: torch.Tensor,
-    ) -> torch.Tensor:
-        horizon = prev_pred.shape[1]
-        if horizon <= 1:
-            if self.ostn_use_patchwise_overlap_summary:
-                return torch.zeros(
-                    1,
-                    0,
-                    prev_pred.shape[2],
-                    4,
-                    device=prev_pred.device,
-                    dtype=prev_pred.dtype,
-                )
-            return torch.zeros(
-                1,
-                prev_pred.shape[2],
-                4,
-                device=prev_pred.device,
-                dtype=prev_pred.dtype,
-            )
-
-        residual = prev_pred[:, 1:, :] - curr_pred[:, :-1, :]
-        if self.ostn_use_patchwise_overlap_summary:
-            return torch.stack(
-                [residual, residual.abs(), residual.pow(2), residual.sign()],
-                dim=-1,
-            )
-        return torch.stack(
-            [
-                residual.mean(dim=1),
-                residual.std(dim=1),
-                residual.abs().mean(dim=1),
-                residual.abs().max(dim=1)[0],
-            ],
-            dim=-1,
-        )
-
-    def _denorm_from_stats(self, pred_norm: torch.Tensor, stats: torch.Tensor) -> torch.Tensor:
-        time_stats = self._stats_to_time_stats(stats, pred_norm.shape[1])
-        mean, std = self._split_stats(time_stats)
-        return pred_norm * (std + self.epsilon) + mean
-
-    def _norm_from_stats(self, pred_denorm: torch.Tensor, stats: torch.Tensor) -> torch.Tensor:
-        time_stats = self._stats_to_time_stats(stats, pred_denorm.shape[1])
-        mean, std = self._split_stats(time_stats)
-        return (pred_denorm - mean) / (std + self.epsilon)
-
-    def reset_ostn_eval_state(self) -> None:
-        self._prev_stream_final_pred = None
-        self._prev_stream_base_final_pred = None
-        self._prev_stream_refined_final_pred = None
-        self._prev_stream_refined_mean = None
-        self._prev_stream_refined_logsigma = None
-        self._prev_stream_overlap_summary = None
-        self._prev_stream_valid = False
-        self._curr_refined_mean = None
-        self._curr_refined_logsigma = None
-        self._curr_base_mean = None
-        self._curr_base_logsigma = None
-        self._last_ostn_applied = False
-        self._last_ostn_alpha_mean = 0.0
-        self._last_ostn_alpha_max = 0.0
-        self._last_ostn_delta_mu_abs_mean = 0.0
-        self._last_ostn_delta_lsig_abs_mean = 0.0
-        self._last_ostn_base_overlap_loss = 0.0
-        self._last_ostn_refined_overlap_loss = 0.0
-        self._last_ostn_base_mu_abs_mean = 0.0
-        self._last_ostn_refined_mu_abs_mean = 0.0
-        self._last_ostn_base_sigma_mean = 0.0
-        self._last_ostn_refined_sigma_mean = 0.0
 
     def normalize(self, input: torch.Tensor) -> torch.Tensor:
         if self.station_type != 'adaptive':
@@ -982,337 +619,15 @@ class SAN(nn.Module):
         self._level0_hist_mu = hist_mean
         self._level0_hist_std = hist_std
         self._level0_hist_lambda = self._std_to_logsigma(hist_std)
-        self._level0_future_final_mu = level0_cache['future_mean_recon']
+        self._level0_future_final_mu = level0_cache['future_mean_final']
         self._level0_future_final_lambda = level0_cache['future_std0_logsigma']
-        self._level0_future_base_mu = self._level0_future_final_mu
-        self._level0_future_base_lambda = self._level0_future_final_lambda
 
-        base_std = level0_cache['future_std0_pred']
-        base_stats = torch.cat([self._level0_future_final_mu, base_std], dim=-1)
-        base_time_stats = self._window_stats_to_time_stats(
-            self._level0_future_final_mu,
-            base_std,
-            self.pred_len,
-        )
-        fused_std = base_std
-        fused_stats = torch.cat([self._level0_future_final_mu, fused_std], dim=-1)
-        fused_time_stats = self._window_stats_to_time_stats(
-            self._level0_future_final_mu,
-            fused_std,
-            self.pred_len,
-        )
-        self._base_pred_stats = base_stats
-        self._base_pred_time_stats = base_time_stats
-        self._refined_pred_stats = fused_stats
-        self._refined_pred_time_stats = fused_time_stats
+        future_mu = level0_cache['future_mean_final']
+        future_std = level0_cache['future_std_base']
+        self._pred_stats = torch.cat([future_mu, future_std], dim=-1)
+        self._pred_time_stats = self._window_stats_to_time_stats(future_mu, future_std, self.pred_len)
 
-        use_ostn = (
-            not self.training
-            and self.ostn_enabled
-            and self._prev_stream_valid
-            and self._prev_stream_overlap_summary is not None
-        )
-
-        if use_ostn:
-            hist_stats_seq = self._build_hist_stats_seq_from_stats(hist_mean, hist_std)
-            overlap_summary = self._prev_stream_overlap_summary.expand(
-                batch_size, *self._prev_stream_overlap_summary.shape[1:]
-            )
-            with torch.no_grad():
-                delta_mu, delta_lsig, alpha = self.ostn_corrector(
-                    hist_stats_seq,
-                    self._level0_future_final_mu.detach(),
-                    self._level0_future_final_lambda.detach(),
-                    overlap_summary,
-                )
-
-            refined_mean = self._level0_future_final_mu + alpha * delta_mu
-            refined_logsigma = self._level0_future_final_lambda + alpha * delta_lsig
-            refined_std = self._logsigma_to_std(refined_logsigma)
-
-            refined_stats = torch.cat([refined_mean, refined_std], dim=-1)
-            refined_time_stats = self._window_stats_to_time_stats(
-                refined_mean,
-                refined_std,
-                self.pred_len,
-            )
-            self._pred_stats = refined_stats
-            self._pred_time_stats = refined_time_stats
-            self._last_ostn_applied = True
-
-            self._level0_future_ostn_mu = refined_mean
-            self._level0_future_ostn_lambda = refined_logsigma
-            self._curr_refined_mean = refined_mean.detach()
-            self._curr_refined_logsigma = refined_logsigma.detach()
-            self._curr_base_mean = self._level0_future_final_mu.detach()
-            self._curr_base_logsigma = self._level0_future_final_lambda.detach()
-
-            with torch.no_grad():
-                self._last_ostn_alpha_mean = float(alpha.detach().mean().item())
-                self._last_ostn_alpha_max = float(alpha.detach().max().item())
-                self._last_ostn_delta_mu_abs_mean = float(delta_mu.detach().abs().mean().item())
-                self._last_ostn_delta_lsig_abs_mean = float(delta_lsig.detach().abs().mean().item())
-                self._last_ostn_base_mu_abs_mean = float(
-                    self._level0_future_final_mu.abs().mean().item()
-                )
-                self._last_ostn_refined_mu_abs_mean = float(refined_mean.abs().mean().item())
-                self._last_ostn_base_sigma_mean = float(fused_std.mean().item())
-                self._last_ostn_refined_sigma_mean = float(refined_std.mean().item())
-        else:
-            self._pred_stats = fused_stats
-            self._pred_time_stats = fused_time_stats
-            self._last_ostn_applied = False
-
-            self._level0_future_ostn_mu = self._level0_future_final_mu
-            self._level0_future_ostn_lambda = self._level0_future_final_lambda
-            self._curr_refined_mean = self._level0_future_final_mu.detach()
-            self._curr_refined_logsigma = self._level0_future_final_lambda.detach()
-            self._curr_base_mean = self._level0_future_final_mu.detach()
-            self._curr_base_logsigma = self._level0_future_final_lambda.detach()
-
-            with torch.no_grad():
-                self._last_ostn_base_mu_abs_mean = float(
-                    self._level0_future_final_mu.abs().mean().item()
-                )
-                self._last_ostn_base_sigma_mean = float(fused_std.mean().item())
-                self._last_ostn_refined_mu_abs_mean = self._last_ostn_base_mu_abs_mean
-                self._last_ostn_refined_sigma_mean = self._last_ostn_base_sigma_mean
-                self._last_ostn_alpha_mean = 0.0
-                self._last_ostn_alpha_max = 0.0
-                self._last_ostn_delta_mu_abs_mean = 0.0
-                self._last_ostn_delta_lsig_abs_mean = 0.0
-
-        if self._oracle_pred_stats is not None:
-            channels = self.channels
-            if self._oracle_mode == 'mean_only':
-                self._pred_stats = torch.cat(
-                    [
-                        self._oracle_pred_stats[:, :, :channels],
-                        self._pred_stats[:, :, channels:],
-                    ],
-                    dim=-1,
-                )
-            elif self._oracle_mode == 'std_only':
-                self._pred_stats = torch.cat(
-                    [
-                        self._pred_stats[:, :, :channels],
-                        self._oracle_pred_stats[:, :, channels:],
-                    ],
-                    dim=-1,
-                )
-            else:
-                self._pred_stats = self._oracle_pred_stats
-            self._pred_time_stats = self._stats_to_time_stats(self._pred_stats, self.pred_len)
-
-        self._final_future_time_stats = self._pred_time_stats
         return norm_input
-
-    def update_ostn_stream_cache(self, final_pred: torch.Tensor) -> None:
-        if not self.ostn_enabled or self.station_type != 'adaptive':
-            return
-
-        curr_tail = final_pred[-1:].detach()
-        curr_base_tail = curr_tail
-        curr_refined_tail = curr_tail
-        if (
-            self._curr_base_mean is not None
-            and self._curr_base_logsigma is not None
-            and self._curr_refined_mean is not None
-            and self._curr_refined_logsigma is not None
-        ):
-            curr_base_std = self._curr_base_logsigma[-1:].detach().exp().clamp(min=self.sigma_min)
-            curr_refined_std = self._curr_refined_logsigma[-1:].detach().exp().clamp(min=self.sigma_min)
-            base_stats = torch.cat([self._curr_base_mean[-1:].detach(), curr_base_std], dim=-1)
-            refined_stats = torch.cat(
-                [self._curr_refined_mean[-1:].detach(), curr_refined_std],
-                dim=-1,
-            )
-            norm_from_refined = self._norm_from_stats(curr_tail, refined_stats)
-            curr_base_tail = self._denorm_from_stats(norm_from_refined, base_stats)
-            curr_refined_tail = self._denorm_from_stats(norm_from_refined, refined_stats)
-
-        if (
-            self._prev_stream_valid
-            and self._prev_stream_base_final_pred is not None
-            and self._prev_stream_refined_final_pred is not None
-        ):
-            self._prev_stream_overlap_summary = self._build_overlap_summary(
-                self._prev_stream_refined_final_pred,
-                curr_refined_tail,
-            )
-
-            if self._prev_stream_base_final_pred.shape[1] > 1:
-                base_residual = (
-                    self._prev_stream_base_final_pred[:, 1:, :] - curr_base_tail[:, :-1, :]
-                )
-                self._last_ostn_base_overlap_loss = float(base_residual.pow(2).mean().item())
-            else:
-                self._last_ostn_base_overlap_loss = 0.0
-
-            if self._prev_stream_refined_final_pred.shape[1] > 1:
-                refined_residual = (
-                    self._prev_stream_refined_final_pred[:, 1:, :] - curr_refined_tail[:, :-1, :]
-                )
-                self._last_ostn_refined_overlap_loss = float(
-                    refined_residual.pow(2).mean().item()
-                )
-            else:
-                self._last_ostn_refined_overlap_loss = 0.0
-
-        if self._curr_refined_mean is not None:
-            self._prev_stream_refined_mean = self._curr_refined_mean[-1:].detach()
-        if self._curr_refined_logsigma is not None:
-            self._prev_stream_refined_logsigma = self._curr_refined_logsigma[-1:].detach()
-
-        self._prev_stream_base_final_pred = curr_base_tail
-        self._prev_stream_refined_final_pred = curr_refined_tail
-        self._prev_stream_final_pred = curr_tail
-        self._prev_stream_valid = True
-
-    def ostn_train_loss(
-        self,
-        x_t: torch.Tensor,
-        y_t: torch.Tensor,
-        x_t1: torch.Tensor,
-        y_t1: torch.Tensor,
-        prev_overlap_summary: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        batch_size, _, channels = x_t.shape
-        device = x_t.device
-
-        with torch.no_grad():
-            hist_windows_t = self._extract_windows(x_t.detach())
-            hist_mean_t, hist_std_t = self._compute_window_stats(hist_windows_t)
-            hist_windows_t1 = self._extract_windows(x_t1.detach())
-            hist_mean_t1, hist_std_t1 = self._compute_window_stats(hist_windows_t1)
-
-            hist_time_stats_t = self._window_stats_to_time_stats(hist_mean_t, hist_std_t, x_t.shape[1])
-            hist_time_mean_t, hist_time_std_t = self._split_stats(hist_time_stats_t)
-            norm_input_t = (x_t - hist_time_mean_t) / (hist_time_std_t + self.epsilon)
-            global_mean_t = x_t.mean(dim=1, keepdim=True)
-
-            hist_time_stats_t1 = self._window_stats_to_time_stats(hist_mean_t1, hist_std_t1, x_t1.shape[1])
-            hist_time_mean_t1, hist_time_std_t1 = self._split_stats(hist_time_stats_t1)
-            norm_input_t1 = (x_t1 - hist_time_mean_t1) / (hist_time_std_t1 + self.epsilon)
-            global_mean_t1 = x_t1.mean(dim=1, keepdim=True)
-
-            base_level_t = self._predict_hierarchical_future_stats(
-                hist_mean_t,
-                hist_std_t,
-                norm_input_t,
-                global_mean_t,
-            )[0]
-            base_level_t1 = self._predict_hierarchical_future_stats(
-                hist_mean_t1,
-                hist_std_t1,
-                norm_input_t1,
-                global_mean_t1,
-            )[0]
-            base_mean_t = base_level_t['future_mean_recon']
-            base_lsig_t = base_level_t['future_std0_logsigma']
-            base_mean_t1 = base_level_t1['future_mean_recon']
-            base_lsig_t1 = base_level_t1['future_std0_logsigma']
-            hist_t = self._build_hist_stats_seq_from_stats(hist_mean_t, hist_std_t)
-            hist_t1 = self._build_hist_stats_seq_from_stats(hist_mean_t1, hist_std_t1)
-
-        oracle_windows_t = self._extract_windows(y_t)
-        oracle_mu_t, oracle_std_t = self._compute_window_stats(oracle_windows_t)
-        oracle_lsig_t = self._std_to_logsigma(oracle_std_t)
-        oracle_windows_t1 = self._extract_windows(y_t1)
-        oracle_mu_t1, oracle_std_t1 = self._compute_window_stats(oracle_windows_t1)
-        oracle_lsig_t1 = self._std_to_logsigma(oracle_std_t1)
-
-        delta_mu_oracle_t = oracle_mu_t - base_mean_t.detach()
-        delta_lsig_oracle_t = oracle_lsig_t - base_lsig_t.detach()
-        delta_mu_oracle_t1 = oracle_mu_t1 - base_mean_t1.detach()
-        delta_lsig_oracle_t1 = oracle_lsig_t1 - base_lsig_t1.detach()
-
-        if prev_overlap_summary is None:
-            if self.ostn_use_patchwise_overlap_summary:
-                overlap_t = torch.zeros(
-                    batch_size,
-                    max(self.pred_len - 1, 0),
-                    channels,
-                    4,
-                    device=device,
-                    dtype=x_t.dtype,
-                )
-            else:
-                overlap_t = torch.zeros(batch_size, channels, 4, device=device, dtype=x_t.dtype)
-        else:
-            overlap_t = prev_overlap_summary.expand(batch_size, *prev_overlap_summary.shape[1:])
-
-        delta_mu_t, delta_lsig_t, alpha_t = self.ostn_corrector(
-            hist_t,
-            base_mean_t.detach(),
-            base_lsig_t.detach(),
-            overlap_t,
-        )
-
-        teacher_residual = (
-            base_mean_t.detach() + alpha_t * delta_mu_t
-        )[:, 1:, :] - base_mean_t1.detach()[:, :-1, :]
-        if self.ostn_use_patchwise_overlap_summary:
-            overlap_t1 = torch.stack(
-                [
-                    teacher_residual,
-                    teacher_residual.abs(),
-                    teacher_residual.pow(2),
-                    teacher_residual.sign(),
-                ],
-                dim=-1,
-            )
-        else:
-            overlap_t1 = torch.stack(
-                [
-                    teacher_residual.mean(dim=1),
-                    teacher_residual.std(dim=1),
-                    teacher_residual.abs().mean(dim=1),
-                    teacher_residual.abs().max(dim=1)[0],
-                ],
-                dim=-1,
-            )
-
-        delta_mu_t1, delta_lsig_t1, alpha_t1 = self.ostn_corrector(
-            hist_t1,
-            base_mean_t1.detach(),
-            base_lsig_t1.detach(),
-            overlap_t1.detach(),
-        )
-
-        refined_mean_t = base_mean_t.detach() + alpha_t * delta_mu_t
-        refined_lsig_t = base_lsig_t.detach() + alpha_t * delta_lsig_t
-        refined_std_t = self._logsigma_to_std(refined_lsig_t)
-
-        refined_mean_t1 = base_mean_t1.detach() + alpha_t1 * delta_mu_t1
-        refined_lsig_t1 = base_lsig_t1.detach() + alpha_t1 * delta_lsig_t1
-        refined_std_t1 = self._logsigma_to_std(refined_lsig_t1)
-
-        stats_t = torch.cat([refined_mean_t, refined_std_t], dim=-1)
-        stats_t1 = torch.cat([refined_mean_t1, refined_std_t1], dim=-1)
-
-        y_t_norm = self._norm_from_stats(y_t, stats_t)
-        y_t1_norm = self._norm_from_stats(y_t1, stats_t1)
-        y_t_corr = self._denorm_from_stats(y_t_norm, stats_t)
-        y_t1_corr = self._denorm_from_stats(y_t1_norm, stats_t1)
-
-        loss_stat = (
-            F.mse_loss(delta_mu_t, delta_mu_oracle_t)
-            + F.mse_loss(delta_lsig_t, delta_lsig_oracle_t)
-            + F.mse_loss(delta_mu_t1, delta_mu_oracle_t1)
-            + F.mse_loss(delta_lsig_t1, delta_lsig_oracle_t1)
-        )
-        if y_t_corr.shape[1] > 1 and y_t1_corr.shape[1] > 1:
-            loss_overlap = F.mse_loss(y_t_corr[:, 1:, :], y_t1_corr[:, :-1, :])
-        else:
-            loss_overlap = torch.tensor(0.0, device=device)
-
-        loss_alpha = alpha_t.mean() + alpha_t1.mean()
-        return (
-            self.ostn_stats_weight * loss_stat
-            + self.ostn_overlap_weight * loss_overlap
-            + self.ostn_alpha_l1 * loss_alpha
-        )
 
     def denormalize(self, input: torch.Tensor, station_pred=None) -> torch.Tensor:
         if station_pred is None:
@@ -1329,132 +644,90 @@ class SAN(nn.Module):
 
         max_level = self.num_levels - 1
         true_windows = self._extract_windows(true)
-        oracle_mean0, oracle_std0 = self._compute_window_stats(true_windows)
-        # _build_recursive_mean_hierarchy: oracle_std_seq[0] is zeros placeholder;
-        # oracle_std_seq[l>=1] are real computed stds of level l-1 mean windowed slices.
-        oracle_mean_seq, oracle_std_seq = self._build_recursive_mean_hierarchy(oracle_mean0)
-
-        # Oracle normalized means for levels 0..L-1
-        oracle_mean_norm: dict[int, torch.Tensor] = {}
-        for level_idx in range(max_level):
-            spec = self.level_transition_specs[level_idx]
-            oracle_mean_lift = self._lift_seq_stats(
-                oracle_mean_seq[level_idx + 1],
-                target_len=oracle_mean_seq[level_idx].shape[1],
-                meta_patch=spec['meta_patch'],
-                meta_stride=spec['meta_stride'],
-            )
-            oracle_std_lift = self._lift_seq_stats(
-                oracle_std_seq[level_idx + 1],
-                target_len=oracle_mean_seq[level_idx].shape[1],
-                meta_patch=spec['meta_patch'],
-                meta_stride=spec['meta_stride'],
-            )
-            oracle_mean_norm[level_idx] = (
-                oracle_mean_seq[level_idx] - oracle_mean_lift
-            ) / (oracle_std_lift + self.epsilon)
+        oracle_mean_seq_l0, oracle_std_seq_l0 = self._compute_window_stats(true_windows)
+        oracle_mean_seq, oracle_std_seq = self._build_recursive_stats_hierarchy(
+            oracle_mean_seq_l0,
+            oracle_std_seq_l0,
+        )
 
         self._last_level_losses = {}
-        level0_cache = self._hierarchy_cache[0]
 
-        # L0_main = L_recon0 + L_std0
-        recon0_loss = F.mse_loss(level0_cache['future_mean_recon'], oracle_mean_seq[0])
-        std0_loss = F.mse_loss(level0_cache['future_std0_pred'], oracle_std0)
-        l0_main = recon0_loss + std0_loss
+        # --- Per-level losses ---
+        # Top-level explicit mean supervision: L_base_mean[top]
+        # Non-top explicit mean supervision:   L_final_mean[l]
+        # All-level sigma supervision:         L_std[l]
+        # future_norm_z_pred remains in the forward path, but is trained only
+        # implicitly through final_mean_loss.
+        base_mean_losses: dict[int, torch.Tensor] = {}
+        std_losses: dict[int, torch.Tensor] = {}
+        final_mean_losses: dict[int, torch.Tensor] = {}
 
-        # Hierarchy losses (only when max_level >= 1)
-        norm_losses: dict[int, torch.Tensor] = {}
-        stats_losses: dict[int, torch.Tensor] = {}
-        cons_losses: dict[int, torch.Tensor] = {}
-
-        if max_level >= 1:
-            # L_norm[l] for l = 0..L-1
-            for level_idx in range(max_level):
-                norm_losses[level_idx] = F.mse_loss(
-                    self._hierarchy_cache[level_idx]['future_mean_norm_pred'],
-                    oracle_mean_norm[level_idx],
+        for level_idx in range(self.num_levels):
+            cache_l = self._hierarchy_cache[level_idx]
+            if level_idx == max_level:
+                base_mean_losses[level_idx] = F.mse_loss(
+                    cache_l['future_mean_base'], oracle_mean_seq[level_idx]
                 )
-            # L_stats[l] = 0.5*(MSE_mean + MSE_std) for l = 1..L
-            for level_idx in range(1, self.num_levels):
-                cache_l = self._hierarchy_cache[level_idx]
-                stats_losses[level_idx] = 0.5 * (
-                    F.mse_loss(cache_l['future_mean_pred'], oracle_mean_seq[level_idx])
-                    + F.mse_loss(cache_l['future_std_pred'], oracle_std_seq[level_idx])
-                )
-            # L_cons[l] = MSE(future_mean_recon[l], future_mean_pred[l]) for middle l = 1..L-1
-            for level_idx in range(1, max_level):
-                cache_l = self._hierarchy_cache[level_idx]
-                cons_losses[level_idx] = F.mse_loss(
-                    cache_l['future_mean_recon'],
-                    cache_l['future_mean_pred'].detach(),
-                )
+            std_losses[level_idx] = F.mse_loss(
+                cache_l['future_std_base'], oracle_std_seq[level_idx]
+            )
 
-        # Weighted hier total
+        for level_idx in range(max_level):
+            cache_l = self._hierarchy_cache[level_idx]
+            final_mean_losses[level_idx] = F.mse_loss(
+                cache_l['future_mean_final'], oracle_mean_seq[level_idx]
+            )
+
+        top_level_weight = 0.20 / (2.0 ** max(max_level - 1, 0)) if self.num_levels > 1 else 1.0
+        weighted_base = top_level_weight * base_mean_losses[max_level]
+        for level_idx in range(self.num_levels):
+            lw = 1.0 if level_idx == 0 else 0.20 / (2.0 ** (level_idx - 1))
+            weighted_base = weighted_base + lw * std_losses[level_idx]
+
         weighted_hier = torch.tensor(0.0, device=true.device, dtype=true.dtype)
-        if max_level == 1:
-            # L=1: norm[0](0.5) + stats[1](0.2)
-            weighted_hier = (
-                0.50 * norm_losses[0]
-                + 0.20 * stats_losses[1]
-            )
-        elif max_level >= 2:
-            # L>=2: norm[0](0.5) + norm[1](0.2) + stats[1](0.2) + stats[2](0.1) + cons[1](0.05)
-            weighted_hier = (
-                0.50 * norm_losses[0]
-                + 0.20 * norm_losses[1]
-                + 0.20 * stats_losses[1]
-                + 0.10 * stats_losses[2]
-                + 0.05 * cons_losses.get(1, torch.tensor(0.0, device=true.device, dtype=true.dtype))
-            )
-            for level_idx in range(3, self.num_levels):
-                w = 0.05 / (2 ** (level_idx - 2))
-                weighted_hier = weighted_hier + w * stats_losses[level_idx]
+        for level_idx in range(max_level):
+            lw = 0.50 / (2.0 ** level_idx)
+            weighted_hier = weighted_hier + lw * final_mean_losses[level_idx]
 
-        total_loss = l0_main + weighted_hier
+        total_loss = weighted_base + weighted_hier
 
-        # --- Update scalar diagnostics ---
+        # --- Scalar diagnostics ---
+        recon0_loss = final_mean_losses.get(0, base_mean_losses[max_level])
+        std0_loss = std_losses[0]
         self._last_recon0_loss = float(recon0_loss.detach().item())
         self._last_std0_loss = float(std0_loss.detach().item())
-        self._last_norm_losses = {l: float(v.detach().item()) for l, v in norm_losses.items()}
-        self._last_stats_losses = {l: float(v.detach().item()) for l, v in stats_losses.items()}
-        self._last_cons_losses = {l: float(v.detach().item()) for l, v in cons_losses.items()}
+        self._last_base_mean_losses = {l: float(v.detach().item()) for l, v in base_mean_losses.items()}
+        self._last_std_losses = {l: float(v.detach().item()) for l, v in std_losses.items()}
+        self._last_final_mean_losses = {l: float(v.detach().item()) for l, v in final_mean_losses.items()}
+        self._last_top_base_mean_loss = float(base_mean_losses[max_level].detach().item())
+        self._last_weighted_base_loss = float(weighted_base.detach().item())
         self._last_weighted_hier_loss = float(weighted_hier.detach().item())
         self._last_total_stats_loss = float(total_loss.detach().item())
         self._last_hier_to_level0_ratio = self._last_weighted_hier_loss / max(
-            float(l0_main.detach().item()), 1e-8
+            float(weighted_base.detach().item()), 1e-8
         )
 
         # --- Per-level cache diagnostics ---
-        # Determine weighted_norm / weighted_stats per level
-        _norm_w: dict[int, float] = {0: 0.50, 1: 0.20}
-        _stats_w: dict[int, float] = {1: 0.20, 2: 0.10}
-        _cons_w: dict[int, float] = {1: 0.05}
-        if max_level == 1:
-            _stats_w = {1: 0.20}
         for level_idx in range(self.num_levels):
             cache = self._hierarchy_cache[level_idx]
-            nl = float(norm_losses[level_idx].detach().item()) if level_idx in norm_losses else 0.0
-            sl = float(stats_losses[level_idx].detach().item()) if level_idx in stats_losses else 0.0
-            cl = float(cons_losses[level_idx].detach().item()) if level_idx in cons_losses else 0.0
-            sm_l = (
-                float(F.mse_loss(cache['future_mean_pred'], oracle_mean_seq[level_idx]).detach().item())
-                if level_idx in stats_losses
-                else 0.0
-            )
-            ss_l = (
-                float(F.mse_loss(cache['future_std_pred'], oracle_std_seq[level_idx]).detach().item())
-                if level_idx in stats_losses
-                else 0.0
-            )
-            w_nl = _norm_w.get(level_idx, 0.0) * nl
-            w_sl = _stats_w.get(level_idx, 0.0) * sl
-            w_cl = _cons_w.get(level_idx, 0.0) * cl
-            cache['norm_loss'] = nl
-            cache['stats_mean_loss'] = sm_l
-            cache['stats_std_loss'] = ss_l
-            cache['cons_loss'] = cl
-            cache['weighted_stats_loss'] = w_nl + w_sl + w_cl
-            cache['stats_loss'] = nl + sl
+            bml = float(base_mean_losses[level_idx].detach().item()) if level_idx in base_mean_losses else 0.0
+            sl = float(std_losses[level_idx].detach().item())
+            fml = float(final_mean_losses[level_idx].detach().item()) if level_idx in final_mean_losses else 0.0
+            cache['base_mean_loss'] = bml
+            cache['std_loss'] = sl
+            cache['final_mean_loss'] = fml
+            cache['stats_loss'] = bml + sl + fml
+            if level_idx == max_level:
+                cache['weighted_stats_loss'] = top_level_weight * bml + (
+                    (1.0 if level_idx == 0 else 0.20 / (2.0 ** (level_idx - 1))) * sl
+                )
+            elif level_idx == 0:
+                cache['weighted_stats_loss'] = sl + 0.50 * fml
+            else:
+                level_weight = 0.20 / (2.0 ** (level_idx - 1))
+                cache['weighted_stats_loss'] = level_weight * sl + (
+                    0.50 / (2.0 ** level_idx)
+                ) * fml
             self._last_level_losses[level_idx] = cache['stats_loss']
 
         return total_loss
@@ -1471,21 +744,17 @@ class SAN(nn.Module):
                         'hist_len': self.level_hist_lens[level_idx],
                         'future_len': self.level_pred_lens[level_idx],
                         'meta_patch': self.level_transition_specs[level_idx]['meta_patch']
-                        if level_idx < len(self.level_transition_specs)
-                        else 0,
+                        if level_idx < len(self.level_transition_specs) else 0,
                         'meta_stride': self.level_transition_specs[level_idx]['meta_stride']
-                        if level_idx < len(self.level_transition_specs)
-                        else 0,
+                        if level_idx < len(self.level_transition_specs) else 0,
                         'stats_loss': self._last_level_losses.get(level_idx, 0.0),
                         'weighted_stats_loss': float(cached.get('weighted_stats_loss', 0.0))
                         if cached is not None else 0.0,
-                        'norm_loss': float(cached.get('norm_loss', 0.0))
+                        'base_mean_loss': float(cached.get('base_mean_loss', 0.0))
                         if cached is not None else 0.0,
-                        'stats_mean_loss': float(cached.get('stats_mean_loss', 0.0))
+                        'std_loss': float(cached.get('std_loss', 0.0))
                         if cached is not None else 0.0,
-                        'stats_std_loss': float(cached.get('stats_std_loss', 0.0))
-                        if cached is not None else 0.0,
-                        'cons_loss': float(cached.get('cons_loss', 0.0))
+                        'final_mean_loss': float(cached.get('final_mean_loss', 0.0))
                         if cached is not None else 0.0,
                     }
                 )
@@ -1500,10 +769,9 @@ class SAN(nn.Module):
                         'meta_stride': 0,
                         'stats_loss': 0.0,
                         'weighted_stats_loss': 0.0,
-                        'norm_loss': 0.0,
-                        'stats_mean_loss': 0.0,
-                        'stats_std_loss': 0.0,
-                        'cons_loss': 0.0,
+                        'base_mean_loss': 0.0,
+                        'std_loss': 0.0,
+                        'final_mean_loss': 0.0,
                     }
                 )
 
@@ -1512,53 +780,46 @@ class SAN(nn.Module):
             'force_extra_levels': self.force_extra_levels,
             'extra_levels': self.num_levels - 1,
             'actual_extra_levels': self.num_levels - 1,
-            'has_level0_absolute_mean_head': self.model is not None,
-            'num_norm_predictors': len(self.hier_norm_predictors),
-            'num_stats_predictors': len(self.hier_stats_predictors),
+            'has_level0_absolute_mean_head': True,
+            'num_level_predictors': len(self.level_predictors),
             'total_stats_loss': self._last_total_stats_loss,
             'recon0_loss': self._last_recon0_loss,
             'std0_loss': self._last_std0_loss,
-            'norm_losses': dict(self._last_norm_losses),
-            'stats_losses': dict(self._last_stats_losses),
-            'cons_losses': dict(self._last_cons_losses),
+            'top_base_mean_loss': self._last_top_base_mean_loss,
+            'weighted_base': self._last_weighted_base_loss,
+            'base_mean_losses': dict(self._last_base_mean_losses),
+            'std_losses': dict(self._last_std_losses),
+            'final_mean_losses': dict(self._last_final_mean_losses),
             'weighted_hier_loss': self._last_weighted_hier_loss,
             'hier_to_level0_ratio': self._last_hier_to_level0_ratio,
             'levels': levels,
         }
 
-    def get_last_ostn_stats(self) -> dict:
-        zero = {
-            'enabled': False,
-            'applied': False,
-            'alpha_mean': 0.0,
-            'alpha_max': 0.0,
-            'delta_mu_abs_mean': 0.0,
-            'delta_logsigma_abs_mean': 0.0,
-            'base_overlap_loss': 0.0,
-            'refined_overlap_loss': 0.0,
-            'base_mu_abs_mean': 0.0,
-            'refined_mu_abs_mean': 0.0,
-            'base_sigma_mean': 0.0,
-            'refined_sigma_mean': 0.0,
-            'hierarchical': self.get_last_hierarchical_stats(),
+    def get_last_aux_stats(self) -> dict:
+        stats: dict[str, float] = {
+            'aux_total': self._last_total_stats_loss,
+            'weighted_base': self._last_weighted_base_loss,
+            'weighted_hier': self._last_weighted_hier_loss,
+            'total_stats_loss': self._last_total_stats_loss,
+            'top_base_mean_loss': self._last_top_base_mean_loss,
+            'L_easy': 0.0,
+            'L_white': 0.0,
+            'L_js': 0.0,
+            'L_w1': 0.0,
+            'L_min': 0.0,
+            'L_e_tv': 0.0,
+            'ratio_n_bc_mean': 0.0,
+            'ratio_n_bc_min': 0.0,
+            'ratio_n_bc_max': 0.0,
+            'loss_n_ratio_budget': 0.0,
+            'pred_n_loss': 0.0,
+            'L_sparse': 0.0,
+            'L_u_tv': 0.0,
         }
-        if not self.ostn_enabled:
-            return zero
-        return {
-            'enabled': True,
-            'applied': self._last_ostn_applied,
-            'alpha_mean': self._last_ostn_alpha_mean,
-            'alpha_max': self._last_ostn_alpha_max,
-            'delta_mu_abs_mean': self._last_ostn_delta_mu_abs_mean,
-            'delta_logsigma_abs_mean': self._last_ostn_delta_lsig_abs_mean,
-            'base_overlap_loss': self._last_ostn_base_overlap_loss,
-            'refined_overlap_loss': self._last_ostn_refined_overlap_loss,
-            'base_mu_abs_mean': self._last_ostn_base_mu_abs_mean,
-            'refined_mu_abs_mean': self._last_ostn_refined_mu_abs_mean,
-            'base_sigma_mean': self._last_ostn_base_sigma_mean,
-            'refined_sigma_mean': self._last_ostn_refined_sigma_mean,
-            'hierarchical': self.get_last_hierarchical_stats(),
-        }
+        for level_idx in range(self.MAX_EXTRA_LEVELS + 1):
+            stats[f'std_loss_l{level_idx}'] = self._last_std_losses.get(level_idx, 0.0)
+            stats[f'final_mean_loss_l{level_idx}'] = self._last_final_mean_losses.get(level_idx, 0.0)
+        return stats
 
     def forward(self, batch_x, mode='n', station_pred=None):
         if mode == 'n':
@@ -1587,6 +848,8 @@ class _MLP(nn.Module):
         self.stats_input = nn.Linear(hist_stat_len, hidden_dim)
         self.raw_input = nn.Linear(raw_hist_len, hidden_dim)
         self.output = nn.Linear(2 * hidden_dim, pred_stat_len)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
 
         if mode == 'mu':
             self.activation = nn.Tanh()
@@ -1621,20 +884,27 @@ class _MLP(nn.Module):
         return pred
 
 
-class _HierStatsPredictor(nn.Module):
-    """Predict absolute future mean and std for hierarchy levels >= 1.
 
-    Used as `hier_stats_predictors[l-1]` for level l in 1..L.
-    All three inputs are fused through a shared trunk before forking into
-    two output heads.
+class _SANLevelPredictor(nn.Module):
+    """Uniform SAN-style predictor for a single hierarchy level.
 
-    Inputs  (B, N_l, C):
-        hist_mu_mean  – hist_mean_seq[l]
-        hist_mu_std   – hist_std_seq[l]
-        xbar_raw_like – patch-averaged raw-input representation at level l
-    Outputs (B, pred_l, C):
-        future_mean_pred  – absolute future mean at level l
-        future_std_pred   – absolute future std at level l (always >= sigma_min)
+    Every level has the same structure:
+      - mean_head: anchor + residual prediction of future mean (same as original SAN).
+      - std_head:  direct sigma prediction of future std.
+      - norm_z_head (non-top levels only): predicts the normed residual under the upper level.
+
+    Inputs to predict_base (B, N_l, C):
+        hist_mean   – hist_mean_seq[l]
+        hist_std    – hist_std_seq[l]
+        xbar        – xbar_levels[l] (normed input signal at this level)
+        anchor      – (B, 1, C) anchor for mean head, always from this level's own
+                      history mean: hist_mean_seq[l].mean(dim=1, keepdim=True)
+
+    Inputs to predict_norm_z (non-top only):
+        hist_mean        – hist_mean_seq[l]
+        upper_hist_std   – lifted hist_std_seq[l+1] (upper-level std context)
+        xbar             – xbar_levels[l]
+        hist_norm_z      – hist normed residual z_l = (hist_mean[l] - upper_hist_mean_lift)/(upper_std+eps)
     """
 
     def __init__(
@@ -1644,73 +914,76 @@ class _HierStatsPredictor(nn.Module):
         pred_stat_len: int,
         enc_in: int,
         sigma_min: float = 1e-3,
+        has_norm_z_head: bool = True,
         hidden_dim: int = 512,
     ):
         super().__init__()
         self.pred_stat_len = pred_stat_len
         self.sigma_min = sigma_min
+        self.has_norm_z_head = has_norm_z_head
 
-        self.enc_mu_mean = nn.Sequential(nn.Linear(hist_stat_len, hidden_dim), nn.GELU())
-        self.enc_mu_std  = nn.Sequential(nn.Linear(hist_stat_len, hidden_dim), nn.GELU())
-        self.enc_xbar    = nn.Sequential(nn.Linear(raw_hist_len,  hidden_dim), nn.GELU())
-
-        self.trunk = nn.Sequential(nn.Linear(3 * hidden_dim, hidden_dim), nn.GELU())
-
-        self.head_mean = nn.Linear(hidden_dim, pred_stat_len)
-        self.head_std  = nn.Linear(hidden_dim, pred_stat_len)
-
-    def forward(
-        self,
-        hist_mu_mean: torch.Tensor,
-        hist_mu_std: torch.Tensor,
-        xbar_raw_like: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # (B, L, C) -> (B, C, L) for time-axis linear
-        h_mean = self.enc_mu_mean(hist_mu_mean.permute(0, 2, 1))
-        h_std  = self.enc_mu_std(hist_mu_std.permute(0, 2, 1))
-        h_xbar = self.enc_xbar(xbar_raw_like.permute(0, 2, 1))
-
-        h_trunk = self.trunk(torch.cat([h_mean, h_std, h_xbar], dim=-1))
-
-        # (B, C, pred_stat_len) -> (B, pred_stat_len, C)
-        future_mean_pred = self.head_mean(h_trunk).permute(0, 2, 1)
-        future_std_pred  = (
-            F.softplus(self.head_std(h_trunk)).permute(0, 2, 1).clamp(min=self.sigma_min)
+        # mean_head: reuses _MLP in 'mu' mode (anchor + residual)
+        self.mean_head = _MLP(
+            hist_stat_len=hist_stat_len,
+            raw_hist_len=raw_hist_len,
+            pred_stat_len=pred_stat_len,
+            enc_in=enc_in,
+            mode='mu',
         )
-        return future_mean_pred, future_std_pred
 
+        # std_head: reuses _MLP in 'lambda' mode (direct sigma prediction)
+        self.std_head = _MLP(
+            hist_stat_len=hist_stat_len,
+            raw_hist_len=raw_hist_len,
+            pred_stat_len=pred_stat_len,
+            enc_in=enc_in,
+            mode='lambda',
+        )
 
-class _HierNormPredictor(nn.Module):
-    """Predict normalized future mean for non-top hierarchy levels."""
+        # norm_z_head: predicts zhat = z (normed residual under upper level); non-top only
+        if has_norm_z_head:
+            self.enc_mean  = nn.Sequential(nn.Linear(hist_stat_len, hidden_dim), nn.GELU())
+            self.enc_ustd  = nn.Sequential(nn.Linear(hist_stat_len, hidden_dim), nn.GELU())
+            self.enc_xbar  = nn.Sequential(nn.Linear(raw_hist_len, hidden_dim), nn.GELU())
+            self.enc_normz = nn.Sequential(nn.Linear(hist_stat_len, hidden_dim), nn.GELU())
+            self.trunk_z   = nn.Sequential(nn.Linear(4 * hidden_dim, hidden_dim), nn.GELU())
+            self.head_z    = nn.Linear(hidden_dim, pred_stat_len)
+            nn.init.zeros_(self.head_z.weight)
+            nn.init.zeros_(self.head_z.bias)
 
-    def __init__(
+    def predict_base(
         self,
-        hist_stat_len: int,
-        raw_hist_len: int,
-        pred_stat_len: int,
-        enc_in: int,
-        hidden_dim: int = 512,
-    ):
-        super().__init__()
-        self.pred_stat_len = pred_stat_len
+        hist_mean: torch.Tensor,
+        hist_std: torch.Tensor,
+        xbar: torch.Tensor,
+        anchor: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (future_mean_base, future_std_base) for this level."""
+        future_mean = self.mean_head(
+            hist_mean - anchor.expand(-1, hist_mean.shape[1], -1),
+            xbar,
+            anchor,
+        )
+        future_std = self.std_head(
+            hist_std,
+            xbar,
+            None,
+        ).clamp(min=self.sigma_min)
+        return future_mean, future_std
 
-        self.enc_mu_mean = nn.Sequential(nn.Linear(hist_stat_len, hidden_dim), nn.GELU())
-        self.enc_mu_std = nn.Sequential(nn.Linear(hist_stat_len, hidden_dim), nn.GELU())
-        self.enc_xbar = nn.Sequential(nn.Linear(raw_hist_len, hidden_dim), nn.GELU())
-        self.enc_norm = nn.Sequential(nn.Linear(hist_stat_len, hidden_dim), nn.GELU())
-        self.trunk = nn.Sequential(nn.Linear(4 * hidden_dim, hidden_dim), nn.GELU())
-        self.head_norm = nn.Linear(hidden_dim, pred_stat_len)
-
-    def forward(
+    def predict_norm_z(
         self,
-        hist_mu_mean: torch.Tensor,
-        hist_mu_std: torch.Tensor,
-        xbar_raw_like: torch.Tensor,
-        hist_mean_norm_under: torch.Tensor,
+        hist_mean: torch.Tensor,
+        upper_hist_std: torch.Tensor,
+        xbar: torch.Tensor,
+        hist_norm_z: torch.Tensor,
     ) -> torch.Tensor:
-        h_mean = self.enc_mu_mean(hist_mu_mean.permute(0, 2, 1))
-        h_std = self.enc_mu_std(hist_mu_std.permute(0, 2, 1))
-        h_xbar = self.enc_xbar(xbar_raw_like.permute(0, 2, 1))
-        h_norm = self.enc_norm(hist_mean_norm_under.permute(0, 2, 1))
-        h_trunk = self.trunk(torch.cat([h_mean, h_std, h_xbar, h_norm], dim=-1))
-        return self.head_norm(h_trunk).permute(0, 2, 1)
+        """Predict zhat_l (normed residual under upper level). Only valid when has_norm_z_head."""
+        if not self.has_norm_z_head:
+            raise ValueError("predict_norm_z called on a top-level predictor without norm_z_head.")
+        h_mean  = self.enc_mean(hist_mean.permute(0, 2, 1))
+        h_ustd  = self.enc_ustd(upper_hist_std.permute(0, 2, 1))
+        h_xbar  = self.enc_xbar(xbar.permute(0, 2, 1))
+        h_normz = self.enc_normz(hist_norm_z.permute(0, 2, 1))
+        h_trunk = self.trunk_z(torch.cat([h_mean, h_ustd, h_xbar, h_normz], dim=-1))
+        return self.head_z(h_trunk).permute(0, 2, 1)
