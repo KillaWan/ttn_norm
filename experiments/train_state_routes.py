@@ -4,7 +4,7 @@ First version: single experiment, no state/path routing.
 Uses SANRouteNorm as the normalization module (a clean single-level SAN base).
 
 Result directory layout:
-    results/state_routes/<exp_name>/<dataset>/<backbone>/base/
+    results/state_routes/<exp_name>/<dataset>/<backbone>/pred_len_<pred_len>/base/
         trials.jsonl    — one trial per line
         summary.json    — mean/std over trials
         config.json     — full config snapshot
@@ -35,6 +35,7 @@ from ttn_norm.experiments.train import (
     _build_backbone_kwargs,
     _build_dataloader,
     _build_metrics,
+    _move_model_to_device,
     _set_seed,
 )
 from ttn_norm.models import TTNModel
@@ -58,7 +59,7 @@ class StateRouteConfig:
     data_path: str = "./data"
     split_type: str = "ratio"
     train_ratio: float = 0.7
-    val_ratio: float = 0.2
+    val_ratio: float = 0.1
     freq: str = "h"
     scaler_type: str = "StandarScaler"
     scale_in_train: bool = False
@@ -73,6 +74,7 @@ class StateRouteConfig:
 
     # Training
     device: str = "cuda:0"
+    cuda_oom_cpu_fallback: bool = False
     seeds: str = "1"          # comma-separated list of seeds to run
     epochs: int = 1000
     lr: float = 1.5e-4
@@ -99,6 +101,11 @@ class StateRouteConfig:
     san_w_mu: float = 1.0
     san_w_std: float = 1.0
 
+    # Route path / state
+    route_path: str = "none"
+    route_state: str = "none"
+    route_state_loss_scale: float = 0.1
+
     # Results
     result_dir: str = "./results/state_routes"
 
@@ -120,6 +127,9 @@ def _build_san_route_model(cfg: StateRouteConfig, num_features: int) -> TTNModel
         sigma_min=cfg.san_sigma_min,
         w_mu=cfg.san_w_mu,
         w_std=cfg.san_w_std,
+        route_path=cfg.route_path,
+        route_state=cfg.route_state,
+        route_state_loss_scale=cfg.route_state_loss_scale,
     )
     # Delegate backbone construction to the existing train.py utility.
     # Build a minimal TrainConfig to satisfy _build_backbone_kwargs signature.
@@ -169,12 +179,16 @@ def _train_epoch(
     optimizer: torch.optim.Optimizer,
     cfg: StateRouteConfig,
     epoch: int,
-) -> float:
+) -> dict[str, float]:
     model.train()
     loss_fn = nn.MSELoss()
     aux_scale = _aux_scale(cfg, epoch)
-    total_loss = 0.0
-    n_batches = 0
+    total_losses: list[float] = []
+    task_losses: list[float] = []
+    aux_losses: list[float] = []
+    mu_losses: list[float] = []
+    std_losses: list[float] = []
+    route_state_losses: list[float] = []
 
     for batch_x, batch_y, _origin_y, _batch_x_enc, _batch_y_enc in train_loader:
         batch_x = batch_x.to(cfg.device).float()
@@ -193,10 +207,25 @@ def _train_epoch(
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
         optimizer.step()
 
-        total_loss += loss.item()
-        n_batches += 1
+        total_losses.append(float(loss.item()))
+        task_losses.append(float(task_loss.item()))
+        aux_losses.append(float(aux_loss.item()))
+        if hasattr(model.nm, "get_last_aux_stats"):
+            aux_stats = model.nm.get_last_aux_stats()
+            mu_losses.append(float(aux_stats.get("mu_loss", 0.0)))
+            std_losses.append(float(aux_stats.get("std_loss", 0.0)))
+            route_state_losses.append(float(aux_stats.get("route_state_loss", 0.0)))
 
-    return total_loss / max(n_batches, 1)
+    return {
+        "total_loss": float(np.mean(total_losses)) if total_losses else 0.0,
+        "task_loss": float(np.mean(task_losses)) if task_losses else 0.0,
+        "aux_loss": float(np.mean(aux_losses)) if aux_losses else 0.0,
+        "aux_total": float(np.mean(aux_losses)) if aux_losses else 0.0,
+        "mu_loss": float(np.mean(mu_losses)) if mu_losses else 0.0,
+        "std_loss": float(np.mean(std_losses)) if std_losses else 0.0,
+        "route_state_loss": float(np.mean(route_state_losses)) if route_state_losses else 0.0,
+        "aux_scale": float(aux_scale),
+    }
 
 
 @torch.no_grad()
@@ -210,10 +239,30 @@ def _eval_loader(
     for metric in metrics.values():
         metric.reset()
 
+    loss_fn = nn.MSELoss()
+    task_losses: list[float] = []
+    aux_losses: list[float] = []
+    mu_losses: list[float] = []
+    std_losses: list[float] = []
+    route_state_losses: list[float] = []
+
     for batch_x, batch_y, _origin_y, _batch_x_enc, _batch_y_enc in loader:
         batch_x = batch_x.to(cfg.device).float()
         batch_y = batch_y.to(cfg.device).float()
         pred = model(batch_x)
+        task_loss = loss_fn(pred, batch_y)
+        task_losses.append(float(task_loss.item()))
+
+        aux_loss = torch.tensor(0.0, device=batch_x.device)
+        if hasattr(model.nm, "loss"):
+            aux_loss = model.nm.loss(batch_y)
+        aux_losses.append(float(aux_loss.item()))
+        if hasattr(model.nm, "get_last_aux_stats"):
+            aux_stats = model.nm.get_last_aux_stats()
+            mu_losses.append(float(aux_stats.get("mu_loss", 0.0)))
+            std_losses.append(float(aux_stats.get("std_loss", 0.0)))
+            route_state_losses.append(float(aux_stats.get("route_state_loss", 0.0)))
+
         if cfg.pred_len == 1:
             B = pred.shape[0]
             pred = pred.contiguous().view(B, -1)
@@ -221,7 +270,18 @@ def _eval_loader(
         for metric in metrics.values():
             metric.update(pred, batch_y)
 
-    return {name: float(m.compute()) for name, m in metrics.items()}
+    results = {name: float(m.compute()) for name, m in metrics.items()}
+    results.update(
+        {
+            "task_loss": float(np.mean(task_losses)) if task_losses else 0.0,
+            "aux_loss": float(np.mean(aux_losses)) if aux_losses else 0.0,
+            "aux_total": float(np.mean(aux_losses)) if aux_losses else 0.0,
+            "mu_loss": float(np.mean(mu_losses)) if mu_losses else 0.0,
+            "std_loss": float(np.mean(std_losses)) if std_losses else 0.0,
+            "route_state_loss": float(np.mean(route_state_losses)) if route_state_losses else 0.0,
+        }
+    )
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +320,7 @@ def _run_trial(cfg: StateRouteConfig, seed: int, ckpt_path: str) -> dict[str, An
         f" test={dataloader.test_size}"
     )
 
-    model = _build_san_route_model(cfg, num_features).to(cfg.device)
+    model = _move_model_to_device(_build_san_route_model(cfg, num_features), cfg)
     optimizer = torch.optim.Adam(
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
     )
@@ -276,10 +336,14 @@ def _run_trial(cfg: StateRouteConfig, seed: int, ckpt_path: str) -> dict[str, An
     t0 = time.time()
 
     for epoch in range(cfg.epochs):
-        train_loss = _train_epoch(model, dataloader.train_loader, optimizer, cfg, epoch)
+        train_stats = _train_epoch(model, dataloader.train_loader, optimizer, cfg, epoch)
+
         val_metrics = _eval_loader(model, dataloader.val_loader, cfg, metrics)
         val_mse = val_metrics["mse"]
         val_mae = val_metrics["mae"]
+        test_metrics = _eval_loader(model, dataloader.test_loader, cfg, metrics)
+        epoch_test_mse = test_metrics["mse"]
+        epoch_test_mae = test_metrics["mae"]
 
         improved = val_mse < best_val_mse - cfg.early_stop_delta
         if improved:
@@ -288,23 +352,31 @@ def _run_trial(cfg: StateRouteConfig, seed: int, ckpt_path: str) -> dict[str, An
             best_epoch = epoch + 1
             patience_counter = 0
             torch.save(model.state_dict(), ckpt_path)
-
-            test_metrics = _eval_loader(model, dataloader.test_loader, cfg, metrics)
             best_test_mse = test_metrics["mse"]
             best_test_mae = test_metrics["mae"]
         else:
             patience_counter += 1
 
-        aux_stats = {}
-        if hasattr(model.nm, "get_last_aux_stats"):
-            aux_stats = model.nm.get_last_aux_stats()
-
         print(
-            f"[epoch {epoch+1:4d}] train_loss={train_loss:.6f}"
+            f"[epoch {epoch+1:4d}]"
+            f"  train_total={train_stats['total_loss']:.6f}"
+            f"  train_task={train_stats['task_loss']:.6f}"
+            f"  train_aux={train_stats['aux_loss']:.6f}"
+            f"  train_mu={train_stats['mu_loss']:.4e}"
+            f"  train_std={train_stats['std_loss']:.4e}"
+            f"  train_route_state={train_stats['route_state_loss']:.4e}"
             f"  val_mse={val_mse:.6f}  val_mae={val_mae:.6f}"
-            f"  aux_total={aux_stats.get('aux_total', 0.0):.4e}"
-            f"  mu_loss={aux_stats.get('mu_loss', 0.0):.4e}"
-            f"  std_loss={aux_stats.get('std_loss', 0.0):.4e}"
+            f"  val_task={val_metrics['task_loss']:.6f}"
+            f"  val_aux={val_metrics['aux_loss']:.6f}"
+            f"  val_mu={val_metrics['mu_loss']:.4e}"
+            f"  val_std={val_metrics['std_loss']:.4e}"
+            f"  val_route_state={val_metrics['route_state_loss']:.4e}"
+            f"  test_mse={epoch_test_mse:.6f}  test_mae={epoch_test_mae:.6f}"
+            f"  test_task={test_metrics['task_loss']:.6f}"
+            f"  test_aux={test_metrics['aux_loss']:.6f}"
+            f"  test_mu={test_metrics['mu_loss']:.4e}"
+            f"  test_std={test_metrics['std_loss']:.4e}"
+            f"  test_route_state={test_metrics['route_state_loss']:.4e}"
             + ("  *" if improved else "")
         )
 
@@ -317,7 +389,7 @@ def _run_trial(cfg: StateRouteConfig, seed: int, ckpt_path: str) -> dict[str, An
             break
 
     train_time = time.time() - t0
-    return {
+    result = {
         "exp_name": cfg.exp_name,
         "dataset": cfg.dataset,
         "backbone": cfg.backbone,
@@ -332,6 +404,13 @@ def _run_trial(cfg: StateRouteConfig, seed: int, ckpt_path: str) -> dict[str, An
         "train_time_sec": round(train_time, 1),
     }
 
+    # Explicitly release GPU memory before the next trial
+    del model, optimizer, metrics
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return result
+
 
 # ---------------------------------------------------------------------------
 # Results I/O
@@ -343,7 +422,9 @@ def _result_dir(cfg: StateRouteConfig) -> str:
         cfg.exp_name,
         cfg.dataset,
         cfg.backbone,
-        "base",
+        f"pred_len_{cfg.pred_len}",
+        f"path_{cfg.route_path}",
+        f"state_{cfg.route_state}",
     )
 
 
@@ -421,6 +502,8 @@ def main(argv=None):
           f"  backbone={cfg.backbone}  window={cfg.window}  pred_len={cfg.pred_len}")
     print(f"[Config] seeds={seeds}  san_period_len={cfg.san_period_len}"
           f"  san_stride={cfg.san_stride}  device={cfg.device}")
+    print(f"[Config] route_path={cfg.route_path}  route_state={cfg.route_state}"
+          f"  route_state_loss_scale={cfg.route_state_loss_scale}")
 
     trials: list[dict] = []
     with tempfile.TemporaryDirectory() as tmp_dir:

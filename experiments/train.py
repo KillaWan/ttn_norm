@@ -31,9 +31,18 @@ def _parse_type(name: str):
     _ensure_fan_on_path()
     import torch_timeseries.datasets as datasets
 
-    if not hasattr(datasets, name):
+    aliases = {
+        "exchange": "ExchangeRate",
+        "exchange_rate": "ExchangeRate",
+        "electricity": "Electricity",
+        "traffic": "Traffic",
+        "weather": "Weather",
+    }
+    resolved_name = aliases.get(name, aliases.get(name.lower(), name))
+
+    if not hasattr(datasets, resolved_name):
         raise ValueError(f"Unknown dataset type: {name}")
-    return getattr(datasets, name)
+    return getattr(datasets, resolved_name)
 
 
 def _parse_scaler(name: str):

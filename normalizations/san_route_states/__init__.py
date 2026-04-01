@@ -1,0 +1,27 @@
+"""san_route_states — explicit registry for route state implementations."""
+from __future__ import annotations
+
+from .base import RouteStateBase
+from .dlogsigma import DLogSigmaState
+from .nu import NuState
+
+_REGISTRY = {
+    "nu": NuState,
+    "dlogsigma": DLogSigmaState,
+}
+
+
+def build_route_state(route_state: str) -> RouteStateBase:
+    """Return a constructed route state instance.
+
+    Args:
+        route_state: One of the registered state names.
+    """
+    if route_state not in _REGISTRY:
+        raise ValueError(
+            f"Unknown route_state '{route_state}'. Registered: {list(_REGISTRY)}"
+        )
+    return _REGISTRY[route_state]()
+
+
+__all__ = ["RouteStateBase", "NuState", "DLogSigmaState", "build_route_state"]
