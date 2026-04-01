@@ -334,20 +334,24 @@ class SANRouteNorm(nn.Module):
         return mean + (std + self.epsilon) * y_norm
 
     def loss(self, y_true: torch.Tensor) -> torch.Tensor:
-        """Aux loss: MSE on predicted vs oracle future window stats.
+        """Aux loss: MSE on base predictor outputs vs oracle future window stats.
 
-        aux_total = w_mu * MSE(mu_fut_hat, oracle_mu)
-                  + w_std * MSE(std_fut_hat, oracle_std)
+        mu_loss and std_loss supervise the base SAN predictor only (not routed finals).
+        route_state_loss is an additional term that supervises the route state predictor.
+
+        aux_total = w_mu * MSE(base_mu_fut_hat, oracle_mu)
+                  + w_std * MSE(base_std_fut_hat, oracle_std)
                   + route_state_loss_scale * route_state_loss
         """
-        if self._mu_fut_hat is None or self._std_fut_hat is None:
+        if self._base_mu_fut_hat is None or self._base_std_fut_hat is None:
             return torch.tensor(0.0, device=y_true.device)
 
         true_windows = self._extract_windows(y_true)
         oracle_mu, oracle_std = self._compute_window_stats(true_windows)
 
-        mu_loss = F.mse_loss(self._mu_fut_hat, oracle_mu)
-        std_loss = F.mse_loss(self._std_fut_hat, oracle_std)
+        # Base SAN aux loss — supervises the base predictor, not the routed finals
+        mu_loss = F.mse_loss(self._base_mu_fut_hat, oracle_mu)
+        std_loss = F.mse_loss(self._base_std_fut_hat, oracle_std)
 
         if self.route_path != "none" and self._route_future_state_hat is not None:
             future_oracle_state = self.route_state_impl.build_future_oracle_state(
@@ -359,6 +363,8 @@ class SANRouteNorm(nn.Module):
         else:
             route_state_loss = torch.tensor(0.0, device=y_true.device)
             self._last_route_state_loss = 0.0
+
+        self._route_state_loss = self._last_route_state_loss
 
         aux_total = (
             self.w_mu * mu_loss
