@@ -9,9 +9,6 @@ future_oracle_state:
 
 adapt_future_state:
     Identity.
-
-path_kwargs_for("affine_residual"):
-    affect_mu=True, affect_logsigma=False
 """
 from __future__ import annotations
 
@@ -28,6 +25,8 @@ class NuState(RouteStateBase):
 
     def extract_hist_state(
         self,
+        x_hist: torch.Tensor,
+        hist_windows: torch.Tensor,
         mu_hist: torch.Tensor,
         std_hist: torch.Tensor,
         sigma_min: float,
@@ -38,6 +37,8 @@ class NuState(RouteStateBase):
 
     def build_future_oracle_state(
         self,
+        y_true: torch.Tensor,
+        fut_windows: torch.Tensor,
         oracle_mu: torch.Tensor,
         oracle_std: torch.Tensor,
         sigma_min: float,
@@ -51,8 +52,3 @@ class NuState(RouteStateBase):
         future_state_hat_raw: torch.Tensor,
     ) -> torch.Tensor:
         return future_state_hat_raw
-
-    def path_kwargs_for(self, route_path: str) -> dict:
-        if route_path == "affine_residual":
-            return {"affect_mu": True, "affect_logsigma": False}
-        raise ValueError(f"NuState has no path_kwargs for route_path='{route_path}'")

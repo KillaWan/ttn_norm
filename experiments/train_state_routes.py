@@ -102,6 +102,9 @@ class StateRouteConfig:
     san_w_std: float = 1.0
 
     # Route path / state
+    # route_path: "none" | "local_transport" | "residual_content" | "alignment" | "gating"
+    #             "local_value_parameter" is a backward-compat alias for "local_transport"
+    # route_state: "none" | "nu" | "dlogsigma"
     route_path: str = "none"
     route_state: str = "none"
     route_state_loss_scale: float = 0.1
