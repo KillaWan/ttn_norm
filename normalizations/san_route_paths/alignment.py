@@ -43,6 +43,11 @@ class AlignmentPath(nn.Module):
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
+        # Diagnostic cache (read via get_route_diagnostics, not part of loss)
+        self._diag_mean_abs_tau_shift: float = 0.0
+        self._diag_mean_abs_local_speed_minus_1: float = 0.0
+        self._diag_mean_tau_curvature: float = 0.0
+
     def forward(
         self,
         y_norm: torch.Tensor,
@@ -77,4 +82,24 @@ class AlignmentPath(nn.Module):
         y_ceil  = y_base.gather(1, tau_ceil)                  # (B, H, C)
 
         y_route = y_floor * (1.0 - frac) + y_ceil * frac
+
+        with torch.no_grad():
+            t_grid = torch.arange(H, device=y_base.device, dtype=y_base.dtype).view(1, H, 1)
+            self._diag_mean_abs_tau_shift = float((tau_norm - t_grid).abs().mean().item())
+            # Local speed = v / mean(v) per (B, C); deviation from 1 measures non-uniformity
+            v_mean = v.mean(dim=1, keepdim=True).clamp_min(1e-8)
+            self._diag_mean_abs_local_speed_minus_1 = float((v / v_mean - 1.0).abs().mean().item())
+            # Curvature: mean absolute second difference of tau_norm
+            increments = tau_norm[:, 1:, :] - tau_norm[:, :-1, :]  # (B, H-1, C)
+            if increments.shape[1] >= 2:
+                curvature = (increments[:, 1:, :] - increments[:, :-1, :]).abs().mean()
+                self._diag_mean_tau_curvature = float(curvature.item())
+
         return y_route
+
+    def get_route_diagnostics(self) -> dict:
+        return {
+            "mean_abs_tau_shift": self._diag_mean_abs_tau_shift,
+            "mean_abs_local_speed_minus_1": self._diag_mean_abs_local_speed_minus_1,
+            "mean_tau_curvature": self._diag_mean_tau_curvature,
+        }

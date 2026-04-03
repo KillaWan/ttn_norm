@@ -5,7 +5,7 @@ Canonical paths:
     local_transport    — monotonic PL spline (LocalTransportPath)
     residual_content   — dilated-TCN additive delta (ResidualContentPath)
     alignment          — monotonic temporal warping (AlignmentPath)
-    gating             — 4-expert soft-gating bank (GatingPath)
+    gating             — state-conditioned factor coefficient assignment (GatingPath)
 
 Aliases (for backward compatibility):
     local_value_parameter → local_transport

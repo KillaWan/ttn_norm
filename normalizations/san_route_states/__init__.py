@@ -4,10 +4,12 @@ from __future__ import annotations
 from .base import RouteStateBase
 from .dlogsigma import DLogSigmaState
 from .nu import NuState
+from .omega_spec import OmegaSpecState
 
 _REGISTRY = {
     "nu": NuState,
     "dlogsigma": DLogSigmaState,
+    "omega_spec": OmegaSpecState,
 }
 
 
@@ -24,4 +26,10 @@ def build_route_state(route_state: str) -> RouteStateBase:
     return _REGISTRY[route_state]()
 
 
-__all__ = ["RouteStateBase", "NuState", "DLogSigmaState", "build_route_state"]
+__all__ = [
+    "RouteStateBase",
+    "NuState",
+    "DLogSigmaState",
+    "OmegaSpecState",
+    "build_route_state",
+]

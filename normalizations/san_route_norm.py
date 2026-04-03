@@ -1,15 +1,27 @@
-# Single-level SAN base (SANRouteNorm).
-#
-# Derived from the original multi-level SAN (san.py) by removing all hierarchy logic.
-# Retains the core SAN design:
-#   - Slice/patch-level mean and std computation from history windows
-#   - Slice-level affine normalization:  z = (x - mu_hist_t) / (std_hist_t + eps)
-#   - Future mean/std prediction via anchor+residual MLP
-#   - Denormalization:  y_base = mu_base_fut_t + (std_base_fut_t + eps) * y_norm
-#   - Simple MSE aux loss on predicted vs oracle future window stats
-#
-# Route paths are output-side operators: they transform y_base inside denormalize(),
-# not the base mu/std tensors.  normalize() only prepares and caches state features.
+"""SANRouteNorm — base SAN + output-side route framework.
+
+Design principles
+-----------------
+- This is a normalization-centric framework.  Route modules do NOT modify the
+    backbone operator and do NOT modify the base mu/std predictor.
+- Route operates only on the output side: inside denormalize(), route_path_impl
+    transforms y_base after base denormalization.
+- normalize() prepares and caches all state features needed by denormalize() and loss().
+- The base predictor (nm.predictor) is always trained in Stage 1.  Route modules
+    (nm.route_state_predictor, nm.route_path_impl) are trained in Stage 3 only.
+- By default, route-state features are normalised by _normalize_patch_state()
+    at the framework layer, so individual state implementations need not standardise.
+- omega_spec is the exception: it keeps its raw bounded physical meaning and skips
+    framework-level patch z-score normalisation, because omega_spec represents absolute
+    spectral concentration / predictability and sample-wise standardisation would
+    destroy that control signal.
+
+Stage roles (enforced by train_state_routes.py):
+  Stage 1: nm.predictor only — base aux loss.
+  Stage 2: backbone only — task loss; nm fully frozen.
+  Stage 3: nm.route_state_predictor + nm.route_path_impl — task + route_state_loss.
+  Joint finetune (optional): backbone + route modules — task loss; nm.predictor frozen.
+"""
 from __future__ import annotations
 
 from typing import Optional
@@ -30,7 +42,21 @@ _VALID_PATHS = {
     "gating",
     "local_value_parameter",   # alias → local_transport
 }
-_VALID_STATES = {"none", "nu", "dlogsigma"}
+_VALID_STATES = {"none", "nu", "dlogsigma", "omega_spec"}
+
+
+def _normalize_patch_state(feat: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """Normalise patch features per-batch, per-channel across the patch dimension.
+
+    feat: (B, P, C)
+    Returns (feat - mean) / std where mean and std are computed over dim=1 (patches).
+    This is the default framework-level normalisation applied to route state features,
+    ensuring the route_state_predictor always operates on a consistent scale.
+    omega_spec is intentionally exempt so its bounded physical semantics are preserved.
+    """
+    mean = feat.mean(dim=1, keepdim=True)
+    std = feat.std(dim=1, keepdim=True).clamp_min(eps)
+    return (feat - mean) / std
 
 
 class SANRouteNorm(nn.Module):
@@ -49,7 +75,8 @@ class SANRouteNorm(nn.Module):
                                | "alignment" | "gating"
                                | "local_value_parameter" (alias → local_transport)
         route_state:           "none" | "nu" | "dlogsigma"
-        route_state_loss_scale: Weight for route state prediction loss.
+        route_state_loss_scale: Weight for route state prediction loss in
+                                compute_total_aux_loss().
     """
 
     def __init__(
@@ -138,7 +165,6 @@ class SANRouteNorm(nn.Module):
             raise ValueError(
                 f"When route_path='{self.route_path}', route_state must not be 'none'."
             )
-
         if self.seq_len < self.window_len:
             raise ValueError(
                 f"seq_len={self.seq_len} < window_len={self.window_len}."
@@ -212,10 +238,7 @@ class SANRouteNorm(nn.Module):
         """Overlap-add patch features to per-timestep features.
 
         feat: (B, P, C) — one feature vector per patch.
-        Returns (B, total_length, C) by broadcasting each patch feature across
-        its covered timesteps and averaging overlapping contributions.
-
-        Shared by all route paths via the cached _route_future_state_time tensor.
+        Returns (B, total_length, C).
         """
         B, P, C = feat.shape
         out = torch.zeros(B, total_length, C, device=feat.device, dtype=feat.dtype)
@@ -240,28 +263,90 @@ class SANRouteNorm(nn.Module):
         self._mu_hist: Optional[torch.Tensor] = None
         self._std_hist: Optional[torch.Tensor] = None
         # Base predictor outputs (patch-level)
-        self._mu_fut_hat: Optional[torch.Tensor] = None   # always == _base_mu_fut_hat
-        self._std_fut_hat: Optional[torch.Tensor] = None  # always == _base_std_fut_hat
         self._base_mu_fut_hat: Optional[torch.Tensor] = None
         self._base_std_fut_hat: Optional[torch.Tensor] = None
         # Base per-timestep stats (time-domain)
         self._pred_time_stats: Optional[torch.Tensor] = None
         self._base_time_mean: Optional[torch.Tensor] = None
         self._base_time_std: Optional[torch.Tensor] = None
-        # Route state features
-        self._route_hist_state: Optional[torch.Tensor] = None
-        self._route_future_state_hat: Optional[torch.Tensor] = None
+        # Route state features — normalised versions (fed to predictor / loss)
+        self._route_hist_state: Optional[torch.Tensor] = None        # normalised
+        self._route_future_state_hat: Optional[torch.Tensor] = None  # normalised
         self._route_future_state_time: Optional[torch.Tensor] = None
         self._route_future_oracle_state: Optional[torch.Tensor] = None
+        # Raw (pre-normalisation) route state features — for diagnostics only
+        self._route_hist_state_raw: Optional[torch.Tensor] = None
+        self._route_future_state_hat_raw: Optional[torch.Tensor] = None
         # Cached names (for stats reporting)
         self._route_path_name: str = self.route_path
         self._route_state_name: str = self.route_state
         # Scalar loss trackers
         self._last_mu_loss: float = 0.0
         self._last_std_loss: float = 0.0
+        self._last_base_aux_loss: float = 0.0
         self._last_route_state_loss: float = 0.0
-        self._route_state_loss: float = 0.0
         self._last_aux_total: float = 0.0
+
+    # ------------------------------------------------------------------
+    # Stage-aware parameter group accessors
+    # ------------------------------------------------------------------
+
+    def parameters_base_predictor(self) -> list:
+        """Return parameter list for the base predictor (Stage 1 optimizer target)."""
+        return list(self.predictor.parameters())
+
+    def parameters_route_modules(self) -> list:
+        """Return parameter list for route modules (Stage 3 optimizer target).
+
+        Returns an empty list when route_path='none'.
+        """
+        params: list = []
+        if self.route_state_predictor is not None:
+            params.extend(self.route_state_predictor.parameters())
+        if self.route_path_impl is not None:
+            params.extend(self.route_path_impl.parameters())
+        return params
+
+    # ------------------------------------------------------------------
+    # Freeze / unfreeze helpers (used by train_state_routes.py)
+    # ------------------------------------------------------------------
+
+    def freeze_base_predictor(self) -> None:
+        """Freeze nm.predictor parameters (no gradient in Stage 2 and Stage 3)."""
+        for p in self.predictor.parameters():
+            p.requires_grad_(False)
+
+    def unfreeze_base_predictor(self) -> None:
+        """Unfreeze nm.predictor parameters."""
+        for p in self.predictor.parameters():
+            p.requires_grad_(True)
+
+    def freeze_route_modules(self) -> None:
+        """Freeze route_state_predictor and route_path_impl (safe when route_path='none')."""
+        if self.route_state_predictor is not None:
+            for p in self.route_state_predictor.parameters():
+                p.requires_grad_(False)
+        if self.route_path_impl is not None:
+            for p in self.route_path_impl.parameters():
+                p.requires_grad_(False)
+
+    def unfreeze_route_modules(self) -> None:
+        """Unfreeze route_state_predictor and route_path_impl (safe when route_path='none')."""
+        if self.route_state_predictor is not None:
+            for p in self.route_state_predictor.parameters():
+                p.requires_grad_(True)
+        if self.route_path_impl is not None:
+            for p in self.route_path_impl.parameters():
+                p.requires_grad_(True)
+
+    def _should_normalize_route_state(self) -> bool:
+        """Return whether framework patch-state normalisation should be applied.
+
+        Default behavior is to normalise route states via _normalize_patch_state().
+        omega_spec is excluded so predictor, oracle, and path use its raw bounded
+        physical quantity instead of a sample-wise patch z-score.
+        """
+        return self.route_state != "omega_spec"
 
     # ------------------------------------------------------------------
     # Main interface
@@ -275,8 +360,12 @@ class SANRouteNorm(nn.Module):
           2. Build per-timestep normalization and compute z.
           3. Run base predictor → mu_base_fut, std_base_fut.
           4. Build and cache per-timestep base stats (base_time_mean, base_time_std).
-          5. If routing active: extract hist_state, predict future_state_hat,
-             adapt, and convert to time domain (future_state_time).
+             5. If routing active:
+                 - extract hist_state_raw, apply default framework normalisation unless
+                    the route state opts out (omega_spec)
+                 - predict future_state_hat_raw, adapt, apply the same default/opt-out rule
+             - cache raw versions for diagnostics
+                 - convert the predictor/path representation to time domain
 
         mu/std tensors are NEVER modified by the route path here; routing
         happens entirely in denormalize().
@@ -309,11 +398,9 @@ class SANRouteNorm(nn.Module):
             mu_hist, std_hist, xbar, anchor
         )
 
-        # Cache base outputs (routing never overwrites these)
+        # Cache base outputs
         self._base_mu_fut_hat = mu_base_fut
         self._base_std_fut_hat = std_base_fut
-        self._mu_fut_hat = mu_base_fut
-        self._std_fut_hat = std_base_fut
 
         # Build per-timestep base stats and cache for denormalize()
         self._pred_time_stats = self._window_stats_to_time_stats(
@@ -325,18 +412,29 @@ class SANRouteNorm(nn.Module):
 
         # --- Route state (if active) ---
         if self.route_path != "none":
-            hist_state = self.route_state_impl.extract_hist_state(
+            should_normalize_state = self._should_normalize_route_state()
+            hist_state_raw = self.route_state_impl.extract_hist_state(
                 x.detach(), hist_windows, mu_hist, std_hist, self.sigma_min
             )
+            self._route_hist_state_raw = hist_state_raw
+            if should_normalize_state:
+                hist_state = _normalize_patch_state(hist_state_raw)
+            else:
+                hist_state = hist_state_raw
             self._route_hist_state = hist_state
 
-            future_state_hat_raw = self.route_state_predictor(hist_state, xbar)
-            future_state_hat = self.route_state_impl.adapt_future_state(
-                future_state_hat_raw
+            future_state_hat_raw_pred = self.route_state_predictor(hist_state, xbar)
+            future_state_hat_adapted = self.route_state_impl.adapt_future_state(
+                future_state_hat_raw_pred
             )
+            self._route_future_state_hat_raw = future_state_hat_adapted
+            if should_normalize_state:
+                future_state_hat = _normalize_patch_state(future_state_hat_adapted)
+            else:
+                future_state_hat = future_state_hat_adapted
             self._route_future_state_hat = future_state_hat
 
-            # Convert patch-level state features to time domain (shared by all paths)
+            # Convert the predictor/path representation to time domain
             self._route_future_state_time = self._patch_features_to_time(
                 future_state_hat, self.pred_len
             )
@@ -349,8 +447,7 @@ class SANRouteNorm(nn.Module):
         Base denorm:  y_base = base_time_mean + (base_time_std + eps) * y_norm
         Route output: y_route = route_path_impl(y_norm, y_base, …)
 
-        Routing is skipped (falls back to y_base) when T != pred_len, since
-        future_state_time is computed only for pred_len timesteps.
+        Routing is skipped (falls back to y_base) when T != pred_len.
         """
         if self._pred_time_stats is None:
             return y_norm
@@ -360,7 +457,7 @@ class SANRouteNorm(nn.Module):
             time_stats = self._pred_time_stats
         else:
             time_stats = self._window_stats_to_time_stats(
-                self._mu_fut_hat, self._std_fut_hat, T
+                self._base_mu_fut_hat, self._base_std_fut_hat, T
             )
         mean, std = self._split_stats(time_stats)
         y_base = mean + (std + self.epsilon) * y_norm
@@ -385,63 +482,109 @@ class SANRouteNorm(nn.Module):
 
         return y_base
 
-    def loss(self, y_true: torch.Tensor) -> torch.Tensor:
-        """Aux loss: base SAN stats loss + route state prediction loss.
+    # ------------------------------------------------------------------
+    # Loss computation (split by stage role)
+    # ------------------------------------------------------------------
 
-        base_aux  = w_mu * MSE(base_mu_fut_hat, oracle_mu)
-                  + w_std * MSE(base_std_fut_hat, oracle_std)
-        route_aux = MSE(future_state_hat, future_oracle_state)   [0 if no routing]
-        total     = base_aux + route_state_loss_scale * route_aux
+    def _compute_oracle_stats(
+        self, y_true: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Helper: extract future windows and oracle (mu, std) from y_true."""
+        true_windows = self._extract_windows(y_true)
+        oracle_mu, oracle_std = self._compute_window_stats(true_windows)
+        return true_windows, oracle_mu, oracle_std
+
+    def compute_base_aux_loss(self, y_true: torch.Tensor) -> torch.Tensor:
+        """Base SAN stats loss only — Stage 1 uses this.
+
+        loss = w_mu * MSE(base_mu_fut_hat, oracle_mu)
+             + w_std * MSE(base_std_fut_hat, oracle_std)
+
+        Updates _last_mu_loss, _last_std_loss, _last_base_aux_loss.
+        Does NOT touch _last_route_state_loss.
         """
         if self._base_mu_fut_hat is None or self._base_std_fut_hat is None:
             return torch.tensor(0.0, device=y_true.device)
 
-        true_windows = self._extract_windows(y_true)
-        oracle_mu, oracle_std = self._compute_window_stats(true_windows)
-
-        # Base SAN aux loss (always supervises base predictor)
+        _, oracle_mu, oracle_std = self._compute_oracle_stats(y_true)
         mu_loss = F.mse_loss(self._base_mu_fut_hat, oracle_mu)
         std_loss = F.mse_loss(self._base_std_fut_hat, oracle_std)
         base_aux = self.w_mu * mu_loss + self.w_std * std_loss
 
-        # Route state prediction loss
-        if self.route_path != "none" and self._route_future_state_hat is not None:
-            future_oracle_state = self.route_state_impl.build_future_oracle_state(
-                y_true, true_windows, oracle_mu, oracle_std, self.sigma_min
-            )
-            self._route_future_oracle_state = future_oracle_state
-            route_state_loss = F.mse_loss(
-                self._route_future_state_hat, future_oracle_state
-            )
-            self._last_route_state_loss = float(route_state_loss.detach().item())
-        else:
-            route_state_loss = torch.tensor(0.0, device=y_true.device)
-            self._last_route_state_loss = 0.0
-
-        self._route_state_loss = self._last_route_state_loss
-
-        aux_total = base_aux + self.route_state_loss_scale * route_state_loss
-
         self._last_mu_loss = float(mu_loss.detach().item())
         self._last_std_loss = float(std_loss.detach().item())
-        self._last_aux_total = float(aux_total.detach().item())
+        self._last_base_aux_loss = float(base_aux.detach().item())
+        self._last_aux_total = self._last_base_aux_loss
+        return base_aux
 
-        return aux_total
+    def compute_route_state_loss(self, y_true: torch.Tensor) -> torch.Tensor:
+        """Route state prediction loss only — Stage 3 uses this.
+
+        loss = MSE(future_state_hat_norm, oracle_state_norm)
+
+        By default, both sides are normalised by _normalize_patch_state to ensure
+        a consistent predictor scale independent of the physical quantity.
+        omega_spec is the exception and keeps its raw bounded physical meaning.
+
+        Updates _last_route_state_loss.  Returns 0 when route_path='none'.
+        """
+        if self.route_path == "none" or self._route_future_state_hat is None:
+            return torch.tensor(0.0, device=y_true.device)
+
+        true_windows, oracle_mu, oracle_std = self._compute_oracle_stats(y_true)
+        oracle_raw = self.route_state_impl.build_future_oracle_state(
+            y_true, true_windows, oracle_mu, oracle_std, self.sigma_min
+        )
+        if self._should_normalize_route_state():
+            oracle_state = _normalize_patch_state(oracle_raw)
+        else:
+            oracle_state = oracle_raw
+        self._route_future_oracle_state = oracle_state
+
+        route_state_loss = F.mse_loss(self._route_future_state_hat, oracle_state)
+        self._last_route_state_loss = float(route_state_loss.detach().item())
+        return route_state_loss
+
+    def compute_total_aux_loss(self, y_true: torch.Tensor) -> torch.Tensor:
+        """Combined base aux + weighted route state loss.
+
+        = compute_base_aux_loss + route_state_loss_scale * compute_route_state_loss
+
+        Updates all _last_* tracking fields.
+        """
+        base_aux = self.compute_base_aux_loss(y_true)
+        route_loss = self.compute_route_state_loss(y_true)
+        total = base_aux + self.route_state_loss_scale * route_loss
+        self._last_aux_total = float(total.detach().item())
+        return total
+
+    def loss(self, y_true: torch.Tensor) -> torch.Tensor:
+        """Backward-compat alias for compute_total_aux_loss."""
+        return self.compute_total_aux_loss(y_true)
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
 
     def get_last_aux_stats(self) -> dict:
+        """Return cached scalar stats from the most recent loss computation.
+
+        Keys are separated: base_aux stats and route_state_loss are distinct.
+        Do not mix route path diagnostics here — use get_route_diagnostics().
+        """
         return {
             "aux_total": self._last_aux_total,
+            "base_aux_loss": self._last_base_aux_loss,
             "mu_loss": self._last_mu_loss,
             "std_loss": self._last_std_loss,
+            "route_state_loss": self._last_route_state_loss,
+            "route_state_framework_normalized": self._should_normalize_route_state(),
             "mu_hist_mean": (
                 float(self._mu_hist.mean().item()) if self._mu_hist is not None else 0.0
             ),
             "std_hist_mean": (
                 float(self._std_hist.mean().item()) if self._std_hist is not None else 0.0
             ),
-            "route_state_loss": self._last_route_state_loss,
-            "route_path": self._route_path_name,
-            "route_state": self._route_state_name,
             "base_mu_fut_mean": (
                 float(self._base_mu_fut_hat.mean().item())
                 if self._base_mu_fut_hat is not None else 0.0
@@ -451,6 +594,25 @@ class SANRouteNorm(nn.Module):
                 if self._base_std_fut_hat is not None else 0.0
             ),
         }
+
+    def get_route_diagnostics(self) -> dict:
+        """Return cached diagnostics from the route path implementation.
+
+        Returns an empty dict when route_path='none'.
+        Aux stats (mu_loss, route_state_loss, …) are NOT included here;
+        use get_last_aux_stats() for those.
+        """
+        if self.route_path == "none" or self.route_path_impl is None:
+            return {}
+        diag: dict = {
+            "route_path": self._route_path_name,
+            "route_state": self._route_state_name,
+            "route_state_name": self._route_state_name,
+            "route_state_framework_normalized": self._should_normalize_route_state(),
+        }
+        if hasattr(self.route_path_impl, "get_route_diagnostics"):
+            diag.update(self.route_path_impl.get_route_diagnostics())
+        return diag
 
     def forward(
         self,
@@ -577,10 +739,10 @@ class RouteStatePredictor(nn.Module):
     """Shared predictor for future route state — state-agnostic.
 
     Input:
-        hist_state: (B, P_hist, C)
+        hist_state: (B, P_hist, C)  — normalised by _normalize_patch_state
         xbar:       (B, P_hist * window_len, C)
     Output:
-        future_state_hat_raw: (B, P_fut, C)
+        future_state_hat_raw: (B, P_fut, C)  — before adapt_future_state
     """
 
     def __init__(
@@ -602,7 +764,7 @@ class RouteStatePredictor(nn.Module):
 
     def forward(
         self,
-        hist_state: torch.Tensor,  # (B, P_hist, C)
+        hist_state: torch.Tensor,  # (B, P_hist, C) — normalised
         xbar: torch.Tensor,        # (B, P_hist * window_len, C)
     ) -> torch.Tensor:
         hs = hist_state.permute(0, 2, 1)   # (B, C, P_hist)

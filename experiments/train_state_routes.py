@@ -1,25 +1,37 @@
 """train_state_routes.py — Training entry point for SANRouteNorm experiments.
 
-First version: single experiment, no state/path routing.
-Uses SANRouteNorm as the normalization module (a clean single-level SAN base).
+Formal three-stage training protocol
+-------------------------------------
+  Stage 1: base predictor pretrain
+      Optimizer: nm.predictor only
+      Loss: nm.compute_base_aux_loss (mu/std prediction loss)
+      Epochs: san_pretrain_epochs  (patience-based early stop)
 
-Result directory layout:
-    results/state_routes/<exp_name>/<dataset>/<backbone>/pred_len_<pred_len>/base/
-        trials.jsonl    — one trial per line
-        summary.json    — mean/std over trials
-        config.json     — full config snapshot
+  Stage 2: backbone training
+      Optimizer: model.fm (backbone) only; nm fully frozen
+      Loss: forecasting task loss (MSE)
+      Epochs: up to cfg.epochs  (patience-based early stop)
 
-Usage:
-    python -m ttn_norm.experiments.train_state_routes \\
-        --dataset ETTh1 --backbone DLinear --window 96 --pred-len 96 \\
-        --seeds 1,2,3 --exp-name my_exp
+  Stage 3: route-only training  [skipped when route_path='none' or route_stage_epochs=0]
+      Starts from Stage 2 best checkpoint
+      Optimizer: nm.route_state_predictor + nm.route_path_impl
+      Loss: route_task_loss_scale * task_loss + nm.compute_route_state_loss
+      Epochs: route_stage_epochs  (patience-based early stop)
+
+Joint finetune (optional, joint_finetune_epochs > 0):
+      Optimizer: backbone + route modules; nm.predictor frozen
+      Loss: task loss
+      Epochs: joint_finetune_epochs (fixed, no early stop)
+
+Result directory:
+  results/state_routes/<exp_name>/<dataset>/<backbone>/pred_len_<pred_len>/
+      <route_path>/<route_state>/
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
-import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass
@@ -29,7 +41,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-# Reuse existing dataloader, backbone, and metric utilities from train.py
 from ttn_norm.experiments.train import (
     TrainConfig,
     _build_backbone_kwargs,
@@ -48,7 +59,7 @@ from ttn_norm.normalizations import SANRouteNorm
 
 @dataclass
 class StateRouteConfig:
-    """Focused config for SANRouteNorm single-experiment runs."""
+    """Configuration for SANRouteNorm three-stage experiments."""
 
     # Experiment identity
     exp_name: str = "san_route_base"
@@ -66,48 +77,63 @@ class StateRouteConfig:
     batch_size: int = 32
     num_worker: int = 4
 
-    # Model
+    # Model geometry
     window: int = 96
     pred_len: int = 96
     horizon: int = 1
     label_len: int = 48
 
-    # Training
+    # Training (shared across stages unless overridden per-stage)
     device: str = "cuda:0"
     cuda_oom_cpu_fallback: bool = False
-    seeds: str = "1"          # comma-separated list of seeds to run
-    epochs: int = 1000
-    lr: float = 1.5e-4
+    seeds: str = "1"
+    epochs: int = 1000       # Stage 2 max epochs
+    lr: float = 1.5e-4       # Stage 1 and Stage 2 lr
     weight_decay: float = 5e-4
     max_grad_norm: float = 5.0
 
-    # Early stopping
+    # Early stopping (Stage 1 and Stage 2 share these)
     early_stop: bool = True
     early_stop_patience: int = 5
     early_stop_min_epochs: int = 1
     early_stop_delta: float = 0.0
 
-    # Aux loss schedule (cosine annealing from scale to min_scale)
+    # Aux loss schedule (Stage 1 only; Stage 2 uses task loss only)
     aux_loss_scale: float = 0.2
     aux_loss_min_scale: float = 0.05
-    aux_loss_schedule: str = "cosine"   # "none" | "cosine"
+    aux_loss_schedule: str = "cosine"
     aux_loss_decay_start_epoch: int = 4
     aux_loss_decay_epochs: int = 16
 
-    # SANRouteNorm
+    # SANRouteNorm geometry
     san_period_len: int = 12
     san_stride: int = 0
     san_sigma_min: float = 1e-3
     san_w_mu: float = 1.0
     san_w_std: float = 1.0
 
+    # Stage 1 epochs (nm.predictor pretrain)
+    san_pretrain_epochs: int = 5
+
     # Route path / state
-    # route_path: "none" | "local_transport" | "residual_content" | "alignment" | "gating"
-    #             "local_value_parameter" is a backward-compat alias for "local_transport"
-    # route_state: "none" | "nu" | "dlogsigma"
     route_path: str = "none"
     route_state: str = "none"
-    route_state_loss_scale: float = 0.1
+    route_state_loss_scale: float = 0.1   # used inside nm for compute_route_state_loss
+
+    # Stage 3: route-only training
+    route_stage_epochs: int = 0           # 0 = skip Stage 3
+    route_stage_lr: float = 1.5e-4
+    route_stage_weight_decay: float = 5e-4
+    route_stage_patience: int = 5
+    route_stage_min_epochs: int = 1
+    route_task_loss_scale: float = 1.0    # weight of task loss in Stage 3
+
+    # Joint finetune (optional post-Stage-3 step)
+    joint_finetune_epochs: int = 0        # 0 = skip
+    joint_finetune_lr: float = 1e-5
+
+    # Non-overlap enforcement for route experiments
+    route_require_nonoverlap: bool = True
 
     # Results
     result_dir: str = "./results/state_routes"
@@ -134,8 +160,14 @@ def _build_san_route_model(cfg: StateRouteConfig, num_features: int) -> TTNModel
         route_state=cfg.route_state,
         route_state_loss_scale=cfg.route_state_loss_scale,
     )
-    # Delegate backbone construction to the existing train.py utility.
-    # Build a minimal TrainConfig to satisfy _build_backbone_kwargs signature.
+    # Validate non-overlap constraint before continuing
+    if cfg.route_require_nonoverlap:
+        if norm.stride != norm.window_len:
+            raise ValueError(
+                f"route_require_nonoverlap=True requires stride == period_len "
+                f"(got stride={norm.stride}, period_len={norm.window_len}). "
+                f"Use san_stride=0 or san_stride=san_period_len."
+            )
     tc = TrainConfig(
         backbone_type=cfg.backbone,
         window=cfg.window,
@@ -154,82 +186,160 @@ def _build_san_route_model(cfg: StateRouteConfig, num_features: int) -> TTNModel
 
 
 # ---------------------------------------------------------------------------
-# Aux-loss scale schedule
+# Per-stage training functions
 # ---------------------------------------------------------------------------
 
-def _aux_scale(cfg: StateRouteConfig, epoch: int) -> float:
-    if cfg.aux_loss_schedule == "none":
-        return float(cfg.aux_loss_scale)
-    start = cfg.aux_loss_decay_start_epoch
-    if epoch < start:
-        return float(cfg.aux_loss_scale)
-    decay = max(cfg.aux_loss_decay_epochs, 1)
-    t = min(epoch - start, decay) / float(decay)
-    cos_factor = 0.5 * (1.0 + np.cos(np.pi * t))
-    return float(
-        cfg.aux_loss_min_scale
-        + (cfg.aux_loss_scale - cfg.aux_loss_min_scale) * cos_factor
-    )
-
-
-# ---------------------------------------------------------------------------
-# Training helpers
-# ---------------------------------------------------------------------------
-
-def _train_epoch(
+def _train_epoch_stage1(
     model: nn.Module,
-    train_loader,
-    optimizer: torch.optim.Optimizer,
+    loader,
+    optim: torch.optim.Optimizer,
     cfg: StateRouteConfig,
-    epoch: int,
 ) -> dict[str, float]:
+    """Stage 1: nm.predictor only, base aux loss."""
     model.train()
-    loss_fn = nn.MSELoss()
-    aux_scale = _aux_scale(cfg, epoch)
-    total_losses: list[float] = []
-    task_losses: list[float] = []
-    aux_losses: list[float] = []
-    mu_losses: list[float] = []
-    std_losses: list[float] = []
-    route_state_losses: list[float] = []
+    base_aux_list: list[float] = []
+    mu_list: list[float] = []
+    std_list: list[float] = []
 
-    for batch_x, batch_y, _origin_y, _batch_x_enc, _batch_y_enc in train_loader:
+    for batch_x, batch_y, _origin_y, _batch_x_enc, _batch_y_enc in loader:
         batch_x = batch_x.to(cfg.device).float()
         batch_y = batch_y.to(cfg.device).float()
 
-        optimizer.zero_grad()
-        pred = model(batch_x)
-        task_loss = loss_fn(pred, batch_y)
+        optim.zero_grad()
+        model(batch_x)
+        base_aux = model.nm.compute_base_aux_loss(batch_y)
+        base_aux.backward()
+        torch.nn.utils.clip_grad_norm_(
+            model.nm.parameters_base_predictor(), cfg.max_grad_norm
+        )
+        optim.step()
 
-        aux_loss = torch.tensor(0.0, device=batch_x.device)
-        if hasattr(model.nm, "loss"):
-            aux_loss = model.nm.loss(batch_y)
-
-        loss = task_loss + aux_scale * aux_loss
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-        optimizer.step()
-
-        total_losses.append(float(loss.item()))
-        task_losses.append(float(task_loss.item()))
-        aux_losses.append(float(aux_loss.item()))
-        if hasattr(model.nm, "get_last_aux_stats"):
-            aux_stats = model.nm.get_last_aux_stats()
-            mu_losses.append(float(aux_stats.get("mu_loss", 0.0)))
-            std_losses.append(float(aux_stats.get("std_loss", 0.0)))
-            route_state_losses.append(float(aux_stats.get("route_state_loss", 0.0)))
+        base_aux_list.append(float(base_aux.item()))
+        aux_stats = model.nm.get_last_aux_stats()
+        mu_list.append(aux_stats["mu_loss"])
+        std_list.append(aux_stats["std_loss"])
 
     return {
-        "total_loss": float(np.mean(total_losses)) if total_losses else 0.0,
-        "task_loss": float(np.mean(task_losses)) if task_losses else 0.0,
-        "aux_loss": float(np.mean(aux_losses)) if aux_losses else 0.0,
-        "aux_total": float(np.mean(aux_losses)) if aux_losses else 0.0,
-        "mu_loss": float(np.mean(mu_losses)) if mu_losses else 0.0,
-        "std_loss": float(np.mean(std_losses)) if std_losses else 0.0,
-        "route_state_loss": float(np.mean(route_state_losses)) if route_state_losses else 0.0,
-        "aux_scale": float(aux_scale),
+        "base_aux_loss": float(np.mean(base_aux_list)) if base_aux_list else 0.0,
+        "mu_loss": float(np.mean(mu_list)) if mu_list else 0.0,
+        "std_loss": float(np.mean(std_list)) if std_list else 0.0,
     }
 
+
+def _train_epoch_stage2(
+    model: nn.Module,
+    loader,
+    optim: torch.optim.Optimizer,
+    cfg: StateRouteConfig,
+) -> dict[str, float]:
+    """Stage 2: backbone only, task loss. nm is frozen; aux monitored under no_grad."""
+    model.train()
+    loss_fn = nn.MSELoss()
+    task_list: list[float] = []
+    base_aux_list: list[float] = []
+    route_state_list: list[float] = []
+
+    for batch_x, batch_y, _origin_y, _batch_x_enc, _batch_y_enc in loader:
+        batch_x = batch_x.to(cfg.device).float()
+        batch_y = batch_y.to(cfg.device).float()
+
+        optim.zero_grad()
+        pred = model(batch_x)
+        task_loss = loss_fn(pred, batch_y)
+        task_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.fm.parameters(), cfg.max_grad_norm)
+        optim.step()
+
+        task_list.append(float(task_loss.item()))
+
+        with torch.no_grad():
+            model.nm.compute_total_aux_loss(batch_y)
+        aux_stats = model.nm.get_last_aux_stats()
+        base_aux_list.append(aux_stats["base_aux_loss"])
+        route_state_list.append(aux_stats["route_state_loss"])
+
+    return {
+        "task_loss": float(np.mean(task_list)) if task_list else 0.0,
+        "base_aux_loss": float(np.mean(base_aux_list)) if base_aux_list else 0.0,
+        "route_state_loss": float(np.mean(route_state_list)) if route_state_list else 0.0,
+    }
+
+
+def _train_epoch_stage3(
+    model: nn.Module,
+    loader,
+    optim: torch.optim.Optimizer,
+    cfg: StateRouteConfig,
+) -> dict[str, float]:
+    """Stage 3: route modules only. Loss = route_task_loss_scale * task + route_state_loss."""
+    model.train()
+    loss_fn = nn.MSELoss()
+    task_list: list[float] = []
+    route_state_list: list[float] = []
+    total_list: list[float] = []
+
+    for batch_x, batch_y, _origin_y, _batch_x_enc, _batch_y_enc in loader:
+        batch_x = batch_x.to(cfg.device).float()
+        batch_y = batch_y.to(cfg.device).float()
+
+        optim.zero_grad()
+        pred = model(batch_x)
+        task_loss = loss_fn(pred, batch_y)
+        route_state_loss = model.nm.compute_route_state_loss(batch_y)
+        loss = (
+            cfg.route_task_loss_scale * task_loss
+            + model.nm.route_state_loss_scale * route_state_loss
+        )
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            model.nm.parameters_route_modules(), cfg.max_grad_norm
+        )
+        optim.step()
+
+        task_list.append(float(task_loss.item()))
+        route_state_list.append(float(route_state_loss.item()))
+        total_list.append(float(loss.item()))
+
+    return {
+        "task_loss": float(np.mean(task_list)) if task_list else 0.0,
+        "route_state_loss": float(np.mean(route_state_list)) if route_state_list else 0.0,
+        "total_loss": float(np.mean(total_list)) if total_list else 0.0,
+    }
+
+
+def _train_epoch_joint(
+    model: nn.Module,
+    loader,
+    optim: torch.optim.Optimizer,
+    cfg: StateRouteConfig,
+    joint_params: list,
+) -> dict[str, float]:
+    """Joint finetune: backbone + route modules, task loss only. nm.predictor frozen."""
+    model.train()
+    loss_fn = nn.MSELoss()
+    task_list: list[float] = []
+
+    for batch_x, batch_y, _origin_y, _batch_x_enc, _batch_y_enc in loader:
+        batch_x = batch_x.to(cfg.device).float()
+        batch_y = batch_y.to(cfg.device).float()
+
+        optim.zero_grad()
+        pred = model(batch_x)
+        task_loss = loss_fn(pred, batch_y)
+        task_loss.backward()
+        torch.nn.utils.clip_grad_norm_(joint_params, cfg.max_grad_norm)
+        optim.step()
+
+        task_list.append(float(task_loss.item()))
+
+    return {
+        "task_loss": float(np.mean(task_list)) if task_list else 0.0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def _eval_loader(
@@ -243,28 +353,21 @@ def _eval_loader(
         metric.reset()
 
     loss_fn = nn.MSELoss()
-    task_losses: list[float] = []
-    aux_losses: list[float] = []
-    mu_losses: list[float] = []
-    std_losses: list[float] = []
-    route_state_losses: list[float] = []
+    task_list: list[float] = []
+    base_aux_list: list[float] = []
+    route_state_list: list[float] = []
 
     for batch_x, batch_y, _origin_y, _batch_x_enc, _batch_y_enc in loader:
         batch_x = batch_x.to(cfg.device).float()
         batch_y = batch_y.to(cfg.device).float()
         pred = model(batch_x)
         task_loss = loss_fn(pred, batch_y)
-        task_losses.append(float(task_loss.item()))
+        task_list.append(float(task_loss.item()))
 
-        aux_loss = torch.tensor(0.0, device=batch_x.device)
-        if hasattr(model.nm, "loss"):
-            aux_loss = model.nm.loss(batch_y)
-        aux_losses.append(float(aux_loss.item()))
-        if hasattr(model.nm, "get_last_aux_stats"):
-            aux_stats = model.nm.get_last_aux_stats()
-            mu_losses.append(float(aux_stats.get("mu_loss", 0.0)))
-            std_losses.append(float(aux_stats.get("std_loss", 0.0)))
-            route_state_losses.append(float(aux_stats.get("route_state_loss", 0.0)))
+        model.nm.compute_total_aux_loss(batch_y)
+        aux_stats = model.nm.get_last_aux_stats()
+        base_aux_list.append(aux_stats["base_aux_loss"])
+        route_state_list.append(aux_stats["route_state_loss"])
 
         if cfg.pred_len == 1:
             B = pred.shape[0]
@@ -274,16 +377,11 @@ def _eval_loader(
             metric.update(pred, batch_y)
 
     results = {name: float(m.compute()) for name, m in metrics.items()}
-    results.update(
-        {
-            "task_loss": float(np.mean(task_losses)) if task_losses else 0.0,
-            "aux_loss": float(np.mean(aux_losses)) if aux_losses else 0.0,
-            "aux_total": float(np.mean(aux_losses)) if aux_losses else 0.0,
-            "mu_loss": float(np.mean(mu_losses)) if mu_losses else 0.0,
-            "std_loss": float(np.mean(std_losses)) if std_losses else 0.0,
-            "route_state_loss": float(np.mean(route_state_losses)) if route_state_losses else 0.0,
-        }
-    )
+    results.update({
+        "task_loss": float(np.mean(task_list)) if task_list else 0.0,
+        "base_aux_loss": float(np.mean(base_aux_list)) if base_aux_list else 0.0,
+        "route_state_loss": float(np.mean(route_state_list)) if route_state_list else 0.0,
+    })
     return results
 
 
@@ -291,10 +389,9 @@ def _eval_loader(
 # Single trial
 # ---------------------------------------------------------------------------
 
-def _run_trial(cfg: StateRouteConfig, seed: int, ckpt_path: str) -> dict[str, Any]:
+def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]:
     _set_seed(seed)
 
-    # Build dataloader via existing train.py utility
     tc = TrainConfig(
         dataset_type=cfg.dataset,
         data_path=cfg.data_path,
@@ -324,75 +421,260 @@ def _run_trial(cfg: StateRouteConfig, seed: int, ckpt_path: str) -> dict[str, An
     )
 
     model = _move_model_to_device(_build_san_route_model(cfg, num_features), cfg)
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
-    )
     metrics = _build_metrics(torch.device(cfg.device))
 
+    norm_ckpt = os.path.join(tmp_dir, f"norm_s{seed}.pt")
+    stage2_ckpt = os.path.join(tmp_dir, f"stage2_s{seed}.pt")
+    stage3_ckpt = os.path.join(tmp_dir, f"stage3_s{seed}.pt")
+
+    t0 = time.time()
     best_val_mse = float("inf")
     best_val_mae = float("inf")
     best_test_mse = float("inf")
     best_test_mae = float("inf")
     best_epoch = 0
-    patience_counter = 0
+    best_stage = "stage2"
 
-    t0 = time.time()
+    # -------------------------------------------------------------------
+    # Stage 1: nm.predictor only (san_pretrain_epochs > 0)
+    # -------------------------------------------------------------------
+    if cfg.san_pretrain_epochs > 0:
+        print(
+            f"\n--- Stage 1: base predictor pretrain"
+            f" (max {cfg.san_pretrain_epochs} epochs, patience={cfg.early_stop_patience}) ---"
+        )
+        # Freeze backbone and route modules; only nm.predictor trains
+        for p in model.fm.parameters():
+            p.requires_grad_(False)
+        model.nm.freeze_route_modules()
+
+        s1_optim = torch.optim.Adam(
+            model.nm.parameters_base_predictor(),
+            lr=cfg.lr, weight_decay=cfg.weight_decay,
+        )
+        best_s1_val = float("inf")
+        s1_patience = 0
+
+        for epoch in range(cfg.san_pretrain_epochs):
+            tr = _train_epoch_stage1(model, dataloader.train_loader, s1_optim, cfg)
+            val_m = _eval_loader(model, dataloader.val_loader, cfg, metrics)
+            val_base_aux = val_m["base_aux_loss"]
+
+            improved = val_base_aux < best_s1_val - cfg.early_stop_delta
+            marker = "  *" if improved else ""
+            if improved:
+                best_s1_val = val_base_aux
+                s1_patience = 0
+                torch.save(model.nm.predictor.state_dict(), norm_ckpt)
+            else:
+                s1_patience += 1
+
+            print(
+                f"[Stage1 epoch {epoch+1:3d}]"
+                f"  train_base_aux={tr['base_aux_loss']:.6f}"
+                f"  train_mu={tr['mu_loss']:.4e}"
+                f"  train_std={tr['std_loss']:.4e}"
+                f"  val_base_aux={val_base_aux:.6f}"
+                + marker
+            )
+
+            if (
+                cfg.early_stop
+                and s1_patience >= cfg.early_stop_patience
+                and epoch + 1 >= cfg.early_stop_min_epochs
+            ):
+                print(f"  Stage 1 early stopping at epoch {epoch + 1}.")
+                break
+
+        if os.path.exists(norm_ckpt):
+            model.nm.predictor.load_state_dict(torch.load(norm_ckpt, weights_only=True))
+            print("Loaded best base predictor checkpoint for Stage 2.")
+
+        # Restore backbone grads for Stage 2
+        for p in model.fm.parameters():
+            p.requires_grad_(True)
+
+    # -------------------------------------------------------------------
+    # Stage 2: backbone only; nm fully frozen
+    # -------------------------------------------------------------------
+    model.nm.freeze_base_predictor()
+    model.nm.freeze_route_modules()
+
+    s2_optim = torch.optim.Adam(
+        model.fm.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
+    )
+
+    print(
+        f"\n--- Stage 2: backbone only (max {cfg.epochs} epochs,"
+        f" patience={cfg.early_stop_patience}) ---"
+    )
+    s2_patience = 0
 
     for epoch in range(cfg.epochs):
-        train_stats = _train_epoch(model, dataloader.train_loader, optimizer, cfg, epoch)
-
-        val_metrics = _eval_loader(model, dataloader.val_loader, cfg, metrics)
-        val_mse = val_metrics["mse"]
-        val_mae = val_metrics["mae"]
-        test_metrics = _eval_loader(model, dataloader.test_loader, cfg, metrics)
-        epoch_test_mse = test_metrics["mse"]
-        epoch_test_mae = test_metrics["mae"]
+        tr = _train_epoch_stage2(model, dataloader.train_loader, s2_optim, cfg)
+        val_m = _eval_loader(model, dataloader.val_loader, cfg, metrics)
+        test_m = _eval_loader(model, dataloader.test_loader, cfg, metrics)
+        val_mse = val_m["mse"]
+        val_mae = val_m["mae"]
 
         improved = val_mse < best_val_mse - cfg.early_stop_delta
+        marker = "  *" if improved else ""
         if improved:
             best_val_mse = val_mse
             best_val_mae = val_mae
+            best_test_mse = test_m["mse"]
+            best_test_mae = test_m["mae"]
             best_epoch = epoch + 1
-            patience_counter = 0
-            torch.save(model.state_dict(), ckpt_path)
-            best_test_mse = test_metrics["mse"]
-            best_test_mae = test_metrics["mae"]
+            best_stage = "stage2"
+            s2_patience = 0
+            torch.save(model.state_dict(), stage2_ckpt)
         else:
-            patience_counter += 1
+            s2_patience += 1
 
         print(
-            f"[epoch {epoch+1:4d}]"
-            f"  train_total={train_stats['total_loss']:.6f}"
-            f"  train_task={train_stats['task_loss']:.6f}"
-            f"  train_aux={train_stats['aux_loss']:.6f}"
-            f"  train_mu={train_stats['mu_loss']:.4e}"
-            f"  train_std={train_stats['std_loss']:.4e}"
-            f"  train_route_state={train_stats['route_state_loss']:.4e}"
+            f"[Stage2 epoch {epoch+1:4d}]"
+            f"  train_task={tr['task_loss']:.6f}"
+            f"  train_base_aux={tr['base_aux_loss']:.6f}"
+            f"  train_route_state={tr['route_state_loss']:.6f}"
             f"  val_mse={val_mse:.6f}  val_mae={val_mae:.6f}"
-            f"  val_task={val_metrics['task_loss']:.6f}"
-            f"  val_aux={val_metrics['aux_loss']:.6f}"
-            f"  val_mu={val_metrics['mu_loss']:.4e}"
-            f"  val_std={val_metrics['std_loss']:.4e}"
-            f"  val_route_state={val_metrics['route_state_loss']:.4e}"
-            f"  test_mse={epoch_test_mse:.6f}  test_mae={epoch_test_mae:.6f}"
-            f"  test_task={test_metrics['task_loss']:.6f}"
-            f"  test_aux={test_metrics['aux_loss']:.6f}"
-            f"  test_mu={test_metrics['mu_loss']:.4e}"
-            f"  test_std={test_metrics['std_loss']:.4e}"
-            f"  test_route_state={test_metrics['route_state_loss']:.4e}"
-            + ("  *" if improved else "")
+            f"  val_base_aux={val_m['base_aux_loss']:.6f}"
+            f"  val_route_state={val_m['route_state_loss']:.6f}"
+            f"  test_mse={test_m['mse']:.6f}  test_mae={test_m['mae']:.6f}"
+            + marker
         )
 
         if (
             cfg.early_stop
-            and patience_counter >= cfg.early_stop_patience
-            and epoch >= cfg.early_stop_min_epochs
+            and s2_patience >= cfg.early_stop_patience
+            and epoch + 1 >= cfg.early_stop_min_epochs
         ):
             print(f"  Early stopping at epoch {epoch + 1}.")
             break
 
+    # -------------------------------------------------------------------
+    # Stage 3: route modules only (if applicable)
+    # -------------------------------------------------------------------
+    if cfg.route_path != "none" and cfg.route_stage_epochs > 0:
+        print(
+            f"\n--- Stage 3: route-only training (max {cfg.route_stage_epochs} epochs,"
+            f" patience={cfg.route_stage_patience}) ---"
+        )
+        # Reload Stage 2 best checkpoint as starting point
+        if os.path.exists(stage2_ckpt):
+            model.load_state_dict(torch.load(stage2_ckpt, weights_only=True))
+
+        # nm.predictor frozen, backbone frozen, route modules unfrozen
+        model.nm.freeze_base_predictor()
+        for p in model.fm.parameters():
+            p.requires_grad_(False)
+        model.nm.unfreeze_route_modules()
+
+        route_params = model.nm.parameters_route_modules()
+        s3_optim = torch.optim.Adam(
+            route_params,
+            lr=cfg.route_stage_lr,
+            weight_decay=cfg.route_stage_weight_decay,
+        )
+        s3_patience = 0
+        best_s3_val = float("inf")
+
+        for epoch in range(cfg.route_stage_epochs):
+            tr = _train_epoch_stage3(model, dataloader.train_loader, s3_optim, cfg)
+            val_m = _eval_loader(model, dataloader.val_loader, cfg, metrics)
+            test_m = _eval_loader(model, dataloader.test_loader, cfg, metrics)
+            val_mse = val_m["mse"]
+            val_mae = val_m["mae"]
+            route_diag = model.nm.get_route_diagnostics()
+
+            improved_s3 = val_mse < best_s3_val - cfg.early_stop_delta
+            marker = "  *" if improved_s3 else ""
+            if improved_s3:
+                best_s3_val = val_mse
+                s3_patience = 0
+                torch.save(model.state_dict(), stage3_ckpt)
+                if val_mse < best_val_mse:
+                    best_val_mse = val_mse
+                    best_val_mae = val_mae
+                    best_test_mse = test_m["mse"]
+                    best_test_mae = test_m["mae"]
+                    best_epoch = epoch + 1
+                    best_stage = "stage3"
+            else:
+                s3_patience += 1
+
+            diag_str = "  ".join(
+                f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
+                for k, v in route_diag.items()
+                if k not in ("route_path", "route_state")
+            )
+            print(
+                f"[Stage3 epoch {epoch+1:4d}]"
+                f"  train_task={tr['task_loss']:.6f}"
+                f"  train_route_state={tr['route_state_loss']:.6f}"
+                f"  val_mse={val_mse:.6f}  val_mae={val_mae:.6f}"
+                f"  val_route_state={val_m['route_state_loss']:.6f}"
+                f"  test_mse={test_m['mse']:.6f}  test_mae={test_m['mae']:.6f}"
+                + (f"  [{diag_str}]" if diag_str else "")
+                + marker
+            )
+
+            if (
+                cfg.early_stop
+                and s3_patience >= cfg.route_stage_patience
+                and epoch + 1 >= cfg.route_stage_min_epochs
+            ):
+                print(f"  Stage 3 early stopping at epoch {epoch + 1}.")
+                break
+
+        # Reload Stage 3 best
+        if os.path.exists(stage3_ckpt):
+            model.load_state_dict(torch.load(stage3_ckpt, weights_only=True))
+
+    # -------------------------------------------------------------------
+    # Joint finetune (optional)
+    # -------------------------------------------------------------------
+    if cfg.joint_finetune_epochs > 0:
+        print(f"\n--- Joint finetune ({cfg.joint_finetune_epochs} epochs, lr={cfg.joint_finetune_lr}) ---")
+        model.nm.freeze_base_predictor()
+        for p in model.fm.parameters():
+            p.requires_grad_(True)
+        model.nm.unfreeze_route_modules()
+
+        joint_params = list(model.fm.parameters()) + model.nm.parameters_route_modules()
+        jf_optim = torch.optim.Adam(
+            joint_params, lr=cfg.joint_finetune_lr, weight_decay=cfg.weight_decay
+        )
+
+        for epoch in range(cfg.joint_finetune_epochs):
+            tr = _train_epoch_joint(model, dataloader.train_loader, jf_optim, cfg, joint_params)
+            val_m = _eval_loader(model, dataloader.val_loader, cfg, metrics)
+            test_m = _eval_loader(model, dataloader.test_loader, cfg, metrics)
+            val_mse = val_m["mse"]
+
+            improved = val_mse < best_val_mse - cfg.early_stop_delta
+            marker = "  *" if improved else ""
+            if improved:
+                best_val_mse = val_mse
+                best_val_mae = val_m["mae"]
+                best_test_mse = test_m["mse"]
+                best_test_mae = test_m["mae"]
+                best_epoch = epoch + 1
+                best_stage = "joint"
+
+            print(
+                f"[Joint epoch {epoch+1:4d}]"
+                f"  train_task={tr['task_loss']:.6f}"
+                f"  val_mse={val_mse:.6f}"
+                f"  test_mse={test_m['mse']:.6f}"
+                + marker
+            )
+
     train_time = time.time() - t0
-    result = {
+
+    # Final route diagnostics (from last eval pass)
+    final_route_diag = model.nm.get_route_diagnostics()
+
+    result: dict[str, Any] = {
         "exp_name": cfg.exp_name,
         "dataset": cfg.dataset,
         "backbone": cfg.backbone,
@@ -404,11 +686,12 @@ def _run_trial(cfg: StateRouteConfig, seed: int, ckpt_path: str) -> dict[str, An
         "best_test_mse": best_test_mse,
         "best_test_mae": best_test_mae,
         "best_epoch": best_epoch,
+        "best_stage": best_stage,
         "train_time_sec": round(train_time, 1),
+        "route_diagnostics": final_route_diag,
     }
 
-    # Explicitly release GPU memory before the next trial
-    del model, optimizer, metrics
+    del model, metrics
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -426,8 +709,8 @@ def _result_dir(cfg: StateRouteConfig) -> str:
         cfg.dataset,
         cfg.backbone,
         f"pred_len_{cfg.pred_len}",
-        f"path_{cfg.route_path}",
-        f"state_{cfg.route_state}",
+        cfg.route_path,
+        cfg.route_state,
     )
 
 
@@ -435,13 +718,11 @@ def _write_results(cfg: StateRouteConfig, trials: list[dict]) -> None:
     out_dir = _result_dir(cfg)
     os.makedirs(out_dir, exist_ok=True)
 
-    # trials.jsonl
     trials_path = os.path.join(out_dir, "trials.jsonl")
     with open(trials_path, "w") as f:
         for trial in trials:
             f.write(json.dumps(trial) + "\n")
 
-    # summary.json
     scalar_keys = [
         "best_val_mse", "best_val_mae",
         "best_test_mse", "best_test_mae",
@@ -453,13 +734,31 @@ def _write_results(cfg: StateRouteConfig, trials: list[dict]) -> None:
         if vals:
             summary[key + "_mean"] = float(np.mean(vals))
             summary[key + "_std"] = float(np.std(vals))
+
+    # Best stage counts
+    stage_counts: dict[str, int] = {}
+    for t in trials:
+        s = t.get("best_stage", "unknown")
+        stage_counts[s] = stage_counts.get(s, 0) + 1
+    summary["best_stage_counts"] = stage_counts
     summary["n_trials"] = len(trials)
+
+    # Aggregate route diagnostics (mean over trials for numeric fields)
+    all_diags = [t.get("route_diagnostics", {}) for t in trials]
+    agg_diag: dict[str, Any] = {}
+    if all_diags and all_diags[0]:
+        for k in all_diags[0]:
+            vals_d = [d[k] for d in all_diags if k in d]
+            if vals_d and isinstance(vals_d[0], float):
+                agg_diag[k] = float(np.mean(vals_d))
+            else:
+                agg_diag[k] = vals_d[0] if vals_d else None
+    summary["route_diagnostics_mean"] = agg_diag
 
     summary_path = os.path.join(out_dir, "summary.json")
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
 
-    # config.json
     config_path = os.path.join(out_dir, "config.json")
     with open(config_path, "w") as f:
         json.dump(asdict(cfg), f, indent=2)
@@ -467,11 +766,11 @@ def _write_results(cfg: StateRouteConfig, trials: list[dict]) -> None:
     print(f"\n[Results] Written to {out_dir}")
     print(
         f"  test_mse = {summary.get('best_test_mse_mean', float('nan')):.6f}"
-        f" ± {summary.get('best_test_mse_std', float('nan')):.6f}"
+        f" \u00b1 {summary.get('best_test_mse_std', float('nan')):.6f}"
     )
     print(
         f"  test_mae = {summary.get('best_test_mae_mean', float('nan')):.6f}"
-        f" ± {summary.get('best_test_mae_std', float('nan')):.6f}"
+        f" \u00b1 {summary.get('best_test_mae_std', float('nan')):.6f}"
     )
 
 
@@ -481,7 +780,7 @@ def _write_results(cfg: StateRouteConfig, trials: list[dict]) -> None:
 
 def _parse_args(argv=None) -> StateRouteConfig:
     parser = argparse.ArgumentParser(
-        description="Train SANRouteNorm (single-level SAN base) on a single experiment."
+        description="Train SANRouteNorm (three-stage protocol)."
     )
     cfg = StateRouteConfig()
     defaults = asdict(cfg)
@@ -493,7 +792,9 @@ def _parse_args(argv=None) -> StateRouteConfig:
                 f"--no-{field.replace('_', '-')}", dest=field, action="store_false"
             )
         else:
-            parser.add_argument(arg, type=type(value) if value is not None else str, default=value)
+            parser.add_argument(
+                arg, type=type(value) if value is not None else str, default=value
+            )
     args = parser.parse_args(argv)
     return StateRouteConfig(**vars(args))
 
@@ -501,25 +802,41 @@ def _parse_args(argv=None) -> StateRouteConfig:
 def main(argv=None):
     cfg = _parse_args(argv)
     seeds = cfg.seed_list()
-    print(f"[Config] exp_name={cfg.exp_name}  dataset={cfg.dataset}"
-          f"  backbone={cfg.backbone}  window={cfg.window}  pred_len={cfg.pred_len}")
-    print(f"[Config] seeds={seeds}  san_period_len={cfg.san_period_len}"
-          f"  san_stride={cfg.san_stride}  device={cfg.device}")
-    print(f"[Config] route_path={cfg.route_path}  route_state={cfg.route_state}"
-          f"  route_state_loss_scale={cfg.route_state_loss_scale}")
+    print(
+        f"[Config] exp_name={cfg.exp_name}  dataset={cfg.dataset}"
+        f"  backbone={cfg.backbone}  window={cfg.window}  pred_len={cfg.pred_len}"
+    )
+    print(
+        f"[Config] seeds={seeds}  san_period_len={cfg.san_period_len}"
+        f"  san_stride={cfg.san_stride}  device={cfg.device}"
+    )
+    print(f"[Config] san_pretrain_epochs={cfg.san_pretrain_epochs}")
+    print(
+        f"[Config] route_path={cfg.route_path}  route_state={cfg.route_state}"
+        f"  route_state_loss_scale={cfg.route_state_loss_scale}"
+    )
+    print(
+        f"[Config] route_stage_epochs={cfg.route_stage_epochs}"
+        f"  route_stage_lr={cfg.route_stage_lr}"
+        f"  route_task_loss_scale={cfg.route_task_loss_scale}"
+    )
+    print(
+        f"[Config] joint_finetune_epochs={cfg.joint_finetune_epochs}"
+        f"  route_require_nonoverlap={cfg.route_require_nonoverlap}"
+    )
 
     trials: list[dict] = []
     with tempfile.TemporaryDirectory() as tmp_dir:
         for seed in seeds:
             print(f"\n{'='*60}")
             print(f"[Seed {seed}]")
-            ckpt_path = os.path.join(tmp_dir, f"best_seed{seed}.pt")
-            trial = _run_trial(cfg, seed, ckpt_path)
+            trial = _run_trial(cfg, seed, tmp_dir)
             trials.append(trial)
             print(
                 f"[Seed {seed}] done — test_mse={trial['best_test_mse']:.6f}"
                 f"  test_mae={trial['best_test_mae']:.6f}"
                 f"  best_epoch={trial['best_epoch']}"
+                f"  best_stage={trial['best_stage']}"
             )
 
     _write_results(cfg, trials)

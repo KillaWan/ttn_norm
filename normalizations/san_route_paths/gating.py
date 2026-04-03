@@ -1,16 +1,27 @@
-"""GatingPath — fixed 4-expert bank with state-conditioned soft gating.
+"""GatingPath — state-conditioned coefficient assignment over existing restoration factors.
 
-Expert bank (fixed structure, not configurable per state):
-    e1: identity                 y_base
-    e2: local additive delta     Conv1d(kernel=3, padding=1)
-    e3: smooth additive delta    2-layer dilated Conv1d
-    e4: osc additive delta       depthwise Conv1d + pointwise Conv1d
+Taxonomy: factor allocation / coefficient assignment.
+This path does NOT generate new content, does NOT perform MoE routing, does NOT
+modify time coordinates, and does NOT alter the value-domain mapping.  It only
+re-weights the fixed decomposition factors already present in y_base.
 
-All expert delta heads are zero-initialised so every expert starts as y_base.
-The gating head is also zero-initialised, yielding uniform softmax weights (0.25
-each), so the initial output is the average of four identical y_base terms = y_base.
+Decomposition of y_base into four fixed factors:
+    mu_slow  = low-pass(base_time_mean)        slow level trend
+    mu_fast  = base_time_mean - mu_slow         fast level residual
+    r_smooth = low-pass(y_base - base_time_mean)  smooth residual
+    r_osc    = (y_base - base_time_mean) - r_smooth  oscillatory residual
 
-Gating logits shape: (B, H, C, 4) — per-channel soft mixture.
+Low-pass filters are non-learnable (replicate-padded avg_pool1d).
+
+Two small gate heads map future_state_time → per-channel 2-branch softmax
+coefficients for (mu_slow, mu_fast) and (r_smooth, r_osc) respectively.
+
+Identity initialisation:  gate weights & biases are zero-initialised so
+    softmax(0,0) = (0.5, 0.5)  →  coefficients = 2 * (0.5, 0.5) = (1, 1)
+    y_route = 1*mu_slow + 1*mu_fast + 1*r_smooth + 1*r_osc = y_base.
+
+Under the non-overlap main protocol, future_state_time is the patch-wise
+broadcasted state, so the resulting coefficients are patch-level constants.
 
 Unified path interface:
     forward(y_norm, y_base, future_state_hat, future_state_time,
@@ -23,44 +34,57 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Fixed smoothing kernel sizes (odd, non-learnable)
+MU_SMOOTH_K = 5
+R_SMOOTH_K = 5
+
+
+def _fixed_smooth(x: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    """Non-learnable low-pass filter via replicate-padded avg_pool1d.
+
+    Args:
+        x: (B, H, C)
+        kernel_size: odd integer.
+    Returns:
+        smoothed (B, H, C).
+    """
+    # avg_pool1d expects (B, C, H)
+    pad = kernel_size // 2
+    xt = x.permute(0, 2, 1)                          # (B, C, H)
+    xt = F.pad(xt, (pad, pad), mode="replicate")      # (B, C, H + 2*pad)
+    xt = F.avg_pool1d(xt, kernel_size=kernel_size, stride=1)  # (B, C, H)
+    return xt.permute(0, 2, 1)                        # (B, H, C)
+
 
 class GatingPath(nn.Module):
-    """4-expert soft-gating path.
+    """State-conditioned factor coefficient assignment over existing y_base factors.
 
-    Expert inputs: cat(y_base, future_state_time) along C → (B, H, 2C),
-                   permuted to (B, 2C, H) for Conv1d.
-    Gating input : future_state_time → (B, H, C*4) → reshape (B, H, C, 4) → softmax.
+    This path decomposes y_base into four fixed (non-learnable) factors and
+    assigns state-conditioned coefficients to each via two 2-branch softmax gates.
+    No new content is generated — the output is strictly a re-weighting of
+    components already present in y_base.
     """
 
     def __init__(self, pred_len: int, enc_in: int, sigma_min: float = 1e-3, **kwargs):
         super().__init__()
-        C2 = 2 * enc_in
-        hidden = max(enc_in, 16)
 
-        # Expert 2: local — single Conv1d, zero-init
-        self.e2_head = nn.Conv1d(C2, enc_in, kernel_size=3, padding=1)
-        nn.init.zeros_(self.e2_head.weight)
-        nn.init.zeros_(self.e2_head.bias)
+        # Gate head for (mu_slow, mu_fast): zero-init → identity at start
+        self.mu_gate_head = nn.Linear(enc_in, enc_in * 2)
+        nn.init.zeros_(self.mu_gate_head.weight)
+        nn.init.zeros_(self.mu_gate_head.bias)
 
-        # Expert 3: smooth — two dilated convs, last layer zero-init
-        self.e3_head = nn.Sequential(
-            nn.Conv1d(C2, hidden, kernel_size=3, dilation=1, padding=1),
-            nn.GELU(),
-            nn.Conv1d(hidden, enc_in, kernel_size=3, dilation=2, padding=2),
-        )
-        nn.init.zeros_(self.e3_head[-1].weight)
-        nn.init.zeros_(self.e3_head[-1].bias)
+        # Gate head for (r_smooth, r_osc): zero-init → identity at start
+        self.r_gate_head = nn.Linear(enc_in, enc_in * 2)
+        nn.init.zeros_(self.r_gate_head.weight)
+        nn.init.zeros_(self.r_gate_head.bias)
 
-        # Expert 4: osc — depthwise + pointwise, pointwise zero-init
-        self.e4_dw = nn.Conv1d(C2, C2, kernel_size=3, padding=1, groups=C2)
-        self.e4_pw = nn.Conv1d(C2, enc_in, kernel_size=1)
-        nn.init.zeros_(self.e4_pw.weight)
-        nn.init.zeros_(self.e4_pw.bias)
-
-        # Gating head: (B, H, C) → (B, H, C*4) → (B, H, C, 4), zero-init
-        self.gate_head = nn.Linear(enc_in, enc_in * 4)
-        nn.init.zeros_(self.gate_head.weight)
-        nn.init.zeros_(self.gate_head.bias)
+        # Diagnostic cache (read via get_route_diagnostics, not part of loss)
+        self._diag_mu_gate_entropy_mean: float = 0.0
+        self._diag_r_gate_entropy_mean: float = 0.0
+        self._diag_mu_branch_usage_mean: list = [1.0, 1.0]
+        self._diag_r_branch_usage_mean: list = [1.0, 1.0]
+        self._diag_mu_fast_weight_mean: float = 1.0
+        self._diag_r_osc_weight_mean: float = 1.0
 
     def forward(
         self,
@@ -70,33 +94,64 @@ class GatingPath(nn.Module):
         future_state_time: torch.Tensor,  # (B, H, C)
         mu_base_fut: torch.Tensor,
         std_base_fut: torch.Tensor,
-        base_time_mean: torch.Tensor,
+        base_time_mean: torch.Tensor,     # (B, H, C)
         base_time_std: torch.Tensor,
     ) -> torch.Tensor:
         B, H, C = y_base.shape
+        mu_base_time = base_time_mean                         # (B, H, C)
+        r_base = y_base - mu_base_time                        # (B, H, C)
 
-        # Shared expert input: (B, 2C, H)
-        inp = torch.cat([y_base, future_state_time], dim=-1).permute(0, 2, 1)
+        # --- Fixed low-pass decomposition of mu and r ---
+        mu_slow = _fixed_smooth(mu_base_time, MU_SMOOTH_K)    # (B, H, C)
+        mu_fast = mu_base_time - mu_slow                      # (B, H, C)
 
-        # Expert 1: identity
-        e1 = y_base                                             # (B, H, C)
+        r_smooth = _fixed_smooth(r_base, R_SMOOTH_K)          # (B, H, C)
+        r_osc = r_base - r_smooth                             # (B, H, C)
 
-        # Expert 2: local
-        e2 = y_base + self.e2_head(inp).permute(0, 2, 1)       # (B, H, C)
+        # --- State-conditioned coefficient gates ---
+        # Under non-overlap protocol, future_state_time is patch-wise broadcasted
+        # state, so the resulting coefficients are patch-level constants.
+        mu_logits = self.mu_gate_head(future_state_time).view(B, H, C, 2)
+        r_logits = self.r_gate_head(future_state_time).view(B, H, C, 2)
 
-        # Expert 3: smooth
-        e3 = y_base + self.e3_head(inp).permute(0, 2, 1)       # (B, H, C)
+        mu_weights = 2.0 * F.softmax(mu_logits, dim=-1)      # (B, H, C, 2)
+        r_weights = 2.0 * F.softmax(r_logits, dim=-1)        # (B, H, C, 2)
 
-        # Expert 4: oscillatory (depthwise → GELU → pointwise)
-        e4_feat = F.gelu(self.e4_dw(inp))                      # (B, 2C, H)
-        e4 = y_base + self.e4_pw(e4_feat).permute(0, 2, 1)     # (B, H, C)
+        # --- Factor re-weighting (identity when all weights = 1) ---
+        y_route = (
+            mu_weights[..., 0] * mu_slow
+            + mu_weights[..., 1] * mu_fast
+            + r_weights[..., 0] * r_smooth
+            + r_weights[..., 1] * r_osc
+        )                                                     # (B, H, C)
 
-        # Stack experts: (B, H, C, 4)
-        experts = torch.stack([e1, e2, e3, e4], dim=-1)
+        # --- Diagnostics (no gradient, logging only) ---
+        with torch.no_grad():
+            mu_probs = F.softmax(mu_logits, dim=-1)           # (B, H, C, 2)
+            r_probs = F.softmax(r_logits, dim=-1)
 
-        # Gating: (B, H, C*4) → (B, H, C, 4) → softmax
-        logits  = self.gate_head(future_state_time).view(B, H, C, 4)
-        weights = F.softmax(logits, dim=-1)                     # (B, H, C, 4)
+            mu_ent = -(mu_probs * mu_probs.clamp_min(1e-9).log()).sum(dim=-1).mean()
+            r_ent = -(r_probs * r_probs.clamp_min(1e-9).log()).sum(dim=-1).mean()
+            self._diag_mu_gate_entropy_mean = float(mu_ent.item())
+            self._diag_r_gate_entropy_mean = float(r_ent.item())
 
-        y_route = (experts * weights).sum(dim=-1)               # (B, H, C)
+            self._diag_mu_branch_usage_mean = [
+                float(mu_weights[..., k].mean().item()) for k in range(2)
+            ]
+            self._diag_r_branch_usage_mean = [
+                float(r_weights[..., k].mean().item()) for k in range(2)
+            ]
+            self._diag_mu_fast_weight_mean = float(mu_weights[..., 1].mean().item())
+            self._diag_r_osc_weight_mean = float(r_weights[..., 1].mean().item())
+
         return y_route
+
+    def get_route_diagnostics(self) -> dict:
+        return {
+            "mu_gate_entropy_mean": self._diag_mu_gate_entropy_mean,
+            "r_gate_entropy_mean": self._diag_r_gate_entropy_mean,
+            "mu_branch_usage_mean": self._diag_mu_branch_usage_mean,
+            "r_branch_usage_mean": self._diag_r_branch_usage_mean,
+            "mu_fast_weight_mean": self._diag_mu_fast_weight_mean,
+            "r_osc_weight_mean": self._diag_r_osc_weight_mean,
+        }

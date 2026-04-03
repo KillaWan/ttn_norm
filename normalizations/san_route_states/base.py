@@ -1,19 +1,24 @@
 """Base interface for route state implementations.
 
-Each state must implement:
-    name                      — string identifier
-    extract_hist_state        — build hist_state from the full historical context
-    build_future_oracle_state — build oracle target for the state prediction loss
-    adapt_future_state        — post-process raw predictor output (identity for most states)
+Design contract
+---------------
+extract_hist_state and build_future_oracle_state define *raw physical quantities*
+(e.g. first-order differences of patch mean, log-std differences).  They do NOT
+apply any general-purpose scale normalisation — that is the responsibility of the
+SANRouteNorm framework layer, which calls _normalize_patch_state() on the outputs.
 
-All methods receive the complete set of available inputs so that future states can
-draw from any of them (raw signal, windows, or pre-computed stats).  Implementations
-should simply ignore parameters they do not need.
+adapt_future_state is responsible only for *domain constraints* (e.g. clamping,
+applying a bijection to keep values in a valid domain).  It must NOT perform
+general-purpose standardisation, which is handled upstream by SANRouteNorm.
 
 Output shape contract (patch-wise):
-    extract_hist_state        -> (B, P_hist, C)
-    build_future_oracle_state -> (B, P_fut,  C)
-    adapt_future_state        -> (B, P_fut,  C)
+    extract_hist_state        -> (B, P_hist, C)   raw physical state
+    build_future_oracle_state -> (B, P_fut,  C)   raw oracle target (before normalisation)
+    adapt_future_state        -> (B, P_fut,  C)   domain-constrained predictor output
+
+All methods receive the complete set of available inputs so implementations can
+draw from any of them (raw signal, windows, pre-computed stats).  Unused
+parameters should simply be ignored.
 """
 from __future__ import annotations
 
@@ -23,7 +28,13 @@ import torch
 
 
 class RouteStateBase(ABC):
-    """Interface contract for route state implementations."""
+    """Interface contract for route state implementations.
+
+    Implementations define the raw physical quantity for a route state.
+    SANRouteNorm applies _normalize_patch_state() after extraction so that
+    the route_state_predictor always receives and predicts scale-normalised inputs.
+    State files must not apply their own general standardisation.
+    """
 
     @property
     @abstractmethod
@@ -39,7 +50,11 @@ class RouteStateBase(ABC):
         std_hist: torch.Tensor,     # (B, P_hist, C)  per-window std
         sigma_min: float,
     ) -> torch.Tensor:
-        """Compute hist_state (B, P_hist, C) from historical context."""
+        """Compute raw hist_state (B, P_hist, C) from historical context.
+
+        Returns the raw physical quantity only.  SANRouteNorm normalises the
+        output with _normalize_patch_state before feeding it to route_state_predictor.
+        """
 
     @abstractmethod
     def build_future_oracle_state(
@@ -50,11 +65,21 @@ class RouteStateBase(ABC):
         oracle_std: torch.Tensor,    # (B, P_fut, C)  per-window oracle std
         sigma_min: float,
     ) -> torch.Tensor:
-        """Compute oracle target for the state prediction loss (B, P_fut, C)."""
+        """Compute raw oracle target (B, P_fut, C) for the state prediction loss.
+
+        Returns the raw physical quantity only.  SANRouteNorm normalises the
+        output with _normalize_patch_state before computing the MSE loss against
+        the (already normalised) route_state_predictor output.
+        """
 
     @abstractmethod
     def adapt_future_state(
         self,
         future_state_hat_raw: torch.Tensor,  # (B, P_fut, C)
     ) -> torch.Tensor:
-        """Post-process raw predictor output into the final state representation."""
+        """Apply domain constraints to raw predictor output.
+
+        Responsible only for domain-validity (e.g. clamping to a legal range,
+        applying a bijection).  General-purpose scale normalisation is handled
+        by SANRouteNorm after this call.
+        """

@@ -1,11 +1,13 @@
 """LocalTransportPath — monotonic piecewise-linear spline transform.
 
-Applies a per-timestep, channel-shared monotonic PL spline to y_base.
-Spline parameters are generated from future_state_time by a shared linear head.
+Applies a per-timestep, per-channel monotonic PL spline to y_base.
+Each (b, t, c) position receives its own K-bin spline, whose parameters are
+generated from future_state_time by a shared linear head that maps the C-dim
+feature vector to C × 2K scalar parameters.
 
-Identity initialisation: zero-init head produces uniform bin widths and unit
-slopes, which yields y_route == y_base for all inputs (including extrapolation
-beyond the clip domain).
+Identity initialisation: zero-init head → softmax(0)=1/K (uniform widths),
+exp(0)=1 (unit slopes) → y_route == y_base for all inputs including
+out-of-domain values (linear extrapolation with boundary slope).
 
 Unified path interface:
     forward(y_norm, y_base, future_state_hat, future_state_time,
@@ -20,15 +22,15 @@ import torch.nn.functional as F
 
 
 class LocalTransportPath(nn.Module):
-    """Monotonic K-bin piecewise-linear spline over y_base.
+    """Monotonic K-bin piecewise-linear spline — per-timestep, per-channel.
 
-    The spline is parametrised by:
-      - K bin widths  (softmax → sum to domain, so positive and normalised)
-      - K bin slopes  (exp → positive; init 1.0 gives identity)
+    The head maps future_state_time (B, H, C) → (B, H, C, 2K):
+      first K values per channel: raw bin widths  → softmax → sum to domain
+      last  K values per channel: raw bin slopes  → exp     → strictly positive
 
-    Values outside the nominal domain [-CLIP, CLIP] are handled by linear
-    extrapolation using the boundary bin slope, so identity is preserved
-    everywhere at initialisation, not just inside the clip range.
+    Values outside the nominal domain are linearly extrapolated using the
+    boundary bin slope, preserving the identity mapping at initialisation
+    for any input magnitude.
     """
 
     K: int = 8
@@ -38,18 +40,25 @@ class LocalTransportPath(nn.Module):
         super().__init__()
         self.pred_len = pred_len
         self.enc_in = enc_in
-        self.domain = 2.0 * self.CLIP  # total width = 12
+        self.domain = 2.0 * self.CLIP  # total domain width = 12
 
-        # Shared head: maps C state features → 2K spline params per timestep.
-        # Zero-init → softmax(0)=1/K (uniform widths), exp(0)=1 (unit slopes) → identity.
-        self.head = nn.Linear(enc_in, 2 * self.K)
+        # Head: C features → C × 2K per-channel spline params.
+        # Output (B, H, C * 2K) reshaped to (B, H, C, 2K).
+        # Zero-init: widths uniform (12/K each), slopes = 1 → identity.
+        self.head = nn.Linear(enc_in, enc_in * 2 * self.K)
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
+
+        # Diagnostic cache (read via get_route_diagnostics, not part of loss)
+        self._diag_mean_abs_log_slope: float = 0.0
+        self._diag_mean_abs_slope_minus_1: float = 0.0
+        self._diag_mean_bin_entropy: float = 0.0
+        self._diag_mean_out_of_domain_ratio: float = 0.0
 
     def forward(
         self,
         y_norm: torch.Tensor,
-        y_base: torch.Tensor,           # (B, H, C)
+        y_base: torch.Tensor,             # (B, H, C)
         future_state_hat: torch.Tensor,
         future_state_time: torch.Tensor,  # (B, H, C)
         mu_base_fut: torch.Tensor,
@@ -60,47 +69,60 @@ class LocalTransportPath(nn.Module):
         B, H, C = y_base.shape
         K = self.K
 
-        # Generate spline params: (B, H, 2K)
-        raw = self.head(future_state_time)
-        raw_w, raw_s = raw[..., :K], raw[..., K:]  # (B, H, K) each
+        # Per-channel spline params: (B, H, C, 2K)
+        raw = self.head(future_state_time).view(B, H, C, 2 * K)
+        raw_w = raw[..., :K]   # (B, H, C, K) — raw bin widths
+        raw_s = raw[..., K:]   # (B, H, C, K) — raw bin slopes
 
-        # Bin widths: softmax → all positive, sum to domain
-        widths = F.softmax(raw_w, dim=-1) * self.domain  # (B, H, K)
+        # Widths: softmax over K bins → positive, sum to domain (12)
+        widths = F.softmax(raw_w, dim=-1) * self.domain   # (B, H, C, K)
 
-        # Bin slopes: exp → positive (1.0 at zero init)
-        slopes = torch.exp(raw_s)  # (B, H, K)
+        # Slopes: exp → positive (initialised to 1.0)
+        slopes = torch.exp(raw_s)                          # (B, H, C, K)
 
-        # x-boundaries: (B, H, K+1) starting from -CLIP
-        zeros = torch.zeros(B, H, 1, device=y_base.device, dtype=y_base.dtype)
-        x_boundaries = torch.cat(
-            [zeros, torch.cumsum(widths, dim=-1)], dim=-1
-        ) - self.CLIP  # [..., 0] = -CLIP, [..., K] = CLIP
+        # x-boundaries: (B, H, C, K+1), first entry = -CLIP
+        zeros = torch.zeros(B, H, C, 1, device=y_base.device, dtype=y_base.dtype)
+        x_boundaries = (
+            torch.cat([zeros, torch.cumsum(widths, dim=-1)], dim=-1) - self.CLIP
+        )  # [..., 0] = -CLIP, [..., K] = CLIP
 
-        # y-boundaries: (B, H, K+1) starting from -CLIP
-        heights = slopes * widths  # (B, H, K)
-        y_boundaries = torch.cat(
-            [zeros, torch.cumsum(heights, dim=-1)], dim=-1
-        ) - self.CLIP
+        # y-boundaries: (B, H, C, K+1), first entry = -CLIP
+        heights = slopes * widths                          # (B, H, C, K)
+        y_boundaries = (
+            torch.cat([zeros, torch.cumsum(heights, dim=-1)], dim=-1) - self.CLIP
+        )
 
-        # For each value in y_base find the containing bin and interpolate.
-        # y_base: (B, H, C); boundaries are channel-shared (B, H, K+/-1).
-        x = y_base  # extrapolation handles out-of-domain correctly
+        # Bin lookup: for each (b, h, c) find which bin y_base falls into.
+        # x: (B, H, C, 1)  vs  x_boundaries: (B, H, C, K+1)
+        x = y_base.unsqueeze(-1)                          # (B, H, C, 1)
+        mask = (x >= x_boundaries)                        # (B, H, C, K+1)
+        bin_idx = mask.sum(dim=-1).clamp(1, K) - 1        # (B, H, C) in [0, K-1]
 
-        # Bin index: count how many left boundaries are <= x, clamp to [0, K-1]
-        # x: (B, H, C, 1)  vs  x_boundaries: (B, H, 1, K+1)
-        mask = (x.unsqueeze(-1) >= x_boundaries.unsqueeze(2))  # (B, H, C, K+1)
-        bin_idx = mask.sum(dim=-1).clamp(1, K) - 1             # (B, H, C) in [0, K-1]
-
-        # Expand boundary tensors to (B, H, C, K+/-1) for gather
-        idx = bin_idx.unsqueeze(-1)  # (B, H, C, 1)
-        x_b = x_boundaries.unsqueeze(2).expand(B, H, C, K + 1)
-        y_b = y_boundaries.unsqueeze(2).expand(B, H, C, K + 1)
-        s_b = slopes.unsqueeze(2).expand(B, H, C, K)
-
-        x_left  = x_b.gather(-1, idx).squeeze(-1)   # (B, H, C)
-        y_left  = y_b.gather(-1, idx).squeeze(-1)   # (B, H, C)
-        slope_k = s_b.gather(-1, idx).squeeze(-1)   # (B, H, C)
+        idx = bin_idx.unsqueeze(-1)                        # (B, H, C, 1)
+        x_left  = x_boundaries.gather(-1, idx).squeeze(-1)  # (B, H, C)
+        y_left  = y_boundaries.gather(-1, idx).squeeze(-1)  # (B, H, C)
+        slope_k = slopes.gather(-1, idx).squeeze(-1)         # (B, H, C)
 
         # Linear interpolation within bin (extrapolation uses boundary slope)
-        y_route = y_left + slope_k * (x - x_left)
+        y_route = y_left + slope_k * (y_base - x_left)
+
+        with torch.no_grad():
+            # |log(slope)| = |raw_s| since slopes = exp(raw_s)
+            self._diag_mean_abs_log_slope = float(raw_s.abs().mean().item())
+            self._diag_mean_abs_slope_minus_1 = float((slopes - 1.0).abs().mean().item())
+            # Bin entropy: entropy of softmax(raw_w) = widths / domain
+            probs = widths / self.domain   # (B, H, C, K), sums to 1 per bin
+            bin_entropy = -(probs * probs.clamp_min(1e-9).log()).sum(dim=-1).mean()
+            self._diag_mean_bin_entropy = float(bin_entropy.item())
+            out_of_domain = ((y_base < -self.CLIP) | (y_base > self.CLIP)).float().mean()
+            self._diag_mean_out_of_domain_ratio = float(out_of_domain.item())
+
         return y_route
+
+    def get_route_diagnostics(self) -> dict:
+        return {
+            "mean_abs_log_slope": self._diag_mean_abs_log_slope,
+            "mean_abs_slope_minus_1": self._diag_mean_abs_slope_minus_1,
+            "mean_bin_entropy": self._diag_mean_bin_entropy,
+            "mean_out_of_domain_ratio": self._diag_mean_out_of_domain_ratio,
+        }
