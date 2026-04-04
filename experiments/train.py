@@ -264,6 +264,7 @@ def _build_backbone_kwargs(cfg: TrainConfig, num_features: int, label_len: int) 
             activation="gelu",
             distil=True,
             mix=True,
+            time_embed=False,
         )
     if name == "Autoformer":
         return dict(

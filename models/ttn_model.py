@@ -94,6 +94,12 @@ class TTNModel(nn.Module):
     ) -> torch.Tensor:
         batch_x, dec_inp = self.normalize(batch_x, dec_inp=dec_inp)
         if self.is_former:
+            if dec_inp is None:
+                pred_len = getattr(self.fm, "pred_len", batch_x.shape[1])
+                dec_inp = torch.zeros(
+                    batch_x.shape[0], pred_len, batch_x.shape[2],
+                    dtype=batch_x.dtype, device=batch_x.device,
+                )
             pred = self.fm(batch_x, batch_x_enc, dec_inp, dec_inp_enc)
         else:
             pred = self.fm(batch_x)
