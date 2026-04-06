@@ -6,27 +6,28 @@ Stages are executed in the order specified by `stage_order` (comma-separated).
 Valid tokens: stage1, lp_pretrain, stage2, stage3, joint.
 
 Default stage_order when left empty:
-  lp_state_correction + lp_state : stage1, lp_pretrain, stage2, joint
-  all other combinations          : stage1, stage2, stage3, joint
+  route_path="none", route_state="none" (pure SAN):
+                                : stage1, stage2
+  lp_state_correction + lp_state: stage1, lp_pretrain, stage2
+  all other route combinations  : stage1, stage2, stage3, joint
 
 Stage semantics
 ---------------
   stage1:
       Optimizer: nm.predictor only
       Loss:      nm.compute_base_aux_loss
+      lp combo:  std-only aux loss; mu loss is inactive
       Eval:      val base_aux_loss (patience-based early stop)
 
   lp_pretrain  [lp_state_correction + lp_state only]:
       Optimizer: nm.lp_state_predictor only
-      Frozen:    fm, nm.predictor, nm.route_path_impl
-      Loss:      nm.compute_route_state_loss (lp sequence MSE)
+      Frozen:    fm, nm.predictor
+      Loss:      nm.compute_route_state_loss (patch-level lp mean MSE)
       Eval:      val route_state_loss (patience-based early stop)
       Max epochs: route_stage_epochs
 
   stage2:
-      Standard:  fm only; nm fully frozen; task loss
-      lp combo:  fm + nm.lp_state_predictor; nm.predictor frozen; task loss
-                 lp_state_predictor and backbone co-adapt to minimise task.
+      All combos: fm only; nm fully frozen; task loss only
       Eval:      val MSE (patience-based early stop)
 
   stage3  [not valid for lp_state_correction + lp_state]:
@@ -35,10 +36,8 @@ Stage semantics
       Eval:      val MSE (patience-based early stop)
       Max epochs: route_stage_epochs
 
-  joint:
-      Standard:  fm + nm.route_modules; nm.predictor frozen; task loss
-      lp combo:  fm + nm.predictor + nm.lp_state_predictor; all trainable
-                 loss: task + route_state_loss_scale * route_state_loss
+  joint  [not valid for lp_state_correction + lp_state]:
+      Optimizer: fm + nm.route_modules; nm.predictor frozen; task loss
 
 Each stage starts from the previous stage's best checkpoint.
 best_stage records the stage that produced the best overall val MSE.
@@ -197,16 +196,22 @@ def _parse_stage_order(cfg: StateRouteConfig) -> list[str]:
     """Return ordered list of stage tokens to execute.
 
     Empty stage_order → default for the route combo:
-      lp_state_correction + lp_state : ["stage1", "lp_pretrain", "stage2", "joint"]
+      pure SAN (route_path="none", route_state="none"):
+                                       ["stage1", "stage2"]
+      lp_state_correction + lp_state : ["stage1", "lp_pretrain", "stage2"]
       others                          : ["stage1", "stage2", "stage3", "joint"]
 
     Raises ValueError for unknown tokens, duplicates, or invalid combos.
+    lp combo: joint and stage3 are forbidden.
     """
     is_lp = (cfg.route_path == "lp_state_correction" and cfg.route_state == "lp_state")
+    is_pure_san = (cfg.route_path == "none" and cfg.route_state == "none")
 
     if cfg.stage_order == "":
-        if is_lp:
-            return ["stage1", "lp_pretrain", "stage2", "joint"]
+        if is_pure_san:
+            return ["stage1", "stage2"]
+        elif is_lp:
+            return ["stage1", "lp_pretrain", "stage2"]
         else:
             return ["stage1", "stage2", "stage3", "joint"]
 
@@ -222,6 +227,11 @@ def _parse_stage_order(cfg: StateRouteConfig) -> list[str]:
         raise ValueError(
             "stage3 is not valid for lp_state_correction + lp_state. "
             "Use lp_pretrain instead."
+        )
+    if is_lp and "joint" in tokens:
+        raise ValueError(
+            "joint is not valid for lp_state_correction + lp_state. "
+            "Stage 2 trains fm only with both nm modules frozen."
         )
     return tokens
 
@@ -317,7 +327,9 @@ def _train_epoch_lp_pretrain(
     optim: torch.optim.Optimizer,
     cfg: StateRouteConfig,
 ) -> dict[str, float]:
-    """lp_pretrain: nm.lp_state_predictor only, route_state_loss (lp sequence MSE)."""
+    """lp_pretrain: nm.lp_state_predictor only.
+    Loss: patch-level MSE where lp mean is defined by patch_mean(lowpass_time(raw_series)).
+    """
     model.train()
     route_state_list: list[float] = []
 
@@ -381,38 +393,6 @@ def _train_epoch_stage2(
         "task_loss": float(np.mean(task_list)) if task_list else 0.0,
         "base_aux_loss": float(np.mean(base_aux_list)) if base_aux_list else 0.0,
         "route_state_loss": float(np.mean(route_state_list)) if route_state_list else 0.0,
-    }
-
-
-def _train_epoch_stage2_lp(
-    model: nn.Module,
-    loader,
-    optim: torch.optim.Optimizer,
-    train_params: list,
-    cfg: StateRouteConfig,
-) -> dict[str, float]:
-    """Stage 2 for lp_state_correction: fm + nm.route_path_impl, task loss only."""
-    model.train()
-    loss_fn = nn.MSELoss()
-    task_list: list[float] = []
-
-    for batch_x, batch_y, _origin_y, batch_x_enc, batch_y_enc in loader:
-        batch_x = batch_x.to(cfg.device).float()
-        batch_y = batch_y.to(cfg.device).float()
-        batch_x_enc = batch_x_enc.to(cfg.device).float()
-        batch_y_enc = batch_y_enc.to(cfg.device).float()
-
-        optim.zero_grad()
-        pred = _forward(model, batch_x, batch_x_enc, batch_y_enc, cfg)
-        task_loss = loss_fn(pred, batch_y)
-        task_loss.backward()
-        torch.nn.utils.clip_grad_norm_(train_params, cfg.max_grad_norm)
-        optim.step()
-
-        task_list.append(float(task_loss.item()))
-
-    return {
-        "task_loss": float(np.mean(task_list)) if task_list else 0.0,
     }
 
 
@@ -489,43 +469,6 @@ def _train_epoch_joint(
 
     return {
         "task_loss": float(np.mean(task_list)) if task_list else 0.0,
-    }
-
-
-def _train_epoch_joint_lp(
-    model: nn.Module,
-    loader,
-    optim: torch.optim.Optimizer,
-    joint_params: list,
-    cfg: StateRouteConfig,
-) -> dict[str, float]:
-    """Joint for lp_state_correction: task + route_state_loss_scale * route_state_loss."""
-    model.train()
-    loss_fn = nn.MSELoss()
-    task_list: list[float] = []
-    route_state_list: list[float] = []
-
-    for batch_x, batch_y, _origin_y, batch_x_enc, batch_y_enc in loader:
-        batch_x = batch_x.to(cfg.device).float()
-        batch_y = batch_y.to(cfg.device).float()
-        batch_x_enc = batch_x_enc.to(cfg.device).float()
-        batch_y_enc = batch_y_enc.to(cfg.device).float()
-
-        optim.zero_grad()
-        pred = _forward(model, batch_x, batch_x_enc, batch_y_enc, cfg)
-        task_loss = loss_fn(pred, batch_y)
-        rs_loss = model.nm.compute_route_state_loss(batch_y)
-        loss = task_loss + model.nm.route_state_loss_scale * rs_loss
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(joint_params, cfg.max_grad_norm)
-        optim.step()
-
-        task_list.append(float(task_loss.item()))
-        route_state_list.append(float(rs_loss.item()))
-
-    return {
-        "task_loss": float(np.mean(task_list)) if task_list else 0.0,
-        "route_state_loss": float(np.mean(route_state_list)) if route_state_list else 0.0,
     }
 
 
@@ -758,8 +701,6 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
             for p in model.fm.parameters():
                 p.requires_grad_(False)
             model.nm.freeze_base_predictor()
-            for p in model.nm.route_path_impl.parameters():
-                p.requires_grad_(False)
             for p in model.nm.lp_state_predictor.parameters():
                 p.requires_grad_(True)
 
@@ -805,7 +746,7 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
                 last_ckpt = lp_pretrain_ckpt
 
         # ==========================================================
-        # stage2: backbone training
+        # stage2: backbone-only plugin training (nm fully frozen)
         # ==========================================================
         elif stage_name == "stage2":
             print(
@@ -813,41 +754,20 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
                 f" patience={cfg.early_stop_patience}) ---"
             )
 
-            if is_lp:
-                # lp_state_correction: fm + lp_state_predictor jointly; nm.predictor frozen
-                # lp_state_predictor and backbone co-adapt to minimise task loss
-                model.nm.freeze_base_predictor()
-                for p in model.nm.lp_state_predictor.parameters():
-                    p.requires_grad_(True)
-                for p in model.fm.parameters():
-                    p.requires_grad_(True)
-                s2_params = (
-                    list(model.fm.parameters())
-                    + list(model.nm.lp_state_predictor.parameters())
-                )
-                s2_optim = torch.optim.Adam(
-                    s2_params, lr=cfg.lr, weight_decay=cfg.weight_decay
-                )
-            else:
-                # Standard: nm fully frozen, fm only
-                model.nm.freeze_base_predictor()
-                model.nm.freeze_route_modules()
-                for p in model.fm.parameters():
-                    p.requires_grad_(True)
-                s2_params = list(model.fm.parameters())
-                s2_optim = torch.optim.Adam(
-                    s2_params, lr=cfg.lr, weight_decay=cfg.weight_decay
-                )
+            # All combos: nm fully frozen, fm only
+            model.nm.freeze_base_predictor()
+            model.nm.freeze_route_modules()
+            for p in model.fm.parameters():
+                p.requires_grad_(True)
+            s2_params = list(model.fm.parameters())
+            s2_optim = torch.optim.Adam(
+                s2_params, lr=cfg.lr, weight_decay=cfg.weight_decay
+            )
 
             s2_patience = 0
 
             for epoch in range(cfg.epochs):
-                if is_lp:
-                    tr = _train_epoch_stage2_lp(
-                        model, dataloader.train_loader, s2_optim, s2_params, cfg
-                    )
-                else:
-                    tr = _train_epoch_stage2(model, dataloader.train_loader, s2_optim, cfg)
+                tr = _train_epoch_stage2(model, dataloader.train_loader, s2_optim, cfg)
 
                 val_m = _eval_loader(model, dataloader.val_loader, cfg, metrics)
                 test_m = _eval_loader(model, dataloader.test_loader, cfg, metrics)
@@ -868,27 +788,17 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
                 else:
                     s2_patience += 1
 
-                if is_lp:
-                    print(
-                        f"[Stage2 epoch {epoch+1:4d}]"
-                        f"  train_task={tr['task_loss']:.6f}"
-                        f"  val_mse={val_mse:.6f}  val_mae={val_mae:.6f}"
-                        f"  val_route_state={val_m['route_state_loss']:.6f}"
-                        f"  test_mse={test_m['mse']:.6f}  test_mae={test_m['mae']:.6f}"
-                        + marker
-                    )
-                else:
-                    print(
-                        f"[Stage2 epoch {epoch+1:4d}]"
-                        f"  train_task={tr['task_loss']:.6f}"
-                        f"  train_base_aux={tr['base_aux_loss']:.6f}"
-                        f"  train_route_state={tr['route_state_loss']:.6f}"
-                        f"  val_mse={val_mse:.6f}  val_mae={val_mae:.6f}"
-                        f"  val_base_aux={val_m['base_aux_loss']:.6f}"
-                        f"  val_route_state={val_m['route_state_loss']:.6f}"
-                        f"  test_mse={test_m['mse']:.6f}  test_mae={test_m['mae']:.6f}"
-                        + marker
-                    )
+                print(
+                    f"[Stage2 epoch {epoch+1:4d}]"
+                    f"  train_task={tr['task_loss']:.6f}"
+                    f"  train_base_aux={tr['base_aux_loss']:.6f}"
+                    f"  train_route_state={tr['route_state_loss']:.6f}"
+                    f"  val_mse={val_mse:.6f}  val_mae={val_mae:.6f}"
+                    f"  val_base_aux={val_m['base_aux_loss']:.6f}"
+                    f"  val_route_state={val_m['route_state_loss']:.6f}"
+                    f"  test_mse={test_m['mse']:.6f}  test_mae={test_m['mae']:.6f}"
+                    + marker
+                )
 
                 if (
                     cfg.early_stop
@@ -986,7 +896,7 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
                 last_ckpt = stage3_ckpt
 
         # ==========================================================
-        # joint: fm + route modules finetune
+        # joint: fm + route modules finetune (not valid for lp combo)
         # ==========================================================
         elif stage_name == "joint":
             if cfg.joint_finetune_epochs <= 0:
@@ -997,95 +907,42 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
             )
             model.nm.unfreeze_base_predictor()
 
-            if is_lp:
-                # lp_state_correction: fm + nm.predictor + lp_state_predictor
-                # nm.predictor is also unfrozen: residual-domain stats adapt jointly
-                for p in model.fm.parameters():
-                    p.requires_grad_(True)
-                for p in model.nm.lp_state_predictor.parameters():
-                    p.requires_grad_(True)
-                joint_params = (
-                    list(model.fm.parameters())
-                    + list(model.nm.predictor.parameters())
-                    + list(model.nm.lp_state_predictor.parameters())
+            for p in model.fm.parameters():
+                p.requires_grad_(True)
+            model.nm.unfreeze_route_modules()
+            joint_params = (
+                list(model.fm.parameters()) + model.nm.parameters_route_modules()
+            )
+            jf_optim = torch.optim.Adam(
+                joint_params, lr=cfg.joint_finetune_lr, weight_decay=cfg.weight_decay
+            )
+
+            for epoch in range(cfg.joint_finetune_epochs):
+                tr = _train_epoch_joint(
+                    model, dataloader.train_loader, jf_optim, cfg, joint_params
                 )
-                jf_optim = torch.optim.Adam(
-                    joint_params, lr=cfg.joint_finetune_lr, weight_decay=cfg.weight_decay
+                val_m = _eval_loader(model, dataloader.val_loader, cfg, metrics)
+                test_m = _eval_loader(model, dataloader.test_loader, cfg, metrics)
+                val_mse = val_m["mse"]
+
+                improved = val_mse < best_val_mse - cfg.early_stop_delta
+                marker = "  *" if improved else ""
+                if improved:
+                    best_val_mse = val_mse
+                    best_val_mae = val_m["mae"]
+                    best_test_mse = test_m["mse"]
+                    best_test_mae = test_m["mae"]
+                    best_epoch = epoch + 1
+                    best_stage = "joint"
+                    torch.save(model.state_dict(), joint_ckpt)
+
+                print(
+                    f"[Joint epoch {epoch+1:4d}]"
+                    f"  train_task={tr['task_loss']:.6f}"
+                    f"  val_mse={val_mse:.6f}"
+                    f"  test_mse={test_m['mse']:.6f}"
+                    + marker
                 )
-
-                for epoch in range(cfg.joint_finetune_epochs):
-                    tr = _train_epoch_joint_lp(
-                        model, dataloader.train_loader, jf_optim, joint_params, cfg
-                    )
-                    val_m = _eval_loader(model, dataloader.val_loader, cfg, metrics)
-                    test_m = _eval_loader(model, dataloader.test_loader, cfg, metrics)
-                    val_mse = val_m["mse"]
-
-                    improved = val_mse < best_val_mse - cfg.early_stop_delta
-                    marker = "  *" if improved else ""
-                    if improved:
-                        best_val_mse = val_mse
-                        best_val_mae = val_m["mae"]
-                        best_test_mse = test_m["mse"]
-                        best_test_mae = test_m["mae"]
-                        best_epoch = epoch + 1
-                        best_stage = "joint"
-                        torch.save(model.state_dict(), joint_ckpt)
-
-                    route_diag = model.nm.get_route_diagnostics()
-                    diag_str = "  ".join(
-                        f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
-                        for k, v in route_diag.items()
-                        if k not in ("route_path", "route_state")
-                    )
-                    print(
-                        f"[Joint epoch {epoch+1:4d}]"
-                        f"  train_task={tr['task_loss']:.6f}"
-                        f"  train_route_state={tr['route_state_loss']:.6f}"
-                        f"  val_mse={val_mse:.6f}"
-                        f"  val_route_state={val_m['route_state_loss']:.6f}"
-                        f"  test_mse={test_m['mse']:.6f}"
-                        + (f"  [{diag_str}]" if diag_str else "")
-                        + marker
-                    )
-
-            else:
-                for p in model.fm.parameters():
-                    p.requires_grad_(True)
-                model.nm.unfreeze_route_modules()
-                joint_params = (
-                    list(model.fm.parameters()) + model.nm.parameters_route_modules()
-                )
-                jf_optim = torch.optim.Adam(
-                    joint_params, lr=cfg.joint_finetune_lr, weight_decay=cfg.weight_decay
-                )
-
-                for epoch in range(cfg.joint_finetune_epochs):
-                    tr = _train_epoch_joint(
-                        model, dataloader.train_loader, jf_optim, cfg, joint_params
-                    )
-                    val_m = _eval_loader(model, dataloader.val_loader, cfg, metrics)
-                    test_m = _eval_loader(model, dataloader.test_loader, cfg, metrics)
-                    val_mse = val_m["mse"]
-
-                    improved = val_mse < best_val_mse - cfg.early_stop_delta
-                    marker = "  *" if improved else ""
-                    if improved:
-                        best_val_mse = val_mse
-                        best_val_mae = val_m["mae"]
-                        best_test_mse = test_m["mse"]
-                        best_test_mae = test_m["mae"]
-                        best_epoch = epoch + 1
-                        best_stage = "joint"
-                        torch.save(model.state_dict(), joint_ckpt)
-
-                    print(
-                        f"[Joint epoch {epoch+1:4d}]"
-                        f"  train_task={tr['task_loss']:.6f}"
-                        f"  val_mse={val_mse:.6f}"
-                        f"  test_mse={test_m['mse']:.6f}"
-                        + marker
-                    )
 
             if os.path.exists(joint_ckpt):
                 model.load_state_dict(torch.load(joint_ckpt, weights_only=True))

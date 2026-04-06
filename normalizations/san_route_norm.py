@@ -14,46 +14,38 @@ Route state normalisation policy:
 - lp_state is handled entirely via a dedicated lp_state_predictor — it bypasses
   the generic RouteStatePredictor and _normalize_patch_state entirely.
 
-lp_state + lp_state_correction — structured mean-state denorm:
-  This combination implements a residual-domain SAN paired with a predicted
-  future low-pass structured mean-state.  It belongs to the Base family and
-  does NOT add a second forecasting branch.
+lp_state + lp_state_correction — "Base SAN + predicted future low-pass patch mean":
+  This combination is a minimal extension of pure SAN.  It does NOT add a second
+  forecasting branch and does NOT implement residual-domain SAN.
 
-  normalize() special-case:
-    1. Compute hist_lowpass = centered_moving_average(x_hist).
-    2. Compute hist_residual = x_hist - hist_lowpass.
-    3. All base SAN window stats (mu_hist, std_hist) are computed on hist_residual.
-    4. z = SAN-normalised hist_residual (residual-domain normalised input).
-    5. base predictor learns residual-domain future patch mu/std.
-    6. lp_state_predictor encodes hist_lowpass (lowpass branch) and fuses with
-       raw x_hist to predict pred_lowpass_fut (B, pred_len, C).
-       The backbone does NOT directly observe the low-pass state; only
-       lp_state_predictor produces pred_lowpass_fut.
+  The lp slow state is defined by:
+    mu_lp = patch_mean(lowpass_time(raw_series))
+  i.e. first apply a fixed time-domain lowpass filter to the raw time series,
+  then extract patch means.  This guarantees that history and oracle share
+  the identical operator.
 
-  Stage roles for lp combo:
-    Stage 1:     nm.predictor only — residual-domain base aux loss.
-    lp_pretrain: nm.lp_state_predictor only — route_state_loss (lp sequence MSE).
-    Stage 2:     fm + nm.lp_state_predictor jointly; nm.predictor frozen; task loss only.
-                 lp_state_predictor and backbone co-adapt to minimise task loss.
-    Joint:       fm + nm.predictor + nm.lp_state_predictor; all trainable;
-                 loss = task_loss + route_state_loss_scale * route_state_loss.
+  normalize() semantics:
+    1. Raw SAN: mu_hist, std_hist computed on raw x (not residual).
+    2. z = standard SAN-normalised input.
+    3. base predictor predicts raw future patch std (std branch) and mean (unused in denorm).
+    4. mu_hist_lp = patch_mean(lowpass_time(x_hist))   <- lp slow state
+       lp_state_predictor(mu_hist_lp) -> lp_mu_fut_hat (B, P_fut, C).
+       Trained to match oracle future lp slow state.
 
-  denormalize() special-case:
-    y_out = pred_lowpass_fut + mu_res_time + sigma_res_time * y_norm
-    where:
-      pred_lowpass_fut  predicted future low-pass sequence (structured mean state)
-      mu_res_time       residual-domain future mean broadcast to time
-      sigma_res_time    residual-domain future std  broadcast to time
-    No gate, no correction, no route_path_impl call.
+  denormalize():
+    lp_time_stats = _window_stats_to_time_stats(lp_mu_fut_hat, base_std_fut_hat, pred_len)
+    y_hat = mu_lp_time + (sigma_base_time + eps) * y_norm
+    (standard affine denorm; only the mean source is replaced)
 
   compute_route_state_loss():
-    MSE(pred_lowpass_fut, oracle_lowpass_fut)   [sequence-level]
+    oracle_lp_mu_fut = patch_mean(lowpass_time(y_true))   [same operator as history side]
+    loss = MSE(lp_mu_fut_hat, oracle_lp_mu_fut)
 
 Stage roles for lp combo (enforced by train_state_routes.py):
-  Stage 1:     nm.predictor only — residual-domain base aux loss.
-  lp_pretrain: nm.lp_state_predictor only — route_state_loss.
-  Stage 2:     backbone only — task loss; nm.predictor + lp_state_predictor frozen.
-  Joint:       backbone + nm.predictor + lp_state_predictor — task + route_state_loss.
+  Stage 1:     nm.predictor only — base std aux loss (mu loss inactive).
+  lp_pretrain: nm.lp_state_predictor only — route_state_loss (patch-level lp mean MSE).
+  Stage 2:     fm only — task loss; nm.predictor + lp_state_predictor both frozen.
+  joint/stage3: forbidden for lp combo.
 """
 from __future__ import annotations
 
@@ -65,7 +57,6 @@ import torch.nn.functional as F
 
 from .san_route_paths import build_route_path
 from .san_route_states import build_route_state
-from .san_route_states.lp_state import LPState, _centered_moving_average
 
 # Valid route_path values (including backward-compat alias)
 _VALID_PATHS = {
@@ -93,45 +84,26 @@ def _normalize_patch_state(feat: torch.Tensor, eps: float = 1e-5) -> torch.Tenso
 
 
 class _LPStatePredictor(nn.Module):
-    """Dual-branch channel-wise MLP predicting future low-pass sequence.
+    """Channel-wise MLP predicting future low-pass patch mean.
 
-    Architecture:
-      lowpass branch : Linear(seq_len -> lp_hidden) + ReLU
-      fusion         : Linear(lp_hidden + seq_len -> hidden) + ReLU + Linear(hidden -> pred_len)
+    Input:  mu_hist_raw   (B, P_hist, C) — raw historical patch means
+    Output: mu_lp_fut_hat (B, P_fut, C)  — predicted future low-pass patch mean
 
-    The hist_lowpass is encoded first; the resulting lowpass_feat is then
-    concatenated with raw x_hist before the fusion MLP.  This mirrors the
-    FAN design where the primary-component predictor receives both the
-    filtered component and the original input.
-
-    lp_hidden = 64, hidden = 128.  Default PyTorch initialisation (no zero-init).
-    All parameters are shared across channels (per-channel linear).
-
-    Input:  x_hist      (B, T, C)
-            hist_lowpass (B, T, C)
-    Output: pred_lowpass_fut  (B, pred_len, C)
+    Architecture: Linear(P_hist → hidden) + ReLU + Linear(hidden → P_fut)
+    Parameters are shared across channels (applied on permuted (B, C, P) input).
     """
 
-    def __init__(self, seq_len: int, pred_len: int, lp_hidden: int = 64, hidden: int = 128):
+    def __init__(self, hist_stat_len: int, pred_stat_len: int, hidden: int = 128):
         super().__init__()
-        self.lp_enc = nn.Linear(seq_len, lp_hidden)
-        self.lp_act = nn.ReLU()
-        self.fusion = nn.Linear(lp_hidden + seq_len, hidden)
-        self.fusion_act = nn.ReLU()
-        self.out = nn.Linear(hidden, pred_len)
+        self.enc = nn.Linear(hist_stat_len, hidden)
+        self.act = nn.ReLU()
+        self.out = nn.Linear(hidden, pred_stat_len)
 
-    def forward(
-        self,
-        x_hist: torch.Tensor,        # (B, T, C)
-        hist_lowpass: torch.Tensor,  # (B, T, C)
-    ) -> torch.Tensor:
-        # permute to (B, C, T) for per-channel shared linear
-        lp = hist_lowpass.permute(0, 2, 1)           # (B, C, T)
-        xh = x_hist.permute(0, 2, 1)                 # (B, C, T)
-        lp_feat = self.lp_act(self.lp_enc(lp))       # (B, C, lp_hidden)
-        fused = torch.cat([lp_feat, xh], dim=-1)     # (B, C, lp_hidden + T)
-        out = self.out(self.fusion_act(self.fusion(fused)))  # (B, C, pred_len)
-        return out.permute(0, 2, 1)                  # (B, pred_len, C)
+    def forward(self, mu_hist: torch.Tensor) -> torch.Tensor:
+        # mu_hist: (B, P, C) -> permute to (B, C, P) for shared per-channel linear
+        x = mu_hist.permute(0, 2, 1)          # (B, C, P)
+        out = self.out(self.act(self.enc(x))) # (B, C, P_fut)
+        return out.permute(0, 2, 1)           # (B, P_fut, C)
 
 
 class SANRouteNorm(nn.Module):
@@ -199,12 +171,14 @@ class SANRouteNorm(nn.Module):
 
         # lp_state uses a dedicated predictor; other states use generic RouteStatePredictor
         if route_path == "lp_state_correction":
-            self.lp_state_predictor = _LPStatePredictor(self.seq_len, self.pred_len)
-            self.route_state_predictor = None
-            self.route_path_impl = build_route_path(
-                route_path, pred_len=self.pred_len, enc_in=enc_in, sigma_min=sigma_min
+            # lp combo: future mean source replacement only — no route_path_impl
+            self.lp_state_predictor = _LPStatePredictor(
+                hist_stat_len=self.hist_stat_len,
+                pred_stat_len=self.pred_stat_len,
             )
-            self.route_state_impl = LPState(period_len=self.window_len)
+            self.route_state_predictor = None
+            self.route_path_impl = None
+            self.route_state_impl = None
         elif route_path != "none":
             self.lp_state_predictor = None
             self.route_state_predictor = RouteStatePredictor(
@@ -326,8 +300,79 @@ class SANRouteNorm(nn.Module):
     def _split_stats(self, stats: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return stats[:, :, : self.channels], stats[:, :, self.channels :]
 
+    def _time_to_patch_mean(self, x_time: torch.Tensor) -> torch.Tensor:
+        """Extract patch means from a time-domain tensor.
+        x_time: (B, T, C) → (B, P, C) where P = _compute_n_windows(T).
+        """
+        wins = self._extract_windows(x_time)
+        mu, _ = self._compute_window_stats(wins)
+        return mu
+
+    def _patch_values_to_time(self, feat: torch.Tensor, total_length: int) -> torch.Tensor:
+        """Overlap-add patch-level values (B, P, C) to time domain (B, total_length, C).
+
+        Two-step mean-preserving lift:
+          1. Linear interpolation as smooth baseline.
+          2. Exact patch-mean correction.
+        """
+        x = feat.permute(0, 2, 1)                                             # (B, C, P)
+        c0 = F.interpolate(x, size=total_length, mode="linear", align_corners=True)
+        c0 = c0.permute(0, 2, 1)                                              # (B, T, C)
+        m0 = self._time_to_patch_mean(c0)                                     # (B, P, C)
+        res = feat - m0
+        return c0 + self._patch_features_to_time(res, total_length)
+
+    def _lowpass_time_series(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply fixed [1, 2, 1]/4 FIR lowpass along the time axis.
+
+        x:      (B, T, C)
+        Returns (B, T, C) smoothed along the T dimension.
+        T == 1: returns x unchanged.
+        Kernel [1, 2, 1] / 4; reflect padding; no learnable parameters.
+        Does NOT mix channels.
+        """
+        B, T, C = x.shape
+        if T == 1:
+            return x
+        k = x.new_tensor([1.0, 2.0, 1.0]) / 4.0         # (3,)
+        xt = x.permute(0, 2, 1).reshape(B * C, 1, T)    # (B*C, 1, T)
+        xt_padded = F.pad(xt, (1, 1), mode="reflect")    # (B*C, 1, T+2)
+        w = k.view(1, 1, 3)                               # (1, 1, 3)
+        out = F.conv1d(xt_padded, w, padding=0)          # (B*C, 1, T)
+        return out.reshape(B, C, T).permute(0, 2, 1)     # (B, T, C)
+
+    def _lowpass_time_to_patch_mean(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute lp slow state: patch_mean(lowpass_time(x)).
+
+        x:      (B, T, C) — raw time series (hist or future)
+        Returns (B, P, C) where P = _compute_n_windows(T).
+        Uses current window_len and stride for patch extraction.
+        This is the sole lp slow-state extractor for the lp combo.
+        """
+        lp = self._lowpass_time_series(x)
+        wins = self._extract_windows(lp)
+        mu, _ = self._compute_window_stats(wins)
+        return mu
+
+    def _lowpass_patch_mean(self, feat: torch.Tensor) -> torch.Tensor:
+        """[Retained for non-lp use; not used by lp combo.]
+
+        Apply fixed [1, 2, 1]/4 FIR lowpass along the patch axis.
+        feat:   (B, P, C) — patch-level feature.
+        Returns (B, P, C) smoothed along the P dimension.
+        """
+        B, P, C = feat.shape
+        if P == 1:
+            return feat
+        k = feat.new_tensor([1.0, 2.0, 1.0]) / 4.0         # (3,)
+        xp = feat.permute(0, 2, 1).reshape(B * C, 1, P)    # (B*C, 1, P)
+        xp_padded = F.pad(xp, (1, 1), mode="reflect")       # (B*C, 1, P+2)
+        w = k.view(1, 1, 3)                                  # (1, 1, 3)
+        out = F.conv1d(xp_padded, w, padding=0)             # (B*C, 1, P)
+        return out.reshape(B, C, P).permute(0, 2, 1)        # (B, P, C)
+
     # ------------------------------------------------------------------
-    # Cache
+    # Stage-aware parameter group accessors
     # ------------------------------------------------------------------
 
     def _reset_cache(self) -> None:
@@ -347,16 +392,10 @@ class SANRouteNorm(nn.Module):
         self._route_future_oracle_state: Optional[torch.Tensor] = None
         self._route_hist_state_raw: Optional[torch.Tensor] = None
         self._route_future_state_hat_raw: Optional[torch.Tensor] = None
-        # lp_state specific caches
-        self._hist_lowpass: Optional[torch.Tensor] = None
-        self._pred_lowpass_fut: Optional[torch.Tensor] = None
-        self._oracle_lowpass_fut: Optional[torch.Tensor] = None
-        # Residual-domain future patch-level stats (what base predictor learns)
-        self._res_mu_fut_hat: Optional[torch.Tensor] = None    # (B, P_fut, C)
-        self._res_std_fut_hat: Optional[torch.Tensor] = None   # (B, P_fut, C)
-        # Residual-domain future time-level stats (broadcast for denorm)
-        self._res_mu_time: Optional[torch.Tensor] = None       # (B, pred_len, C)
-        self._res_sigma_time: Optional[torch.Tensor] = None    # (B, pred_len, C)
+        # lp_state specific caches (patch-level)
+        self._lp_mu_hist: Optional[torch.Tensor] = None      # (B, P_hist, C) mu_hist_lp
+        self._lp_mu_fut_hat: Optional[torch.Tensor] = None   # (B, P_fut, C)  predicted lp mean
+        self._oracle_lp_mu_fut: Optional[torch.Tensor] = None  # (B, P_fut, C) oracle lp mean
         # Cached names
         self._route_path_name: str = self.route_path
         self._route_state_name: str = self.route_state
@@ -365,7 +404,6 @@ class SANRouteNorm(nn.Module):
         self._last_std_loss: float = 0.0
         self._last_base_aux_loss: float = 0.0
         self._last_route_state_loss: float = 0.0
-        self._last_lp_aux_loss: float = 0.0
         self._last_aux_total: float = 0.0
 
     # ------------------------------------------------------------------
@@ -442,11 +480,8 @@ class SANRouteNorm(nn.Module):
     def normalize(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize input and prepare all caches.
 
-        lp_state_correction special-case:
-          - Computes hist_lowpass via centered_moving_average.
-          - SAN stats (mu_hist, std_hist, z) computed on hist_residual = x - hist_lowpass.
-          - base predictor learns residual-domain future mu/std.
-          - lp_state_predictor(x_hist, hist_lowpass) → pred_lowpass_fut.
+        lp_state_correction: raw SAN stats on x (not residual), then
+          lp_state_predictor(mu_hist_raw) → lp_mu_fut_hat (B, P_fut, C).
         Generic route paths: unchanged base SAN + RouteStatePredictor.
         """
         self._reset_cache()
@@ -456,16 +491,8 @@ class SANRouteNorm(nn.Module):
                 f"SANRouteNorm expected seq_len={self.seq_len}, got {T}."
             )
 
-        # --- lp_state special case: residual-domain SAN ---
-        if self.route_path == "lp_state_correction":
-            hist_lowpass = _centered_moving_average(x.detach(), self.route_state_impl._period_len)
-            self._hist_lowpass = hist_lowpass
-            # Residual = raw - lowpass; SAN operates on residual
-            x_input = x - hist_lowpass
-        else:
-            x_input = x
-
-        # --- Base SAN: history stats (on residual for lp, raw for others) ---
+        # --- Base SAN: history stats on raw input ---
+        x_input = x
         hist_windows = self._extract_windows(x_input.detach())
         mu_hist, std_hist = self._compute_window_stats(hist_windows)
         self._mu_hist = mu_hist
@@ -497,14 +524,11 @@ class SANRouteNorm(nn.Module):
 
         # --- Route state (if active) ---
         if self.route_path == "lp_state_correction":
-            # lp_state_predictor predicts future low-pass sequence
-            pred_lowpass_fut = self.lp_state_predictor(x.detach(), hist_lowpass)
-            self._pred_lowpass_fut = pred_lowpass_fut
-            # Cache residual-domain future stats for denormalize()
-            self._res_mu_fut_hat = mu_base_fut    # already residual-domain
-            self._res_std_fut_hat = std_base_fut  # already residual-domain
-            self._res_mu_time = base_time_mean
-            self._res_sigma_time = base_time_std
+            # lp combo: mu_lp = patch_mean(lowpass_time(x_hist))
+            mu_hist_lp = self._lowpass_time_to_patch_mean(x.detach())
+            self._lp_mu_hist = mu_hist_lp
+            lp_mu_fut_hat = self.lp_state_predictor(mu_hist_lp)
+            self._lp_mu_fut_hat = lp_mu_fut_hat
 
         elif self.route_path != "none":
             # Generic route state: RouteStatePredictor + optional _normalize_patch_state
@@ -535,33 +559,35 @@ class SANRouteNorm(nn.Module):
 
         return z
 
-    def denormalize(self, y_norm: torch.Tensor) -> torch.Tensor:
+    def denormalize(
+        self,
+        y_norm: torch.Tensor,
+        y_true_oracle: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Restore y_norm to original scale, applying the route path if active.
 
-        lp_state_correction (structured mean-state denorm):
-            y_out = pred_lowpass_fut + mu_res_time + sigma_res_time * y_norm
-            where mu_res_time / sigma_res_time are residual-domain future stats.
-        All other paths: y_base = base_time_mean + (base_time_std + eps) * y_norm,
-            then route_path_impl transforms y_base.
+        lp_state_correction (mean-only replacement):
+            Uses predicted future low-pass patch mean as the denorm mean;
+            base std for the scale.  Standard affine denorm.
+        All other paths: standard affine denorm then optional route_path_impl.
         """
         if self._pred_time_stats is None:
             return y_norm
 
         T = y_norm.shape[1]
 
-        # lp_state_correction: structured mean-state denorm (no gate, no correction)
+        # lp_state_correction: future mean from lp predictor, std from base predictor
         if (
             self.route_path == "lp_state_correction"
-            and self._pred_lowpass_fut is not None
-            and self._res_mu_time is not None
-            and self._res_sigma_time is not None
+            and self._lp_mu_fut_hat is not None
+            and self._base_std_fut_hat is not None
             and T == self.pred_len
         ):
-            return (
-                self._pred_lowpass_fut
-                + self._res_mu_time
-                + (self._res_sigma_time + self.epsilon) * y_norm
-            ).contiguous()
+            lp_time_stats = self._window_stats_to_time_stats(
+                self._lp_mu_fut_hat, self._base_std_fut_hat, T
+            )
+            mu_lp_time, sigma_base_time = self._split_stats(lp_time_stats)
+            return (mu_lp_time + (sigma_base_time + self.epsilon) * y_norm).contiguous()
 
         # Standard base denorm
         if T == self._pred_time_stats.shape[1]:
@@ -608,27 +634,24 @@ class SANRouteNorm(nn.Module):
     def compute_base_aux_loss(self, y_true: torch.Tensor) -> torch.Tensor:
         """Base SAN stats loss — Stage 1 uses this.
 
-        lp_state_correction: oracle stats are computed on residual-domain y_true
-        so the predictor learns residual-domain future mu/std.
+        lp_state_correction: oracle stats from raw y_true; only std_loss active;
+          mu_loss is inactive (base mean prediction is not used in lp denorm).
+        All other paths: standard mu + std loss on raw y_true.
         """
         if self._base_mu_fut_hat is None or self._base_std_fut_hat is None:
             return torch.tensor(0.0, device=y_true.device)
 
-        if self.route_path == "lp_state_correction" and self._oracle_lowpass_fut is None:
-            # Compute oracle lowpass for residual oracle (detached, no grad needed here)
-            oracle_lowpass = _centered_moving_average(
-                y_true.detach(), self.route_state_impl._period_len
-            )
-            y_oracle_input = y_true - oracle_lowpass
-        elif self.route_path == "lp_state_correction" and self._oracle_lowpass_fut is not None:
-            y_oracle_input = y_true - self._oracle_lowpass_fut
-        else:
-            y_oracle_input = y_true
+        _, oracle_mu, oracle_std = self._compute_oracle_stats(y_true)
 
-        _, oracle_mu, oracle_std = self._compute_oracle_stats(y_oracle_input)
-        mu_loss = F.mse_loss(self._base_mu_fut_hat, oracle_mu)
-        std_loss = F.mse_loss(self._base_std_fut_hat, oracle_std)
-        base_aux = self.w_mu * mu_loss + self.w_std * std_loss
+        if self.route_path == "lp_state_correction":
+            # Only std loss; mu predictor is not used in lp denorm
+            mu_loss = torch.tensor(0.0, device=y_true.device)
+            std_loss = F.mse_loss(self._base_std_fut_hat, oracle_std)
+            base_aux = self.w_std * std_loss
+        else:
+            mu_loss = F.mse_loss(self._base_mu_fut_hat, oracle_mu)
+            std_loss = F.mse_loss(self._base_std_fut_hat, oracle_std)
+            base_aux = self.w_mu * mu_loss + self.w_std * std_loss
 
         self._last_mu_loss = float(mu_loss.detach().item())
         self._last_std_loss = float(std_loss.detach().item())
@@ -637,30 +660,26 @@ class SANRouteNorm(nn.Module):
         return base_aux
 
     def compute_route_state_loss(self, y_true: torch.Tensor) -> torch.Tensor:
-        """Route state prediction loss — Stage 3 uses this.
+        """Route state prediction loss — lp_pretrain / Stage 3 uses this.
 
-        lp_state: MSE(pred_lowpass_fut, oracle_lowpass_fut) over the full future sequence.
+        lp_state: patch-level MSE(lp_mu_fut_hat, oracle_lp_mu_fut).
+                  oracle_lp_mu_fut = patch_mean(lowpass_time(y_true)).
         Others:   MSE(future_state_hat, oracle_state) at patch level.
         Returns 0 when route_path='none'.
         """
         if self.route_path == "none":
             return torch.tensor(0.0, device=y_true.device)
 
-        # lp_state special case
+        # lp_state special case: patch-level MSE against oracle slow state
         if self.route_state == "lp_state":
-            if self._pred_lowpass_fut is None:
+            if self._lp_mu_fut_hat is None:
                 return torch.tensor(0.0, device=y_true.device)
-            oracle_lowpass_fut = _centered_moving_average(y_true, self.route_state_impl._period_len)
-            self._oracle_lowpass_fut = oracle_lowpass_fut
-            lp_aux_loss = F.mse_loss(self._pred_lowpass_fut, oracle_lowpass_fut)
-            self._last_route_state_loss = float(lp_aux_loss.detach().item())
-            self._last_lp_aux_loss = float(lp_aux_loss.detach().item())
-            # Push diagnostics to route_path_impl
-            if self.route_path_impl is not None and hasattr(
-                self.route_path_impl, "update_diagnostics"
-            ):
-                self.route_path_impl.update_diagnostics(self._pred_lowpass_fut, oracle_lowpass_fut)
-            return lp_aux_loss
+            # oracle: same operator as history side — patch_mean(lowpass_time(y_true))
+            oracle_lp_mu_fut = self._lowpass_time_to_patch_mean(y_true)
+            self._oracle_lp_mu_fut = oracle_lp_mu_fut
+            lp_loss = F.mse_loss(self._lp_mu_fut_hat, oracle_lp_mu_fut)
+            self._last_route_state_loss = float(lp_loss.detach().item())
+            return lp_loss
 
         # Generic route state
         if self._route_future_state_hat is None:
@@ -681,11 +700,7 @@ class SANRouteNorm(nn.Module):
         return route_state_loss
 
     def compute_total_aux_loss(self, y_true: torch.Tensor) -> torch.Tensor:
-        """Combined base aux + weighted route state loss.
-
-        For lp_state_correction: compute route_state_loss first so that
-        _oracle_lowpass_fut is cached before compute_base_aux_loss uses it.
-        """
+        """Combined base aux + weighted route state loss."""
         if self.route_path == "lp_state_correction":
             route_loss = self.compute_route_state_loss(y_true)
             base_aux = self.compute_base_aux_loss(y_true)
@@ -707,6 +722,9 @@ class SANRouteNorm(nn.Module):
     def get_last_aux_stats(self) -> dict:
         """Scalar stats from most recent loss computation.
         base_aux and route_state_loss are kept separate.
+        lp_* fields are non-zero only when route_path='lp_state_correction'.
+        lp_mu_hist_mean     : mean of patch_mean(lowpass_time(x_hist))
+        oracle_lp_mu_fut_mean: mean of patch_mean(lowpass_time(y_true))
         """
         return {
             "aux_total": self._last_aux_total,
@@ -714,7 +732,6 @@ class SANRouteNorm(nn.Module):
             "mu_loss": self._last_mu_loss,
             "std_loss": self._last_std_loss,
             "route_state_loss": self._last_route_state_loss,
-            "lp_aux_loss": self._last_lp_aux_loss,
             "mu_hist_mean": (
                 float(self._mu_hist.mean().item()) if self._mu_hist is not None else 0.0
             ),
@@ -729,14 +746,37 @@ class SANRouteNorm(nn.Module):
                 float(self._base_std_fut_hat.mean().item())
                 if self._base_std_fut_hat is not None else 0.0
             ),
+            "lp_mu_hist_mean": (
+                float(self._lp_mu_hist.mean().item()) if self._lp_mu_hist is not None else 0.0
+            ),
+            "lp_mu_fut_hat_mean": (
+                float(self._lp_mu_fut_hat.mean().item())
+                if self._lp_mu_fut_hat is not None else 0.0
+            ),
+            "oracle_lp_mu_fut_mean": (
+                float(self._oracle_lp_mu_fut.mean().item())
+                if self._oracle_lp_mu_fut is not None else 0.0
+            ),
+            "lp_mu_abs_error": (
+                float(
+                    (self._lp_mu_fut_hat - self._oracle_lp_mu_fut).abs().mean().item()
+                )
+                if self._lp_mu_fut_hat is not None and self._oracle_lp_mu_fut is not None
+                else 0.0
+            ),
         }
 
     def get_route_diagnostics(self) -> dict:
         """Cached diagnostics from the route path.
         Empty dict when route_path='none'.
         Aux stats are NOT mixed in here — use get_last_aux_stats() for those.
+        lp combo fields:
+          lp_mu_hist_mean      : mean of patch_mean(lowpass_time(x_hist))
+          lp_mu_fut_hat_mean   : mean of predicted future lp slow state
+          oracle_lp_mu_fut_mean: mean of patch_mean(lowpass_time(y_true))
+          lp_mu_abs_error      : |lp_mu_fut_hat - oracle_lp_mu_fut|.mean()
         """
-        if self.route_path == "none" or self.route_path_impl is None:
+        if self.route_path == "none":
             return {}
         diag: dict = {
             "route_path": self._route_path_name,
@@ -744,37 +784,32 @@ class SANRouteNorm(nn.Module):
         }
         if self.route_path == "lp_state_correction":
             # lp-specific diagnostics
-            diag["lp_aux_loss"] = self._last_lp_aux_loss
-            diag["hist_lowpass_mean"] = (
-                float(self._hist_lowpass.mean().item())
-                if self._hist_lowpass is not None else 0.0
+            diag["lp_mu_hist_mean"] = (
+                float(self._lp_mu_hist.mean().item())
+                if self._lp_mu_hist is not None else 0.0
             )
-            diag["pred_lowpass_mean"] = (
-                float(self._pred_lowpass_fut.mean().item())
-                if self._pred_lowpass_fut is not None else 0.0
+            diag["lp_mu_fut_hat_mean"] = (
+                float(self._lp_mu_fut_hat.mean().item())
+                if self._lp_mu_fut_hat is not None else 0.0
             )
-            diag["oracle_lowpass_mean"] = (
-                float(self._oracle_lowpass_fut.mean().item())
-                if self._oracle_lowpass_fut is not None else 0.0
+            diag["oracle_lp_mu_fut_mean"] = (
+                float(self._oracle_lp_mu_fut.mean().item())
+                if self._oracle_lp_mu_fut is not None else 0.0
             )
-            if self._pred_lowpass_fut is not None and self._oracle_lowpass_fut is not None:
-                diag["lp_abs_error"] = float(
-                    (self._pred_lowpass_fut - self._oracle_lowpass_fut).abs().mean().item()
+            diag["lp_mu_abs_error"] = (
+                float(
+                    (self._lp_mu_fut_hat - self._oracle_lp_mu_fut).abs().mean().item()
                 )
-            else:
-                diag["lp_abs_error"] = 0.0
-            diag["res_mu_mean"] = (
-                float(self._res_mu_fut_hat.mean().item())
-                if self._res_mu_fut_hat is not None else 0.0
+                if self._lp_mu_fut_hat is not None and self._oracle_lp_mu_fut is not None
+                else 0.0
             )
-            diag["res_sigma_mean"] = (
-                float(self._res_std_fut_hat.mean().item())
-                if self._res_std_fut_hat is not None else 0.0
+            diag["base_std_fut_mean"] = (
+                float(self._base_std_fut_hat.mean().item())
+                if self._base_std_fut_hat is not None else 0.0
             )
-            # Also include route_path_impl diagnostics (lp_pred_mean, etc.)
-            if hasattr(self.route_path_impl, "get_route_diagnostics"):
-                diag.update(self.route_path_impl.get_route_diagnostics())
-        elif hasattr(self.route_path_impl, "get_route_diagnostics"):
+        elif self.route_path_impl is not None and hasattr(
+            self.route_path_impl, "get_route_diagnostics"
+        ):
             diag.update(self.route_path_impl.get_route_diagnostics())
         return diag
 

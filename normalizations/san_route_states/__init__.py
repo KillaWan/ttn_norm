@@ -6,12 +6,14 @@ from .dlogsigma import DLogSigmaState
 from .lp_state import LPState
 from .nu import NuState
 from .omega_spec import OmegaSpecState
+from .slope_state import SlopeState
 
 _REGISTRY = {
     "nu": NuState,
     "dlogsigma": DLogSigmaState,
     "omega_spec": OmegaSpecState,
     "lp_state": LPState,
+    "slope_state": SlopeState,
 }
 
 
@@ -34,5 +36,6 @@ __all__ = [
     "DLogSigmaState",
     "OmegaSpecState",
     "LPState",
+    "SlopeState",
     "build_route_state",
 ]

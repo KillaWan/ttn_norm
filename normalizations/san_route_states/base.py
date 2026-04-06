@@ -1,4 +1,17 @@
-"""Base interface for route state implementations.
+"""Base interface for generic route state implementations.
+
+Scope
+-----
+RouteStateBase serves only the generic 3D patch-state family:
+    nu, dlogsigma, omega_spec
+
+lp_state special case
+---------------------
+lp_state + lp_state_correction is handled entirely within SANRouteNorm
+via its own _lowpass_patch_mean helper and _LPStatePredictor.  It does NOT
+go through RouteStateBase, RouteStatePredictor, or _normalize_patch_state.
+LPState in san_route_states/lp_state.py is kept as a signal-processing helper
+but is NOT used as a RouteStateBase implementation at the framework level.
 
 Design contract
 ---------------

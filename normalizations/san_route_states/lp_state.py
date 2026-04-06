@@ -1,25 +1,27 @@
-"""LPState — low-pass patch state.
+"""LPState — low-pass patch statistics helper for the lp route.
 
-Role in the lp_state + lp_state_correction combination
--------------------------------------------------------
-The future low-pass sequence (pred_lowpass_fut) is the structured mean-state
-used directly in the denorm equation:
+Note on current main experiment
+-------------------------------
+The current lp combo in SANRouteNorm does NOT use "direct future lowpass prediction
++ moment correction" as described in older versions of this file.  The active
+definition is:
 
-    y_out = pred_lowpass_fut + mu_res_time + sigma_res_time * y_norm
+    mu_lp = patch_mean(lowpass_time(raw_series))
 
-This is a normalization-framework mechanism, NOT a second forecasting branch.
+i.e. first apply a fixed time-domain FIR lowpass to the raw time series, then
+extract patch means.  This is implemented entirely in SANRouteNorm via the
+_lowpass_time_series() and _lowpass_time_to_patch_mean() helpers.  LPState in
+this file is retained as a signal-processing helper library; it is NOT used as
+a RouteStateBase implementation in the current lp combo.
+
+_symmetric_fir_lowpass is the primary FIR helper here.  SANRouteNorm uses its
+own inline [1,2,1]/4 kernel via _lowpass_time_series() for the lp state.
 
 Lowpass helpers
 ---------------
-_centered_moving_average(x, period_len) — applied to the full sequence:
-  - period_len odd:  single pass, kernel_size = period_len.
-  - period_len even: two passes — kernel_size=period_len then kernel_size=2
-                     — giving a centered 2×period_len moving average.
-
-The methods in this class (LPState) define oracle patch-level states for
-diagnostics only.  The main output path does NOT depend on patch-level
-compression of the low-pass sequence — pred_lowpass_fut enters denorm as
-a full time-domain sequence.
+_symmetric_fir_lowpass(x, period_len) — triangular FIR lowpass:
+  - kernel: [1, 2, ..., period_len, ..., 2, 1], length = 2*period_len - 1.
+  - normalised by kernel sum; reflect padding; depthwise conv1d.
 
 Framework contracts:
   - _normalize_patch_state() is NOT applied to lp_state.
@@ -32,6 +34,36 @@ import torch
 import torch.nn.functional as F
 
 from .base import RouteStateBase
+
+
+def _symmetric_fir_lowpass(x: torch.Tensor, period_len: int) -> torch.Tensor:
+    """Fixed symmetric triangular FIR lowpass filter along the time dimension.
+
+    Kernel: [1, 2, ..., period_len, period_len-1, ..., 2, 1], length = 2*period_len - 1.
+    Normalised by kernel sum.  Padding mode: reflect.
+    All channels share the same kernel (depthwise conv1d).
+
+    Args:
+        x:          (B, T, C)
+        period_len: half-kernel parameter (>= 1).
+
+    Returns:
+        (B, T, C)  same shape as input.
+    """
+    if period_len <= 1:
+        return x
+    half = torch.arange(1, period_len + 1, dtype=x.dtype, device=x.device)  # [1,..,period_len]
+    kernel = torch.cat([half, half[:-1].flip(0)])  # [1,..,period_len,..,1], len=2*period_len-1
+    kernel = kernel / kernel.sum()
+    ksize = kernel.shape[0]
+    pad = period_len - 1  # = ksize // 2
+
+    B, T, C = x.shape
+    x_t = x.permute(0, 2, 1).reshape(B * C, 1, T)            # (B*C, 1, T)
+    x_padded = F.pad(x_t, (pad, pad), mode="reflect")         # (B*C, 1, T+2*pad)
+    w = kernel.view(1, 1, ksize)                               # (1, 1, ksize)
+    out = F.conv1d(x_padded, w, padding=0)                    # (B*C, 1, T)
+    return out.reshape(B, C, T).permute(0, 2, 1)              # (B, T, C)
 
 
 def _fixed_lowpass(x: torch.Tensor, kernel_size: int) -> torch.Tensor:
@@ -109,7 +141,7 @@ class LPState(RouteStateBase):
         B, P, W, C = hist_windows.shape
         # Reshape to treat each (batch, patch) as an independent sequence
         wins = hist_windows.reshape(B * P, W, C)              # (B*P, W, C)
-        wins_lp = _centered_moving_average(wins, self._period_len)  # (B*P, W, C)
+        wins_lp = _symmetric_fir_lowpass(wins, self._period_len)  # (B*P, W, C)
         wins_lp = wins_lp.reshape(B, P, W, C)
 
         lp_mean = wins_lp.mean(dim=2)                         # (B, P, C)
@@ -127,7 +159,7 @@ class LPState(RouteStateBase):
         """Compute (B, P_fut, 2C) low-pass patch states from future ground truth."""
         B, P, W, C = fut_windows.shape
         wins = fut_windows.reshape(B * P, W, C)
-        wins_lp = _centered_moving_average(wins, self._period_len)
+        wins_lp = _symmetric_fir_lowpass(wins, self._period_len)
         wins_lp = wins_lp.reshape(B, P, W, C)
 
         lp_mean = wins_lp.mean(dim=2)

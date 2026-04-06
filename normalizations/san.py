@@ -107,6 +107,11 @@ class SAN(nn.Module):
         self._last_weighted_base_loss: float = 0.0
         self._last_weighted_hier_loss: float = 0.0
         self._last_hier_to_level0_ratio: float = 0.0
+        # Low-pass mean branch diagnostics
+        self._last_mu_lp_target_mse: float = 0.0
+        self._last_mu_raw_target_mse: float = 0.0
+        self._last_mu_hist_lp_mean: float = 0.0
+        self._last_mu_fut_lp_mean: float = 0.0
 
     def _select_num_coarse_levels(self, level0_hist_len: int) -> int:
         if level0_hist_len <= 8:
@@ -181,6 +186,27 @@ class SAN(nn.Module):
 
     def _logsigma_to_std(self, logsigma: torch.Tensor) -> torch.Tensor:
         return logsigma.exp().clamp(min=self.sigma_min)
+
+    @staticmethod
+    def _lowpass_patch_mean(patch_mean: torch.Tensor) -> torch.Tensor:
+        """Fixed [1,2,1]/4 low-pass filter along the patch axis.
+
+        Input/output shape: (B, P, C) – batch × patch × channel.
+        Operates only on the patch axis; channels are never mixed.
+        If P == 1, returns the input unchanged.
+        """
+        B, P, C = patch_mean.shape
+        if P == 1:
+            return patch_mean
+        # Reshape to (B*C, 1, P) so F.conv1d acts on the patch axis per channel.
+        x = patch_mean.permute(0, 2, 1).reshape(B * C, 1, P)
+        kernel = torch.tensor(
+            [1.0, 2.0, 1.0], device=patch_mean.device, dtype=patch_mean.dtype
+        ) / 4.0
+        kernel = kernel.view(1, 1, 3)
+        x_pad = F.pad(x, (1, 1), mode='reflect')
+        out = F.conv1d(x_pad, kernel)
+        return out.reshape(B, C, P).permute(0, 2, 1).contiguous()
 
     def _validate_config_lengths(self) -> None:
         if self.seq_len < self.window_len:
@@ -464,6 +490,9 @@ class SAN(nn.Module):
             hist_window_std,
         )
         xbar_levels = self._build_xbar_hierarchy(norm_input)
+        # Low-pass versions of hist patch-mean sequences (one per level, independent).
+        # These drive the mean branch; std branch and hierarchy structure use raw.
+        hist_mean_lp_seq = [self._lowpass_patch_mean(m) for m in hist_mean_seq]
 
         # Storage
         future_mean_base: dict[int, torch.Tensor] = {}
@@ -479,10 +508,11 @@ class SAN(nn.Module):
         # ---------------------------------------------------------------
         for level_idx in range(max_level, -1, -1):
             predictor = self.level_predictors[level_idx]
-            anchor = hist_mean_seq[level_idx].mean(dim=1, keepdim=True)
+            # Anchor and mean-head input both come from the lp version.
+            anchor = hist_mean_lp_seq[level_idx].mean(dim=1, keepdim=True)
 
             mb, sb = predictor.predict_base(
-                hist_mean_seq[level_idx],
+                hist_mean_lp_seq[level_idx],
                 hist_std_seq[level_idx],
                 xbar_levels[level_idx],
                 anchor,
@@ -498,9 +528,10 @@ class SAN(nn.Module):
         # ---------------------------------------------------------------
         for level_idx in range(max_level):
             spec = self.level_transition_specs[level_idx]
+            # Use lp means for the norm-z computation (mean branch).
             upper_hist_mean_lift = self._lift_seq_stats(
-                hist_mean_seq[level_idx + 1],
-                target_len=hist_mean_seq[level_idx].shape[1],
+                hist_mean_lp_seq[level_idx + 1],
+                target_len=hist_mean_lp_seq[level_idx].shape[1],
                 meta_patch=spec['meta_patch'],
                 meta_stride=spec['meta_stride'],
             )
@@ -511,7 +542,7 @@ class SAN(nn.Module):
                 meta_stride=spec['meta_stride'],
             )
             hist_norm_z[level_idx] = (
-                hist_mean_seq[level_idx] - upper_hist_mean_lift
+                hist_mean_lp_seq[level_idx] - upper_hist_mean_lift
             ) / (upper_hist_std_lift + self.epsilon)
 
         # ---------------------------------------------------------------
@@ -542,7 +573,7 @@ class SAN(nn.Module):
                 meta_stride=spec['meta_stride'],
             )
             zhat = self.level_predictors[level_idx].predict_norm_z(
-                hist_mean_seq[level_idx],
+                hist_mean_lp_seq[level_idx],
                 upper_hist_std_lift,
                 xbar_levels[level_idx],
                 hist_norm_z[level_idx],
@@ -649,6 +680,8 @@ class SAN(nn.Module):
             oracle_mean_seq_l0,
             oracle_std_seq_l0,
         )
+        # Low-pass oracle patch-mean per level (applied independently, one pass each).
+        oracle_mean_lp_seq = [self._lowpass_patch_mean(m) for m in oracle_mean_seq]
 
         self._last_level_losses = {}
 
@@ -666,7 +699,7 @@ class SAN(nn.Module):
             cache_l = self._hierarchy_cache[level_idx]
             if level_idx == max_level:
                 base_mean_losses[level_idx] = F.mse_loss(
-                    cache_l['future_mean_base'], oracle_mean_seq[level_idx]
+                    cache_l['future_mean_base'], oracle_mean_lp_seq[level_idx]
                 )
             std_losses[level_idx] = F.mse_loss(
                 cache_l['future_std_base'], oracle_std_seq[level_idx]
@@ -675,7 +708,7 @@ class SAN(nn.Module):
         for level_idx in range(max_level):
             cache_l = self._hierarchy_cache[level_idx]
             final_mean_losses[level_idx] = F.mse_loss(
-                cache_l['future_mean_final'], oracle_mean_seq[level_idx]
+                cache_l['future_mean_final'], oracle_mean_lp_seq[level_idx]
             )
 
         top_level_weight = 0.20 / (2.0 ** max(max_level - 1, 0)) if self.num_levels > 1 else 1.0
@@ -706,6 +739,20 @@ class SAN(nn.Module):
         self._last_hier_to_level0_ratio = self._last_weighted_hier_loss / max(
             float(weighted_base.detach().item()), 1e-8
         )
+
+        # --- Low-pass mean branch diagnostics ---
+        _top_pred = self._hierarchy_cache[max_level]['future_mean_base'].detach()
+        self._last_mu_lp_target_mse = float(
+            F.mse_loss(_top_pred, oracle_mean_lp_seq[max_level]).item()
+        )
+        self._last_mu_raw_target_mse = float(
+            F.mse_loss(_top_pred, oracle_mean_seq[max_level]).item()
+        )
+        _hist_lp_top = self._lowpass_patch_mean(
+            self._hierarchy_cache[max_level]['hist_mean_seq']
+        )
+        self._last_mu_hist_lp_mean = float(_hist_lp_top.mean().item())
+        self._last_mu_fut_lp_mean = float(oracle_mean_lp_seq[max_level].mean().item())
 
         # --- Per-level cache diagnostics ---
         for level_idx in range(self.num_levels):
@@ -819,6 +866,10 @@ class SAN(nn.Module):
         for level_idx in range(self.MAX_EXTRA_LEVELS + 1):
             stats[f'std_loss_l{level_idx}'] = self._last_std_losses.get(level_idx, 0.0)
             stats[f'final_mean_loss_l{level_idx}'] = self._last_final_mean_losses.get(level_idx, 0.0)
+        stats['mu_lp_target_mse'] = self._last_mu_lp_target_mse
+        stats['mu_raw_target_mse'] = self._last_mu_raw_target_mse
+        stats['mu_hist_lp_mean'] = self._last_mu_hist_lp_mean
+        stats['mu_fut_lp_mean'] = self._last_mu_fut_lp_mean
         return stats
 
     def forward(self, batch_x, mode='n', station_pred=None):
