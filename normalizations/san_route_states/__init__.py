@@ -7,6 +7,7 @@ from .lp_state import LPState
 from .nu import NuState
 from .omega_spec import OmegaSpecState
 from .slope_state import SlopeState
+from .timeapn_state import TimeAPNState
 
 _REGISTRY = {
     "nu": NuState,
@@ -14,6 +15,7 @@ _REGISTRY = {
     "omega_spec": OmegaSpecState,
     "lp_state": LPState,
     "slope_state": SlopeState,
+    "timeapn_state": TimeAPNState,
 }
 
 
@@ -37,5 +39,6 @@ __all__ = [
     "OmegaSpecState",
     "LPState",
     "SlopeState",
+    "TimeAPNState",
     "build_route_state",
 ]

@@ -10,6 +10,9 @@ Canonical paths:
                               must be paired with route_state="lp_state"
     slope_state_correction  — patch-affine denorm-state correction (SlopeStateCorrection)
                               must be paired with route_state="slope_state"
+    timeapn_correction      — TimeAPN phase+mean correction (TimeAPNCorrection)
+                              must be paired with route_state="timeapn_state"
+                              actual logic lives in SANRouteNorm; this entry is a stub
 
 Aliases (for backward compatibility):
     local_value_parameter → local_transport
@@ -22,6 +25,7 @@ from .local_transport import LocalTransportPath
 from .lp_state_correction import LPStateCorrection
 from .residual_content import ResidualContentPath
 from .slope_state_correction import SlopeStateCorrection
+from .timeapn_correction import TimeAPNCorrection
 
 _REGISTRY: dict[str, type] = {
     "local_transport":      LocalTransportPath,
@@ -30,6 +34,7 @@ _REGISTRY: dict[str, type] = {
     "gating":               GatingPath,
     "lp_state_correction":  LPStateCorrection,
     "slope_state_correction": SlopeStateCorrection,
+    "timeapn_correction":   TimeAPNCorrection,
 }
 
 _ALIASES: dict[str, str] = {
@@ -63,5 +68,6 @@ __all__ = [
     "GatingPath",
     "LPStateCorrection",
     "SlopeStateCorrection",
+    "TimeAPNCorrection",
     "build_route_path",
 ]

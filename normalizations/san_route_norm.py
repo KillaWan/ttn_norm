@@ -1,51 +1,74 @@
-"""SANRouteNorm — base SAN + output-side route framework.
+"""SANRouteNorm — exact SAN base + output-side route framework.
 
 Design principles
 -----------------
-- This is a normalization-centric framework.  Route modules do NOT modify the
-  backbone operator and do NOT add a second forecasting branch.
+- Exact original SAN is the base family.
 - normalize() prepares and caches all state features needed by denormalize() and loss().
 - The base predictor (nm.predictor) is always trained in Stage 1.
+- For route_path="none" (pure SAN) the output is numerically identical to the
+  official SAN implementation.
 
-Route state normalisation policy:
-- By default, route-state features are normalised by _normalize_patch_state()
-  at the framework layer (nu, dlogsigma).
-- omega_spec is exempt: it keeps its raw bounded physical meaning.
-- lp_state is handled entirely via a dedicated lp_state_predictor — it bypasses
-  the generic RouteStatePredictor and _normalize_patch_state entirely.
-
-lp_state + lp_state_correction — "Base SAN + predicted future low-pass patch mean":
-  This combination is a minimal extension of pure SAN.  It does NOT add a second
-  forecasting branch and does NOT implement residual-domain SAN.
-
-  The lp slow state is defined by:
-    mu_lp = patch_mean(lowpass_time(raw_series))
-  i.e. first apply a fixed time-domain lowpass filter to the raw time series,
-  then extract patch means.  This guarantees that history and oracle share
-  the identical operator.
-
-  normalize() semantics:
-    1. Raw SAN: mu_hist, std_hist computed on raw x (not residual).
-    2. z = standard SAN-normalised input.
-    3. base predictor predicts raw future patch std (std branch) and mean (unused in denorm).
-    4. mu_hist_lp = patch_mean(lowpass_time(x_hist))   <- lp slow state
-       lp_state_predictor(mu_hist_lp) -> lp_mu_fut_hat (B, P_fut, C).
-       Trained to match oracle future lp slow state.
-
+Pure SAN (route_path="none", route_state="none")
+------------------------------------------------
+  stride MUST equal period_len (non-overlap patches only).
+  normalize():
+    x reshaped to (B, P_hist, period_len, C).
+    patch mean/std computed per patch.
+    z = (x - mean) / (std + eps), reshaped back to (B, T, C).
+    Predictor receives raw (un-normalised) flattened windows xbar_raw:
+      mean head input: (hist_mean - mean_all) and (raw_x - mean_all)
+      std  head input: hist_std               and raw_x
   denormalize():
-    lp_time_stats = _window_stats_to_time_stats(lp_mu_fut_hat, base_std_fut_hat, pred_len)
-    y_hat = mu_lp_time + (sigma_base_time + eps) * y_norm
-    (standard affine denorm; only the mean source is replaced)
+    y_norm reshaped to (B, P_fut, period_len, C).
+    y = y_norm * (pred_std + eps) + pred_mean, reshaped back to (B, pred_len, C).
+  Stage 1: train SAN predictor only, supervised on oracle patch mean/std MSE.
+  Stage 2: freeze predictor, train fm only, task loss.
 
-  compute_route_state_loss():
-    oracle_lp_mu_fut = patch_mean(lowpass_time(y_true))   [same operator as history side]
-    loss = MSE(lp_mu_fut_hat, oracle_lp_mu_fut)
+Route layering
+--------------
+  All routes EXCEPT timeapn_correction build on the exact SAN base.
 
-Stage roles for lp combo (enforced by train_state_routes.py):
-  Stage 1:     nm.predictor only — base std aux loss (mu loss inactive).
-  lp_pretrain: nm.lp_state_predictor only — route_state_loss (patch-level lp mean MSE).
-  Stage 2:     fm only — task loss; nm.predictor + lp_state_predictor both frozen.
-  joint/stage3: forbidden for lp combo.
+lp_state + lp_state_correction
+--------------------------------
+  lp slow state: mu_lp = patch_mean(lowpass_time(raw_series))
+  denormalize uses lp mean + base std.  Stages: stage1, lp_pretrain, stage2.
+
+timeapn_correction + timeapn_state
+----------------------------------------------------------
+  Uses OfficialAPN (timeapn_official.py) in place of the SAN base predictor.
+  This pair does NOT use the SAN base predictor at all.
+  See timeapn_official.py for the module interface.
+
+  normalize():
+    Calls apn.normalize(x):
+      - norm_x, pred_ms, seq_ms = apn.normalize(x)
+      - Caches pred_ms = (pred_m, pred_s) and seq_ms = (seq_m, seq_s).
+      - Returns norm_x.
+
+  denormalize(y_norm):
+    1. Compute seq_ms_y = (seq_m_y, seq_s_y) from y_norm via apn.norm_sliding
+       (needed for phase supervision in loss, NOT used in de_normalize).
+    2. Build station_pred_raw  = cat([pred_m, pred_s]).T  — raw predicted station.
+       Build station_pred_loss = cat([pred_m, seq_s_y + pred_s]).T  — for phase loss.
+    3. Apply apn.de_normalize(y_norm, station_pred_raw) → y_out.
+       (de_normalize receives raw pred_s, not combined phase)
+    4. Cache y_out, station_pred_raw, station_pred_loss.
+
+  compute_route_state_loss(y_true):
+    Implements reconstruction + mean + phase supervision loss:
+      _, (true_m, true_phi) = apn.norm_sliding(y_true_BCT)
+      station_pred_loss from cache → (pred_mean, seq_s_y + pred_s)
+      loss_mean  = MSE(pred_mean, true_m_transposed)
+      loss_phase = MSE(combined_phase, true_phi_transposed)
+      loss_recon = MSE(y_out, y_true)
+      total = loss_recon + loss_mean + loss_phase
+
+  Training stages (enforced by train_state_routes.py):
+    timeapn_pretrain: station_optim on APN params only; fm runs forward but not updated.
+    stage2:           fm_optim only; APN stays frozen unless timeapn_enable_late_merge=True.
+
+  Other routes (local_transport, residual_content, alignment, gating,
+  slope_state_correction): overlap-add generalised implementation unchanged.
 """
 from __future__ import annotations
 
@@ -57,6 +80,7 @@ import torch.nn.functional as F
 
 from .san_route_paths import build_route_path
 from .san_route_states import build_route_state
+from .timeapn_official import OfficialAPN
 
 # Valid route_path values (including backward-compat alias)
 _VALID_PATHS = {
@@ -66,9 +90,19 @@ _VALID_PATHS = {
     "alignment",
     "gating",
     "lp_state_correction",
-    "local_value_parameter",   # alias → local_transport
+    "local_value_parameter",    # alias → local_transport
+    "slope_state_correction",
+    "timeapn_correction",
 }
-_VALID_STATES = {"none", "nu", "dlogsigma", "omega_spec", "lp_state"}
+_VALID_STATES = {
+    "none",
+    "nu",
+    "dlogsigma",
+    "omega_spec",
+    "lp_state",
+    "slope_state",
+    "timeapn_state",
+}
 
 
 def _normalize_patch_state(feat: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
@@ -79,19 +113,12 @@ def _normalize_patch_state(feat: torch.Tensor, eps: float = 1e-5) -> torch.Tenso
     Applied to nu and dlogsigma by default.  omega_spec and lp_state are exempt.
     """
     mean = feat.mean(dim=1, keepdim=True)
-    std = feat.std(dim=1, keepdim=True).clamp_min(eps)
+    std  = feat.std(dim=1, keepdim=True).clamp_min(eps)
     return (feat - mean) / std
 
 
 class _LPStatePredictor(nn.Module):
-    """Channel-wise MLP predicting future low-pass patch mean.
-
-    Input:  mu_hist_raw   (B, P_hist, C) — raw historical patch means
-    Output: mu_lp_fut_hat (B, P_fut, C)  — predicted future low-pass patch mean
-
-    Architecture: Linear(P_hist → hidden) + ReLU + Linear(hidden → P_fut)
-    Parameters are shared across channels (applied on permuted (B, C, P) input).
-    """
+    """Channel-wise MLP predicting future low-pass patch mean."""
 
     def __init__(self, hist_stat_len: int, pred_stat_len: int, hidden: int = 128):
         super().__init__()
@@ -100,10 +127,8 @@ class _LPStatePredictor(nn.Module):
         self.out = nn.Linear(hidden, pred_stat_len)
 
     def forward(self, mu_hist: torch.Tensor) -> torch.Tensor:
-        # mu_hist: (B, P, C) -> permute to (B, C, P) for shared per-channel linear
-        x = mu_hist.permute(0, 2, 1)          # (B, C, P)
-        out = self.out(self.act(self.enc(x))) # (B, C, P_fut)
-        return out.permute(0, 2, 1)           # (B, P_fut, C)
+        x = mu_hist.permute(0, 2, 1)
+        return self.out(self.act(self.enc(x))).permute(0, 2, 1)
 
 
 class SANRouteNorm(nn.Module):
@@ -118,11 +143,14 @@ class SANRouteNorm(nn.Module):
         sigma_min:             Minimum allowed std (clamp floor).
         w_mu:                  Weight for mu component of base aux loss.
         w_std:                 Weight for std component of base aux loss.
-        route_path:            "none" | "local_transport" | "residual_content"
-                               | "alignment" | "gating" | "lp_state_correction"
-                               | "local_value_parameter" (alias → local_transport)
-        route_state:           "none" | "nu" | "dlogsigma" | "omega_spec" | "lp_state"
-        route_state_loss_scale: Weight for route state loss in compute_total_aux_loss().
+        route_path:            One of _VALID_PATHS.
+        route_state:           One of _VALID_STATES.
+        route_state_loss_scale: Weight for route state loss.
+
+        # TimeAPN parameters (only used when route_path="timeapn_correction")
+        timeapn_j, timeapn_learnable, timeapn_wavelet, timeapn_dr,
+        timeapn_kernel_len, timeapn_hkernel_len,
+        timeapn_pd_model, timeapn_pd_ff, timeapn_pe_layers
     """
 
     def __init__(
@@ -138,20 +166,30 @@ class SANRouteNorm(nn.Module):
         route_path: str = "none",
         route_state: str = "none",
         route_state_loss_scale: float = 0.1,
+        # TimeAPN-specific (official APN defaults)
+        timeapn_j: int = 1,
+        timeapn_learnable: bool = True,
+        timeapn_wavelet: str = "bior3.5",
+        timeapn_dr: float = 0.05,
+        timeapn_kernel_len: int = 7,
+        timeapn_hkernel_len: int = 5,
+        timeapn_pd_model: int = 128,
+        timeapn_pd_ff: int = 128,
+        timeapn_pe_layers: int = 2,
         **kwargs,
     ):
         super().__init__()
-        self.seq_len = int(seq_len)
-        self.pred_len = int(pred_len)
+        self.seq_len   = int(seq_len)
+        self.pred_len  = int(pred_len)
         self.window_len = int(period_len)
-        self.stride = int(stride) if int(stride) > 0 else self.window_len
-        self.enc_in = enc_in
-        self.channels = enc_in
+        self.stride    = int(stride) if int(stride) > 0 else self.window_len
+        self.enc_in    = enc_in
+        self.channels  = enc_in
         self.sigma_min = float(sigma_min)
-        self.epsilon = 1e-5
-        self.w_mu = float(w_mu)
-        self.w_std = float(w_std)
-        self.route_path = route_path
+        self.epsilon   = 1e-5
+        self.w_mu      = float(w_mu)
+        self.w_std     = float(w_std)
+        self.route_path  = route_path
         self.route_state = route_state
         self.route_state_loss_scale = float(route_state_loss_scale)
 
@@ -161,26 +199,51 @@ class SANRouteNorm(nn.Module):
         self.pred_stat_len = self._compute_n_windows(self.pred_len)
         raw_hist_len = self.hist_stat_len * self.window_len
 
-        self.predictor = _SANBasePredictor(
-            hist_stat_len=self.hist_stat_len,
-            raw_hist_len=raw_hist_len,
-            pred_stat_len=self.pred_stat_len,
-            enc_in=enc_in,
-            sigma_min=sigma_min,
-        )
+        # ------------------------------------------------------------------
+        # SAN base predictor — used by all routes EXCEPT timeapn pair
+        # ------------------------------------------------------------------
+        self.predictor: Optional[nn.Module] = None
+        if route_path != "timeapn_correction":
+            self.predictor = _SANBasePredictor(
+                hist_stat_len=self.hist_stat_len,
+                raw_hist_len=raw_hist_len,
+                pred_stat_len=self.pred_stat_len,
+                enc_in=enc_in,
+                sigma_min=sigma_min,
+            )
 
-        # lp_state uses a dedicated predictor; other states use generic RouteStatePredictor
+        # ------------------------------------------------------------------
+        # Route-specific modules
+        # ------------------------------------------------------------------
+        self.lp_state_predictor: Optional[nn.Module]  = None
+        self.route_state_predictor: Optional[nn.Module] = None
+        self.route_path_impl: Optional[nn.Module]     = None
+        self.route_state_impl                          = None
+        self.apn_module: Optional[OfficialAPN]         = None
+
         if route_path == "lp_state_correction":
-            # lp combo: future mean source replacement only — no route_path_impl
             self.lp_state_predictor = _LPStatePredictor(
                 hist_stat_len=self.hist_stat_len,
                 pred_stat_len=self.pred_stat_len,
             )
-            self.route_state_predictor = None
-            self.route_path_impl = None
-            self.route_state_impl = None
+
+        elif route_path == "timeapn_correction":
+            self.apn_module = OfficialAPN(
+                seq_len=seq_len,
+                pred_len=pred_len,
+                enc_in=enc_in,
+                kernel_len=timeapn_kernel_len,
+                hkernel_len=timeapn_hkernel_len,
+                j=timeapn_j,
+                learnable=timeapn_learnable,
+                wavelet=timeapn_wavelet,
+                dr=timeapn_dr,
+                pd_model=timeapn_pd_model,
+                pd_ff=timeapn_pd_ff,
+                pe_layers=timeapn_pe_layers,
+            )
+
         elif route_path != "none":
-            self.lp_state_predictor = None
             self.route_state_predictor = RouteStatePredictor(
                 hist_stat_len=self.hist_stat_len,
                 raw_hist_len=raw_hist_len,
@@ -191,11 +254,6 @@ class SANRouteNorm(nn.Module):
                 route_path, pred_len=self.pred_len, enc_in=enc_in, sigma_min=sigma_min
             )
             self.route_state_impl = build_route_state(route_state)
-        else:
-            self.lp_state_predictor = None
-            self.route_state_predictor = None
-            self.route_path_impl = None
-            self.route_state_impl = None
 
         self._reset_cache()
 
@@ -218,7 +276,7 @@ class SANRouteNorm(nn.Module):
             raise ValueError(
                 f"When route_path='{self.route_path}', route_state must not be 'none'."
             )
-        # lp_state and lp_state_correction must always be paired together
+        # lp pair
         if self.route_path == "lp_state_correction" and self.route_state != "lp_state":
             raise ValueError(
                 "route_path='lp_state_correction' requires route_state='lp_state'."
@@ -226,201 +284,177 @@ class SANRouteNorm(nn.Module):
         if self.route_state == "lp_state" and self.route_path != "lp_state_correction":
             raise ValueError(
                 f"route_state='lp_state' requires route_path='lp_state_correction',"
-                f" got route_path='{self.route_path}'."
+                f" got '{self.route_path}'."
+            )
+        # timeapn pair
+        if self.route_path == "timeapn_correction" and self.route_state != "timeapn_state":
+            raise ValueError(
+                "route_path='timeapn_correction' requires route_state='timeapn_state'."
+            )
+        if self.route_state == "timeapn_state" and self.route_path != "timeapn_correction":
+            raise ValueError(
+                f"route_state='timeapn_state' requires route_path='timeapn_correction',"
+                f" got '{self.route_path}'."
             )
         if self.seq_len < self.window_len:
             raise ValueError(f"seq_len={self.seq_len} < window_len={self.window_len}.")
         if self.pred_len < self.window_len:
             raise ValueError(f"pred_len={self.pred_len} < window_len={self.window_len}.")
-        if (self.seq_len - self.window_len) % self.stride != 0:
-            raise ValueError(
-                f"(seq_len - window_len) % stride != 0: "
-                f"seq_len={self.seq_len}, window_len={self.window_len}, stride={self.stride}."
-            )
-        if (self.pred_len - self.window_len) % self.stride != 0:
-            raise ValueError(
-                f"(pred_len - window_len) % stride != 0: "
-                f"pred_len={self.pred_len}, window_len={self.window_len}, stride={self.stride}."
-            )
+        if self.route_path != "timeapn_correction":
+            # stride/window checks only for SAN-based routes
+            if (self.seq_len - self.window_len) % self.stride != 0:
+                raise ValueError(
+                    f"(seq_len - window_len) % stride != 0: "
+                    f"seq_len={self.seq_len}, window_len={self.window_len}, "
+                    f"stride={self.stride}."
+                )
+            if (self.pred_len - self.window_len) % self.stride != 0:
+                raise ValueError(
+                    f"(pred_len - window_len) % stride != 0: "
+                    f"pred_len={self.pred_len}, window_len={self.window_len}, "
+                    f"stride={self.stride}."
+                )
 
     # ------------------------------------------------------------------
-    # Window utilities
+    # Window utilities (used by SAN-based routes)
     # ------------------------------------------------------------------
 
     def _compute_n_windows(self, length: int) -> int:
         return (length - self.window_len) // self.stride + 1
 
     def _extract_windows(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, T, C) -> (B, N, window_len, C)"""
         windows = x.unfold(dimension=1, size=self.window_len, step=self.stride)
         return windows.permute(0, 1, 3, 2).contiguous()
 
     def _compute_window_stats(
         self, windows: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """windows: (B, N, window_len, C) -> (mean, std) each (B, N, C)"""
         mean = windows.mean(dim=2)
-        std = windows.std(dim=2).clamp(min=self.sigma_min)
+        std  = windows.std(dim=2).clamp(min=self.sigma_min)
         return mean, std
 
     def _window_stats_to_time_stats(
         self, mean: torch.Tensor, std: torch.Tensor, total_length: int
     ) -> torch.Tensor:
-        """Overlap-add window stats to per-timestep stats.
-        Returns (B, total_length, 2*C) = cat([mu_t, sigma_t], dim=-1).
-        """
         B, N, C = mean.shape
-        mu_t = torch.zeros(B, total_length, C, device=mean.device, dtype=mean.dtype)
-        e2_t = torch.zeros_like(mu_t)
-        counts = torch.zeros_like(mu_t)
+        mu_t    = torch.zeros(B, total_length, C, device=mean.device, dtype=mean.dtype)
+        e2_t    = torch.zeros_like(mu_t)
+        counts  = torch.zeros_like(mu_t)
         e2 = std.pow(2) + mean.pow(2)
         for i in range(N):
             s = i * self.stride
             e = s + self.window_len
-            mu_t[:, s:e, :] += mean[:, i : i + 1, :]
-            e2_t[:, s:e, :] += e2[:, i : i + 1, :]
+            mu_t[:, s:e, :]   += mean[:, i:i+1, :]
+            e2_t[:, s:e, :]   += e2[:, i:i+1, :]
             counts[:, s:e, :] += 1.0
-        mu_t = mu_t / counts.clamp_min(1.0)
-        e2_t = e2_t / counts.clamp_min(1.0)
-        sigma_t = torch.sqrt(torch.clamp(e2_t - mu_t.pow(2), min=self.sigma_min ** 2))
+        mu_t  = mu_t  / counts.clamp_min(1.0)
+        e2_t  = e2_t  / counts.clamp_min(1.0)
+        sigma_t = torch.sqrt(
+            torch.clamp(e2_t - mu_t.pow(2), min=self.sigma_min ** 2)
+        )
         return torch.cat([mu_t, sigma_t], dim=-1)
 
     def _patch_features_to_time(self, feat: torch.Tensor, total_length: int) -> torch.Tensor:
-        """Overlap-add patch features (B, P, C) to per-timestep (B, total_length, C)."""
         B, P, C = feat.shape
-        out = torch.zeros(B, total_length, C, device=feat.device, dtype=feat.dtype)
-        counts = torch.zeros(B, total_length, C, device=feat.device, dtype=feat.dtype)
+        out    = torch.zeros(B, total_length, C, device=feat.device, dtype=feat.dtype)
+        counts = torch.zeros_like(out)
         for i in range(P):
             s = i * self.stride
             e = s + self.window_len
-            out[:, s:e, :] += feat[:, i : i + 1, :]
+            out[:, s:e, :]    += feat[:, i:i+1, :]
             counts[:, s:e, :] += 1.0
         return out / counts.clamp_min(1.0)
 
     def _split_stats(self, stats: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return stats[:, :, : self.channels], stats[:, :, self.channels :]
+        return stats[:, :, :self.channels], stats[:, :, self.channels:]
 
     def _time_to_patch_mean(self, x_time: torch.Tensor) -> torch.Tensor:
-        """Extract patch means from a time-domain tensor.
-        x_time: (B, T, C) → (B, P, C) where P = _compute_n_windows(T).
-        """
         wins = self._extract_windows(x_time)
         mu, _ = self._compute_window_stats(wins)
         return mu
 
-    def _patch_values_to_time(self, feat: torch.Tensor, total_length: int) -> torch.Tensor:
-        """Overlap-add patch-level values (B, P, C) to time domain (B, total_length, C).
-
-        Two-step mean-preserving lift:
-          1. Linear interpolation as smooth baseline.
-          2. Exact patch-mean correction.
-        """
-        x = feat.permute(0, 2, 1)                                             # (B, C, P)
-        c0 = F.interpolate(x, size=total_length, mode="linear", align_corners=True)
-        c0 = c0.permute(0, 2, 1)                                              # (B, T, C)
-        m0 = self._time_to_patch_mean(c0)                                     # (B, P, C)
-        res = feat - m0
-        return c0 + self._patch_features_to_time(res, total_length)
-
     def _lowpass_time_series(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply fixed [1, 2, 1]/4 FIR lowpass along the time axis.
-
-        x:      (B, T, C)
-        Returns (B, T, C) smoothed along the T dimension.
-        T == 1: returns x unchanged.
-        Kernel [1, 2, 1] / 4; reflect padding; no learnable parameters.
-        Does NOT mix channels.
-        """
         B, T, C = x.shape
         if T == 1:
             return x
-        k = x.new_tensor([1.0, 2.0, 1.0]) / 4.0         # (3,)
-        xt = x.permute(0, 2, 1).reshape(B * C, 1, T)    # (B*C, 1, T)
-        xt_padded = F.pad(xt, (1, 1), mode="reflect")    # (B*C, 1, T+2)
-        w = k.view(1, 1, 3)                               # (1, 1, 3)
-        out = F.conv1d(xt_padded, w, padding=0)          # (B*C, 1, T)
-        return out.reshape(B, C, T).permute(0, 2, 1)     # (B, T, C)
+        k = x.new_tensor([1.0, 2.0, 1.0]) / 4.0
+        xt = x.permute(0, 2, 1).reshape(B * C, 1, T)
+        xt_padded = F.pad(xt, (1, 1), mode="reflect")
+        w = k.view(1, 1, 3)
+        out = F.conv1d(xt_padded, w, padding=0)
+        return out.reshape(B, C, T).permute(0, 2, 1)
 
     def _lowpass_time_to_patch_mean(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute lp slow state: patch_mean(lowpass_time(x)).
-
-        x:      (B, T, C) — raw time series (hist or future)
-        Returns (B, P, C) where P = _compute_n_windows(T).
-        Uses current window_len and stride for patch extraction.
-        This is the sole lp slow-state extractor for the lp combo.
-        """
         lp = self._lowpass_time_series(x)
         wins = self._extract_windows(lp)
         mu, _ = self._compute_window_stats(wins)
         return mu
 
     def _lowpass_patch_mean(self, feat: torch.Tensor) -> torch.Tensor:
-        """[Retained for non-lp use; not used by lp combo.]
-
-        Apply fixed [1, 2, 1]/4 FIR lowpass along the patch axis.
-        feat:   (B, P, C) — patch-level feature.
-        Returns (B, P, C) smoothed along the P dimension.
-        """
         B, P, C = feat.shape
         if P == 1:
             return feat
-        k = feat.new_tensor([1.0, 2.0, 1.0]) / 4.0         # (3,)
-        xp = feat.permute(0, 2, 1).reshape(B * C, 1, P)    # (B*C, 1, P)
-        xp_padded = F.pad(xp, (1, 1), mode="reflect")       # (B*C, 1, P+2)
-        w = k.view(1, 1, 3)                                  # (1, 1, 3)
-        out = F.conv1d(xp_padded, w, padding=0)             # (B*C, 1, P)
-        return out.reshape(B, C, P).permute(0, 2, 1)        # (B, P, C)
+        k = feat.new_tensor([1.0, 2.0, 1.0]) / 4.0
+        xp = feat.permute(0, 2, 1).reshape(B * C, 1, P)
+        xp_padded = F.pad(xp, (1, 1), mode="reflect")
+        w = k.view(1, 1, 3)
+        out = F.conv1d(xp_padded, w, padding=0)
+        return out.reshape(B, C, P).permute(0, 2, 1)
 
     # ------------------------------------------------------------------
-    # Stage-aware parameter group accessors
+    # Cache
     # ------------------------------------------------------------------
 
     def _reset_cache(self) -> None:
-        self._mu_hist: Optional[torch.Tensor] = None
-        self._std_hist: Optional[torch.Tensor] = None
-        # Base predictor outputs (patch-level)
-        self._base_mu_fut_hat: Optional[torch.Tensor] = None
+        # SAN base
+        self._mu_hist: Optional[torch.Tensor]        = None
+        self._std_hist: Optional[torch.Tensor]       = None
+        self._base_mu_fut_hat: Optional[torch.Tensor]  = None
         self._base_std_fut_hat: Optional[torch.Tensor] = None
-        # Base per-timestep stats (time-domain)
-        self._pred_time_stats: Optional[torch.Tensor] = None
-        self._base_time_mean: Optional[torch.Tensor] = None
-        self._base_time_std: Optional[torch.Tensor] = None
-        # Generic route state features (nu / dlogsigma / omega_spec)
-        self._route_hist_state: Optional[torch.Tensor] = None
-        self._route_future_state_hat: Optional[torch.Tensor] = None
-        self._route_future_state_time: Optional[torch.Tensor] = None
-        self._route_future_oracle_state: Optional[torch.Tensor] = None
-        self._route_hist_state_raw: Optional[torch.Tensor] = None
-        self._route_future_state_hat_raw: Optional[torch.Tensor] = None
-        # lp_state specific caches (patch-level)
-        self._lp_mu_hist: Optional[torch.Tensor] = None      # (B, P_hist, C) mu_hist_lp
-        self._lp_mu_fut_hat: Optional[torch.Tensor] = None   # (B, P_fut, C)  predicted lp mean
-        self._oracle_lp_mu_fut: Optional[torch.Tensor] = None  # (B, P_fut, C) oracle lp mean
-        # Cached names
-        self._route_path_name: str = self.route_path
+        self._pred_time_stats: Optional[torch.Tensor]  = None
+        self._base_time_mean: Optional[torch.Tensor]   = None
+        self._base_time_std: Optional[torch.Tensor]    = None
+        # Generic route
+        self._route_hist_state: Optional[torch.Tensor]            = None
+        self._route_future_state_hat: Optional[torch.Tensor]      = None
+        self._route_future_state_time: Optional[torch.Tensor]     = None
+        self._route_future_oracle_state: Optional[torch.Tensor]   = None
+        self._route_hist_state_raw: Optional[torch.Tensor]        = None
+        self._route_future_state_hat_raw: Optional[torch.Tensor]  = None
+        # lp_state
+        self._lp_mu_hist: Optional[torch.Tensor]     = None
+        self._lp_mu_fut_hat: Optional[torch.Tensor]  = None
+        self._oracle_lp_mu_fut: Optional[torch.Tensor] = None
+        # TimeAPN (official APN caches)
+        self._apn_pred_ms: Optional[tuple]            = None   # (pred_m, pred_s)
+        self._apn_seq_ms: Optional[tuple]             = None   # (seq_m, seq_s)
+        self._apn_station_pred_raw:  Optional[torch.Tensor] = None  # (B, pred_len, 2C) raw [pred_m, pred_s]
+        self._apn_station_pred_loss: Optional[torch.Tensor] = None  # (B, pred_len, 2C) [pred_m, seq_s_y+pred_s]
+        self._apn_y_out: Optional[torch.Tensor]             = None  # final denorm output
+        # Diagnostics
+        self._route_path_name:  str = self.route_path
         self._route_state_name: str = self.route_state
-        # Scalar loss trackers
-        self._last_mu_loss: float = 0.0
-        self._last_std_loss: float = 0.0
-        self._last_base_aux_loss: float = 0.0
-        self._last_route_state_loss: float = 0.0
-        self._last_aux_total: float = 0.0
+        self._last_mu_loss:           float = 0.0
+        self._last_std_loss:          float = 0.0
+        self._last_base_aux_loss:     float = 0.0
+        self._last_route_state_loss:  float = 0.0
+        self._last_aux_total:         float = 0.0
+        self._last_apn_loss_mean:     float = 0.0
+        self._last_apn_loss_phase:    float = 0.0
+        self._last_apn_loss_recon:    float = 0.0
 
     # ------------------------------------------------------------------
-    # Stage-aware parameter group accessors
+    # Parameter group accessors
     # ------------------------------------------------------------------
 
     def parameters_base_predictor(self) -> list:
-        """Return parameter list for the base predictor (Stage 1 optimizer target)."""
-        return list(self.predictor.parameters())
+        """Stage 1 optimizer target — SAN base predictor only."""
+        if self.predictor is not None:
+            return list(self.predictor.parameters())
+        return []
 
     def parameters_route_modules(self) -> list:
-        """Return parameter list for route modules (Stage 3 optimizer target).
-
-        For lp_state_correction: includes lp_state_predictor + route_path_impl params.
-        For all other paths: includes route_state_predictor + route_path_impl params.
-        Returns an empty list when route_path='none'.
-        """
+        """Route-module params (lp_pretrain / timeapn_pretrain / stage3)."""
         params: list = []
         if self.lp_state_predictor is not None:
             params.extend(self.lp_state_predictor.parameters())
@@ -428,6 +462,8 @@ class SANRouteNorm(nn.Module):
             params.extend(self.route_state_predictor.parameters())
         if self.route_path_impl is not None:
             params.extend(self.route_path_impl.parameters())
+        if self.apn_module is not None:
+            params.extend(self.apn_module.parameters())
         return params
 
     # ------------------------------------------------------------------
@@ -435,103 +471,139 @@ class SANRouteNorm(nn.Module):
     # ------------------------------------------------------------------
 
     def freeze_base_predictor(self) -> None:
-        for p in self.predictor.parameters():
-            p.requires_grad_(False)
+        if self.predictor is not None:
+            for p in self.predictor.parameters():
+                p.requires_grad_(False)
 
     def unfreeze_base_predictor(self) -> None:
-        for p in self.predictor.parameters():
-            p.requires_grad_(True)
+        if self.predictor is not None:
+            for p in self.predictor.parameters():
+                p.requires_grad_(True)
 
     def freeze_route_modules(self) -> None:
-        """Freeze all route modules (lp_state_predictor, route_state_predictor, route_path_impl)."""
-        if self.lp_state_predictor is not None:
-            for p in self.lp_state_predictor.parameters():
-                p.requires_grad_(False)
-        if self.route_state_predictor is not None:
-            for p in self.route_state_predictor.parameters():
-                p.requires_grad_(False)
-        if self.route_path_impl is not None:
-            for p in self.route_path_impl.parameters():
-                p.requires_grad_(False)
+        for m in [
+            self.lp_state_predictor,
+            self.route_state_predictor,
+            self.route_path_impl,
+            self.apn_module,
+        ]:
+            if m is not None:
+                for p in m.parameters():
+                    p.requires_grad_(False)
 
     def unfreeze_route_modules(self) -> None:
-        """Unfreeze all route modules."""
-        if self.lp_state_predictor is not None:
-            for p in self.lp_state_predictor.parameters():
-                p.requires_grad_(True)
-        if self.route_state_predictor is not None:
-            for p in self.route_state_predictor.parameters():
-                p.requires_grad_(True)
-        if self.route_path_impl is not None:
-            for p in self.route_path_impl.parameters():
-                p.requires_grad_(True)
+        for m in [
+            self.lp_state_predictor,
+            self.route_state_predictor,
+            self.route_path_impl,
+            self.apn_module,
+        ]:
+            if m is not None:
+                for p in m.parameters():
+                    p.requires_grad_(True)
 
     def _should_normalize_route_state(self) -> bool:
-        """Return True if framework _normalize_patch_state() should be applied.
-
-        omega_spec and lp_state are exempt (both keep their raw physical meaning).
-        """
-        return self.route_state not in ("omega_spec", "lp_state")
+        return self.route_state not in ("omega_spec", "lp_state", "timeapn_state")
 
     # ------------------------------------------------------------------
-    # Main interface
+    # Main interface: normalize
     # ------------------------------------------------------------------
 
     def normalize(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalize input and prepare all caches.
+        """Normalize input.
 
-        lp_state_correction: raw SAN stats on x (not residual), then
-          lp_state_predictor(mu_hist_raw) → lp_mu_fut_hat (B, P_fut, C).
-        Generic route paths: unchanged base SAN + RouteStatePredictor.
+        timeapn pair:
+            Calls OfficialAPN.normalize(x); caches pred_ms / seq_ms.
+            Returns normalized x.
+        pure SAN / other routes:
+            Exact SAN (reshape-based) or overlap-add generalised implementation.
         """
         self._reset_cache()
         B, T, C = x.shape
-        if T != self.seq_len:
+        if T != self.seq_len and self.route_path != "timeapn_correction":
             raise ValueError(
                 f"SANRouteNorm expected seq_len={self.seq_len}, got {T}."
             )
 
-        # --- Base SAN: history stats on raw input ---
-        x_input = x
-        hist_windows = self._extract_windows(x_input.detach())
+        is_pure_san = (self.route_path == "none")
+        is_timeapn  = (self.route_path == "timeapn_correction")
+
+        # ==============================================================
+        # Official TimeAPN path
+        # ==============================================================
+        if is_timeapn:
+            if self.apn_module is None:
+                return x
+            norm_x, pred_ms, seq_ms = self.apn_module.normalize(x)
+            self._apn_pred_ms = pred_ms   # (pred_m, pred_s) each (B, C, pred_len)
+            self._apn_seq_ms  = seq_ms    # (seq_m, seq_s)  each (B, C, seq_len)
+            return norm_x
+
+        # ==============================================================
+        # Exact SAN reshape-based path (pure SAN)
+        # ==============================================================
+        if is_pure_san:
+            P_hist = self.hist_stat_len
+            x_patches = x.reshape(B, P_hist, self.window_len, C)
+            mu_hist   = x_patches.mean(dim=2)
+            std_hist  = x_patches.std(dim=2).clamp(min=self.sigma_min)
+            self._mu_hist  = mu_hist
+            self._std_hist = std_hist
+
+            z_san = (
+                (x_patches - mu_hist.unsqueeze(2))
+                / (std_hist.unsqueeze(2) + self.epsilon)
+            ).reshape(B, T, C)
+
+            xbar_raw = x.detach().reshape(B, -1, C)
+            anchor   = mu_hist.mean(dim=1, keepdim=True)
+            mu_base_fut, std_base_fut = self.predictor.predict(
+                mu_hist, std_hist, None, anchor, xbar_raw=xbar_raw
+            )
+            self._base_mu_fut_hat  = mu_base_fut
+            self._base_std_fut_hat = std_base_fut
+            self._pred_time_stats  = self._window_stats_to_time_stats(
+                mu_base_fut, std_base_fut, self.pred_len
+            )
+            bts_m, bts_s = self._split_stats(self._pred_time_stats)
+            self._base_time_mean = bts_m
+            self._base_time_std  = bts_s
+            return z_san
+
+        # ==============================================================
+        # Generalised overlap-add path (lp_state + generic routes)
+        # ==============================================================
+        hist_windows = self._extract_windows(x.detach())
         mu_hist, std_hist = self._compute_window_stats(hist_windows)
-        self._mu_hist = mu_hist
+        self._mu_hist  = mu_hist
         self._std_hist = std_hist
 
-        # --- Per-timestep normalization ---
-        hist_time_stats = self._window_stats_to_time_stats(mu_hist, std_hist, T)
+        hist_time_stats     = self._window_stats_to_time_stats(mu_hist, std_hist, T)
         hist_time_mean, hist_time_std = self._split_stats(hist_time_stats)
-        z = (x_input - hist_time_mean) / (hist_time_std + self.epsilon)
+        z = (x - hist_time_mean) / (hist_time_std + self.epsilon)
 
-        # --- xbar: flattened normalized windows ---
         norm_windows = self._extract_windows(z.detach())
         xbar = norm_windows.reshape(B, -1, C)
 
-        # --- Base predictor ---
         anchor = mu_hist.mean(dim=1, keepdim=True)
         mu_base_fut, std_base_fut = self.predictor.predict(
             mu_hist, std_hist, xbar, anchor
         )
-        self._base_mu_fut_hat = mu_base_fut
+        self._base_mu_fut_hat  = mu_base_fut
         self._base_std_fut_hat = std_base_fut
-
-        self._pred_time_stats = self._window_stats_to_time_stats(
+        self._pred_time_stats  = self._window_stats_to_time_stats(
             mu_base_fut, std_base_fut, self.pred_len
         )
-        base_time_mean, base_time_std = self._split_stats(self._pred_time_stats)
-        self._base_time_mean = base_time_mean
-        self._base_time_std = base_time_std
+        bts_m, bts_s = self._split_stats(self._pred_time_stats)
+        self._base_time_mean = bts_m
+        self._base_time_std  = bts_s
 
-        # --- Route state (if active) ---
         if self.route_path == "lp_state_correction":
-            # lp combo: mu_lp = patch_mean(lowpass_time(x_hist))
             mu_hist_lp = self._lowpass_time_to_patch_mean(x.detach())
-            self._lp_mu_hist = mu_hist_lp
-            lp_mu_fut_hat = self.lp_state_predictor(mu_hist_lp)
-            self._lp_mu_fut_hat = lp_mu_fut_hat
+            self._lp_mu_hist    = mu_hist_lp
+            self._lp_mu_fut_hat = self.lp_state_predictor(mu_hist_lp)
 
         elif self.route_path != "none":
-            # Generic route state: RouteStatePredictor + optional _normalize_patch_state
             should_normalize = self._should_normalize_route_state()
             hist_state_raw = self.route_state_impl.extract_hist_state(
                 x.detach(), hist_windows, mu_hist, std_hist, self.sigma_min
@@ -542,54 +614,120 @@ class SANRouteNorm(nn.Module):
                 else hist_state_raw
             )
             self._route_hist_state = hist_state
-
-            future_state_hat_raw_pred = self.route_state_predictor(hist_state, xbar)
-            future_state_hat_adapted = self.route_state_impl.adapt_future_state(
-                future_state_hat_raw_pred
-            )
-            self._route_future_state_hat_raw = future_state_hat_adapted
+            fut_hat_raw = self.route_state_predictor(hist_state, xbar)
+            fut_hat_adapted = self.route_state_impl.adapt_future_state(fut_hat_raw)
+            self._route_future_state_hat_raw = fut_hat_adapted
             future_state_hat = (
-                _normalize_patch_state(future_state_hat_adapted) if should_normalize
-                else future_state_hat_adapted
+                _normalize_patch_state(fut_hat_adapted) if should_normalize
+                else fut_hat_adapted
             )
-            self._route_future_state_hat = future_state_hat
+            self._route_future_state_hat  = future_state_hat
             self._route_future_state_time = self._patch_features_to_time(
                 future_state_hat, self.pred_len
             )
 
         return z
 
+    # ------------------------------------------------------------------
+    # Main interface: denormalize
+    # ------------------------------------------------------------------
+
     def denormalize(
         self,
         y_norm: torch.Tensor,
         y_true_oracle: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Restore y_norm to original scale, applying the route path if active.
+        """Restore y_norm to original scale.
 
-        lp_state_correction (mean-only replacement):
-            Uses predicted future low-pass patch mean as the denorm mean;
-            base std for the scale.  Standard affine denorm.
-        All other paths: standard affine denorm then optional route_path_impl.
+        timeapn pair:
+            1. Compute seq_ms_y from y_norm via norm_sliding (needed for phase loss).
+            2. Build station_pred_raw  = cat([pred_m, pred_s], dim=-1)  → raw predicted station.
+               Build station_pred_loss = cat([pred_m, seq_s_y + pred_s], dim=-1) → phase-supervised.
+            3. de_normalize uses station_pred_raw (official semantics: raw pred_s for phase compensation).
+            4. Cache y_out, station_pred_raw, station_pred_loss for loss.
+        pure SAN:
+            Exact reshape-based denorm.
+        Others:
+            Overlap-add denorm + optional route_path_impl.
         """
+        T = y_norm.shape[1]
+
+        # ==============================================================
+        # Official TimeAPN denorm
+        # ==============================================================
+        if self.route_path == "timeapn_correction":
+            if self.apn_module is None or self._apn_pred_ms is None:
+                return y_norm
+            pred_m, pred_s = self._apn_pred_ms  # (B, C, pred_len) each
+
+            # seq_ms of model output — needed for phase supervision in loss
+            y_BCT = y_norm.detach().transpose(-1, -2)  # (B, C, pred_len)
+            _, (seq_m_y, seq_s_y) = self.apn_module.norm_sliding(y_BCT)
+            # seq_s_y: (B, C, pred_len) — phase of model output
+
+            # Raw predicted station tensor: only pred_m and pred_s
+            # This is the official APN semantics: pred_s is used for phase compensation
+            station_pred_raw = torch.cat(
+                [pred_m, pred_s], dim=1
+            ).transpose(-1, -2)   # (B, pred_len, 2C)
+
+            # Loss station tensor: combined phase = seq_s_y + pred_s for phase supervision
+            station_pred_loss = torch.cat(
+                [pred_m, seq_s_y + pred_s], dim=1
+            ).transpose(-1, -2)   # (B, pred_len, 2C)
+
+            # de_normalize with raw predicted station (official semantics)
+            y_out = self.apn_module.de_normalize(y_norm, station_pred_raw)
+
+            # Cache for loss
+            self._apn_station_pred_raw  = station_pred_raw
+            self._apn_station_pred_loss = station_pred_loss
+            self._apn_y_out             = y_out
+            return y_out
+
         if self._pred_time_stats is None:
             return y_norm
 
-        T = y_norm.shape[1]
+        # ==============================================================
+        # Pure SAN exact reshape-based denorm
+        # ==============================================================
+        if self.route_path == "none":
+            if T != self.pred_len:
+                ts = self._window_stats_to_time_stats(
+                    self._base_mu_fut_hat, self._base_std_fut_hat, T
+                )
+                mu, sig = self._split_stats(ts)
+                return (mu + (sig + self.epsilon) * y_norm).contiguous()
 
-        # lp_state_correction: future mean from lp predictor, std from base predictor
+            B, _, C = y_norm.shape
+            P_fut = self.pred_stat_len
+            y_patches  = y_norm.reshape(B, P_fut, self.window_len, C)
+            pred_mean  = self._base_mu_fut_hat
+            pred_std   = self._base_std_fut_hat
+            y_san = (
+                y_patches * (pred_std.unsqueeze(2) + self.epsilon)
+                + pred_mean.unsqueeze(2)
+            ).reshape(B, self.pred_len, C)
+            return y_san.contiguous()
+
+        # ==============================================================
+        # lp_state_correction
+        # ==============================================================
         if (
             self.route_path == "lp_state_correction"
             and self._lp_mu_fut_hat is not None
             and self._base_std_fut_hat is not None
             and T == self.pred_len
         ):
-            lp_time_stats = self._window_stats_to_time_stats(
+            lp_ts = self._window_stats_to_time_stats(
                 self._lp_mu_fut_hat, self._base_std_fut_hat, T
             )
-            mu_lp_time, sigma_base_time = self._split_stats(lp_time_stats)
-            return (mu_lp_time + (sigma_base_time + self.epsilon) * y_norm).contiguous()
+            mu_lp, sig_base = self._split_stats(lp_ts)
+            return (mu_lp + (sig_base + self.epsilon) * y_norm).contiguous()
 
-        # Standard base denorm
+        # ==============================================================
+        # Generic overlap-add + route_path_impl
+        # ==============================================================
         if T == self._pred_time_stats.shape[1]:
             time_stats = self._pred_time_stats
         else:
@@ -599,7 +737,6 @@ class SANRouteNorm(nn.Module):
         mean, std = self._split_stats(time_stats)
         y_base = mean + (std + self.epsilon) * y_norm
 
-        # Generic route path transformation
         if (
             self.route_path not in ("none", "lp_state_correction")
             and self._route_future_state_hat is not None
@@ -617,11 +754,10 @@ class SANRouteNorm(nn.Module):
                 base_time_mean=self._base_time_mean,
                 base_time_std=self._base_time_std,
             )
-
         return y_base
 
     # ------------------------------------------------------------------
-    # Loss computation (split by stage role)
+    # Loss computation
     # ------------------------------------------------------------------
 
     def _compute_oracle_stats(
@@ -632,56 +768,99 @@ class SANRouteNorm(nn.Module):
         return true_windows, oracle_mu, oracle_std
 
     def compute_base_aux_loss(self, y_true: torch.Tensor) -> torch.Tensor:
-        """Base SAN stats loss — Stage 1 uses this.
+        """Base SAN stats loss (Stage 1).  Not used for timeapn pair."""
+        if self.route_path == "timeapn_correction":
+            return torch.tensor(0.0, device=y_true.device)
 
-        lp_state_correction: oracle stats from raw y_true; only std_loss active;
-          mu_loss is inactive (base mean prediction is not used in lp denorm).
-        All other paths: standard mu + std loss on raw y_true.
-        """
         if self._base_mu_fut_hat is None or self._base_std_fut_hat is None:
             return torch.tensor(0.0, device=y_true.device)
 
         _, oracle_mu, oracle_std = self._compute_oracle_stats(y_true)
 
         if self.route_path == "lp_state_correction":
-            # Only std loss; mu predictor is not used in lp denorm
-            mu_loss = torch.tensor(0.0, device=y_true.device)
+            mu_loss  = torch.tensor(0.0, device=y_true.device)
             std_loss = F.mse_loss(self._base_std_fut_hat, oracle_std)
             base_aux = self.w_std * std_loss
         else:
-            mu_loss = F.mse_loss(self._base_mu_fut_hat, oracle_mu)
+            mu_loss  = F.mse_loss(self._base_mu_fut_hat, oracle_mu)
             std_loss = F.mse_loss(self._base_std_fut_hat, oracle_std)
             base_aux = self.w_mu * mu_loss + self.w_std * std_loss
 
-        self._last_mu_loss = float(mu_loss.detach().item())
-        self._last_std_loss = float(std_loss.detach().item())
+        self._last_mu_loss       = float(mu_loss.detach().item())
+        self._last_std_loss      = float(std_loss.detach().item())
         self._last_base_aux_loss = float(base_aux.detach().item())
-        self._last_aux_total = self._last_base_aux_loss
+        self._last_aux_total     = self._last_base_aux_loss
         return base_aux
 
     def compute_route_state_loss(self, y_true: torch.Tensor) -> torch.Tensor:
-        """Route state prediction loss — lp_pretrain / Stage 3 uses this.
+        """Route state loss.
 
-        lp_state: patch-level MSE(lp_mu_fut_hat, oracle_lp_mu_fut).
-                  oracle_lp_mu_fut = patch_mean(lowpass_time(y_true)).
-        Others:   MSE(future_state_hat, oracle_state) at patch level.
+        timeapn pair: implements official sliding_loss_P.
+        lp pair: patch MSE.
+        Others: generic route state MSE.
         Returns 0 when route_path='none'.
         """
         if self.route_path == "none":
             return torch.tensor(0.0, device=y_true.device)
 
-        # lp_state special case: patch-level MSE against oracle slow state
+        # ------------------------------------------------------------------
+        # Official TimeAPN sliding_loss_P
+        # ------------------------------------------------------------------
+        if self.route_path == "timeapn_correction":
+            if self.apn_module is None or self._apn_pred_ms is None:
+                return torch.tensor(0.0, device=y_true.device)
+
+            pred_m, pred_s = self._apn_pred_ms  # (B, C, pred_len)
+
+            # Ground-truth mean and phase from y_true
+            y_true_BCT = y_true.transpose(-1, -2)  # (B, C, pred_len)
+            _, (true_m, true_phi) = self.apn_module.norm_sliding(y_true_BCT)
+            # true_m, true_phi: (B, C, pred_len)
+
+            # station_pred1 was built in denormalize as (B, pred_len, 2C)
+            if self._apn_station_pred_loss is None:
+                return torch.tensor(0.0, device=y_true.device)
+
+            half = self._apn_station_pred_loss.shape[-1] // 2
+            pred_mean_flat = self._apn_station_pred_loss[..., :half]  # (B, pred_len, C)
+            combined_phase = self._apn_station_pred_loss[..., half:]  # (B, pred_len, C)  seq_s_y + pred_s
+
+            # station_ture for y_true: cat([true_m, true_phi]) → (B, pred_len, 2C)
+            true_mean_flat  = true_m.transpose(-1, -2)   # (B, pred_len, C)
+            true_phase_flat = true_phi.transpose(-1, -2)  # (B, pred_len, C)
+
+            loss_mean  = F.mse_loss(pred_mean_flat,  true_mean_flat)
+            loss_phase = F.mse_loss(combined_phase,  true_phase_flat)
+
+            # Reconstruction loss: y_out vs y_true
+            if self._apn_y_out is not None:
+                loss_recon = F.mse_loss(self._apn_y_out, y_true)
+            else:
+                loss_recon = torch.tensor(0.0, device=y_true.device)
+
+            self._last_apn_loss_mean  = float(loss_mean.detach().item())
+            self._last_apn_loss_phase = float(loss_phase.detach().item())
+            self._last_apn_loss_recon = float(loss_recon.detach().item())
+
+            total = loss_recon + loss_mean + loss_phase
+            self._last_route_state_loss = float(total.detach().item())
+            return total
+
+        # ------------------------------------------------------------------
+        # lp_state
+        # ------------------------------------------------------------------
         if self.route_state == "lp_state":
             if self._lp_mu_fut_hat is None:
                 return torch.tensor(0.0, device=y_true.device)
-            # oracle: same operator as history side — patch_mean(lowpass_time(y_true))
             oracle_lp_mu_fut = self._lowpass_time_to_patch_mean(y_true)
             self._oracle_lp_mu_fut = oracle_lp_mu_fut
             lp_loss = F.mse_loss(self._lp_mu_fut_hat, oracle_lp_mu_fut)
             self._last_route_state_loss = float(lp_loss.detach().item())
             return lp_loss
 
+        # ------------------------------------------------------------------
         # Generic route state
+        # ------------------------------------------------------------------
         if self._route_future_state_hat is None:
             return torch.tensor(0.0, device=y_true.device)
 
@@ -694,7 +873,6 @@ class SANRouteNorm(nn.Module):
             _normalize_patch_state(oracle_raw) if should_normalize else oracle_raw
         )
         self._route_future_oracle_state = oracle_state
-
         route_state_loss = F.mse_loss(self._route_future_state_hat, oracle_state)
         self._last_route_state_loss = float(route_state_loss.detach().item())
         return route_state_loss
@@ -703,16 +881,15 @@ class SANRouteNorm(nn.Module):
         """Combined base aux + weighted route state loss."""
         if self.route_path == "lp_state_correction":
             route_loss = self.compute_route_state_loss(y_true)
-            base_aux = self.compute_base_aux_loss(y_true)
+            base_aux   = self.compute_base_aux_loss(y_true)
         else:
-            base_aux = self.compute_base_aux_loss(y_true)
+            base_aux   = self.compute_base_aux_loss(y_true)
             route_loss = self.compute_route_state_loss(y_true)
         total = base_aux + self.route_state_loss_scale * route_loss
         self._last_aux_total = float(total.detach().item())
         return total
 
     def loss(self, y_true: torch.Tensor) -> torch.Tensor:
-        """Backward-compat alias for compute_total_aux_loss."""
         return self.compute_total_aux_loss(y_true)
 
     # ------------------------------------------------------------------
@@ -720,18 +897,17 @@ class SANRouteNorm(nn.Module):
     # ------------------------------------------------------------------
 
     def get_last_aux_stats(self) -> dict:
-        """Scalar stats from most recent loss computation.
-        base_aux and route_state_loss are kept separate.
-        lp_* fields are non-zero only when route_path='lp_state_correction'.
-        lp_mu_hist_mean     : mean of patch_mean(lowpass_time(x_hist))
-        oracle_lp_mu_fut_mean: mean of patch_mean(lowpass_time(y_true))
-        """
         return {
-            "aux_total": self._last_aux_total,
-            "base_aux_loss": self._last_base_aux_loss,
-            "mu_loss": self._last_mu_loss,
-            "std_loss": self._last_std_loss,
-            "route_state_loss": self._last_route_state_loss,
+            "aux_total":         self._last_aux_total,
+            "base_aux_loss":     self._last_base_aux_loss,
+            "mu_loss":           self._last_mu_loss,
+            "std_loss":          self._last_std_loss,
+            "route_state_loss":  self._last_route_state_loss,
+            # TimeAPN decomposition
+            "apn_loss_mean":     self._last_apn_loss_mean,
+            "apn_loss_phase":    self._last_apn_loss_phase,
+            "apn_loss_recon":    self._last_apn_loss_recon,
+            # SAN stats
             "mu_hist_mean": (
                 float(self._mu_hist.mean().item()) if self._mu_hist is not None else 0.0
             ),
@@ -746,8 +922,10 @@ class SANRouteNorm(nn.Module):
                 float(self._base_std_fut_hat.mean().item())
                 if self._base_std_fut_hat is not None else 0.0
             ),
+            # lp fields
             "lp_mu_hist_mean": (
-                float(self._lp_mu_hist.mean().item()) if self._lp_mu_hist is not None else 0.0
+                float(self._lp_mu_hist.mean().item())
+                if self._lp_mu_hist is not None else 0.0
             ),
             "lp_mu_fut_hat_mean": (
                 float(self._lp_mu_fut_hat.mean().item())
@@ -758,37 +936,33 @@ class SANRouteNorm(nn.Module):
                 if self._oracle_lp_mu_fut is not None else 0.0
             ),
             "lp_mu_abs_error": (
-                float(
-                    (self._lp_mu_fut_hat - self._oracle_lp_mu_fut).abs().mean().item()
-                )
+                float((self._lp_mu_fut_hat - self._oracle_lp_mu_fut).abs().mean().item())
                 if self._lp_mu_fut_hat is not None and self._oracle_lp_mu_fut is not None
                 else 0.0
             ),
         }
 
     def get_route_diagnostics(self) -> dict:
-        """Cached diagnostics from the route path.
-        Empty dict when route_path='none'.
-        Aux stats are NOT mixed in here — use get_last_aux_stats() for those.
-        lp combo fields:
-          lp_mu_hist_mean      : mean of patch_mean(lowpass_time(x_hist))
-          lp_mu_fut_hat_mean   : mean of predicted future lp slow state
-          oracle_lp_mu_fut_mean: mean of patch_mean(lowpass_time(y_true))
-          lp_mu_abs_error      : |lp_mu_fut_hat - oracle_lp_mu_fut|.mean()
-        """
         if self.route_path == "none":
             return {}
         diag: dict = {
-            "route_path": self._route_path_name,
+            "route_path":  self._route_path_name,
             "route_state": self._route_state_name,
         }
-        if self.route_path == "lp_state_correction":
-            # lp-specific diagnostics
-            diag["lp_mu_hist_mean"] = (
+        if self.route_path == "timeapn_correction":
+            diag["apn_loss_mean"]  = self._last_apn_loss_mean
+            diag["apn_loss_phase"] = self._last_apn_loss_phase
+            diag["apn_loss_recon"] = self._last_apn_loss_recon
+            if self._apn_pred_ms is not None:
+                pred_m, pred_s = self._apn_pred_ms
+                diag["apn_pred_m_mean"] = float(pred_m.mean().item())
+                diag["apn_pred_s_mean"] = float(pred_s.mean().item())
+        elif self.route_path == "lp_state_correction":
+            diag["lp_mu_hist_mean"]       = (
                 float(self._lp_mu_hist.mean().item())
                 if self._lp_mu_hist is not None else 0.0
             )
-            diag["lp_mu_fut_hat_mean"] = (
+            diag["lp_mu_fut_hat_mean"]    = (
                 float(self._lp_mu_fut_hat.mean().item())
                 if self._lp_mu_fut_hat is not None else 0.0
             )
@@ -827,7 +1001,7 @@ class SANRouteNorm(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Internal MLP and predictor classes
+# Internal MLP and predictor classes (SAN-based routes only)
 # ---------------------------------------------------------------------------
 
 
@@ -851,25 +1025,25 @@ class _SANBaseMLP(nn.Module):
         self.pred_stat_len = pred_stat_len
         self.mode = mode
         self.stats_input = nn.Linear(hist_stat_len, hidden_dim)
-        self.raw_input = nn.Linear(raw_hist_len, hidden_dim)
-        self.output = nn.Linear(2 * hidden_dim, pred_stat_len)
+        self.raw_input   = nn.Linear(raw_hist_len,  hidden_dim)
+        self.output      = nn.Linear(2 * hidden_dim, pred_stat_len)
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
 
         if mode == "mu":
-            self.activation = nn.Tanh()
+            self.activation       = nn.Tanh()
             self.final_activation = nn.Identity()
             self.weight = nn.Parameter(torch.ones(2, enc_in))
         else:
-            self.activation = nn.GELU()
+            self.activation       = nn.GELU()
             self.final_activation = nn.Softplus()
             self.weight = None
 
     def forward(
         self,
         x_stats: torch.Tensor,
-        x_raw: torch.Tensor,
-        anchor: Optional[torch.Tensor] = None,
+        x_raw:   torch.Tensor,
+        anchor:  Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         xs = x_stats.permute(0, 2, 1)
         xr = x_raw.permute(0, 2, 1)
@@ -888,7 +1062,7 @@ class _SANBaseMLP(nn.Module):
 
 
 class _SANBasePredictor(nn.Module):
-    """Predicts future (mean, std) from historical window stats and normalized input."""
+    """Predicts future (mean, std) from historical window stats and input."""
 
     def __init__(
         self,
@@ -920,27 +1094,31 @@ class _SANBasePredictor(nn.Module):
 
     def predict(
         self,
-        mu_hist: torch.Tensor,
-        std_hist: torch.Tensor,
-        xbar: torch.Tensor,
-        anchor: torch.Tensor,
+        mu_hist:   torch.Tensor,
+        std_hist:  torch.Tensor,
+        xbar:      Optional[torch.Tensor],
+        anchor:    torch.Tensor,
+        xbar_raw:  Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        mu_fut = self.mean_head(
-            mu_hist - anchor.expand(-1, mu_hist.shape[1], -1), xbar, anchor
-        )
-        std_fut = self.std_head(std_hist, xbar, None).clamp(min=self.sigma_min)
+        if xbar_raw is not None:
+            raw_len       = xbar_raw.shape[1]
+            anchor_broad  = anchor.expand(-1, raw_len, -1)
+            mu_fut  = self.mean_head(
+                mu_hist - anchor.expand(-1, mu_hist.shape[1], -1),
+                xbar_raw - anchor_broad,
+                anchor,
+            )
+            std_fut = self.std_head(std_hist, xbar_raw, None).clamp(min=self.sigma_min)
+        else:
+            mu_fut  = self.mean_head(
+                mu_hist - anchor.expand(-1, mu_hist.shape[1], -1), xbar, anchor
+            )
+            std_fut = self.std_head(std_hist, xbar, None).clamp(min=self.sigma_min)
         return mu_fut, std_fut
 
 
 class RouteStatePredictor(nn.Module):
-    """Shared predictor for future route state — state-agnostic.
-
-    Input:
-        hist_state: (B, P_hist, C)  — normalised by framework if applicable
-        xbar:       (B, P_hist * window_len, C)
-    Output:
-        future_state_hat_raw: (B, P_fut, C)
-    """
+    """Shared predictor for future route state — state-agnostic."""
 
     def __init__(
         self,
@@ -953,19 +1131,19 @@ class RouteStatePredictor(nn.Module):
         super().__init__()
         self.pred_stat_len = pred_stat_len
         self.state_input = nn.Linear(hist_stat_len, hidden_dim)
-        self.raw_input = nn.Linear(raw_hist_len, hidden_dim)
-        self.activation = nn.Tanh()
-        self.output = nn.Linear(2 * hidden_dim, pred_stat_len)
+        self.raw_input   = nn.Linear(raw_hist_len,  hidden_dim)
+        self.activation  = nn.Tanh()
+        self.output      = nn.Linear(2 * hidden_dim, pred_stat_len)
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
 
     def forward(
         self,
         hist_state: torch.Tensor,
-        xbar: torch.Tensor,
+        xbar:       torch.Tensor,
     ) -> torch.Tensor:
-        hs = hist_state.permute(0, 2, 1)
-        xr = xbar.permute(0, 2, 1)
+        hs  = hist_state.permute(0, 2, 1)
+        xr  = xbar.permute(0, 2, 1)
         feat = torch.cat([self.state_input(hs), self.raw_input(xr)], dim=-1)
-        out = self.output(self.activation(feat))
+        out  = self.output(self.activation(feat))
         return out.permute(0, 2, 1)
