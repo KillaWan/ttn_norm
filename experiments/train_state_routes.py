@@ -198,15 +198,15 @@ class StateRouteConfig:
     # TimeAPN-specific parameters (official APN replication)
     # ------------------------------------------------------------------
     # APN module construction
-    timeapn_j: int = 1                  # DWT decomposition levels (0 = no DWT)
+    timeapn_j: int = 0                  # DWT decomposition levels (0 = no DWT)
     timeapn_learnable: bool = True      # learnable DWT filter coefficients
     timeapn_wavelet: str = "bior3.5"    # wavelet name for DWT1D
     timeapn_dr: float = 0.05            # dropout rate for Statics_MLP
     timeapn_kernel_len: int = 7         # sliding-window kernel
     timeapn_hkernel_len: int = 5        # DWT-band sliding-window kernel
-    timeapn_pd_model: int = 128         # hidden dimension d_model for Statics_MLP
-    timeapn_pd_ff: int = 128            # FFN hidden dimension d_ff
-    timeapn_pe_layers: int = 2          # FFN layers in mean_ffn
+    timeapn_pd_model: int = 256         # hidden dimension d_model for Statics_MLP
+    timeapn_pd_ff: int = 512            # FFN hidden dimension d_ff
+    timeapn_pe_layers: int = 0          # FFN layers in mean_ffn
 
     # Training schedule
     timeapn_pre_epoch: int = 5          # APN-only pretrain epochs (0 = skip)
