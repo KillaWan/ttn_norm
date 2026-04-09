@@ -53,6 +53,8 @@ class SAN(nn.Module):
         base_stride: int = 0,
         force_extra_levels: int = -1,
         sigma_min: float = 1e-3,
+        mu_energy_weighted_loss: bool = False,
+        mu_energy_weight_gamma: float = 0.5,
         **kwargs,
     ):
         super().__init__()
@@ -68,6 +70,8 @@ class SAN(nn.Module):
         self.station_type = station_type
         self.force_extra_levels = int(force_extra_levels)
         self.sigma_min = float(sigma_min)
+        self.mu_energy_weighted_loss = bool(mu_energy_weighted_loss)
+        self.mu_energy_weight_gamma = float(mu_energy_weight_gamma)
 
         if self.force_extra_levels not in {-1, 0, 1, 2}:
             raise ValueError(
@@ -186,6 +190,41 @@ class SAN(nn.Module):
 
     def _logsigma_to_std(self, logsigma: torch.Tensor) -> torch.Tensor:
         return logsigma.exp().clamp(min=self.sigma_min)
+
+    def _compute_mu_loss(
+        self,
+        mu_hat: torch.Tensor,
+        mu_target: torch.Tensor,
+        raw_windows: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute mean-state MSE, optionally energy-weighted across future slices.
+
+        Args:
+            mu_hat:      Predicted patch means,  shape (B, P, C).
+            mu_target:   Oracle patch means,     shape (B, P, C).
+            raw_windows: Raw future windows before any SAN normalization,
+                         shape (B, P, W, C).  Used to derive energy weights
+                         when mu_energy_weighted_loss=True.
+
+        Returns:
+            Scalar mean-state loss.
+        """
+        if not self.mu_energy_weighted_loss:
+            return F.mse_loss(mu_hat, mu_target)
+
+        # ---- energy per future slice (B, P) ----------------------------
+        # e_j = mean over window-time and channel dims
+        e = raw_windows.pow(2).mean(dim=(-2, -1))            # (B, P)
+        r = e / (e.sum(dim=1, keepdim=True) + 1e-8)          # (B, P)  normalised
+        w = (r + 1e-8) ** self.mu_energy_weight_gamma         # (B, P)
+        w = w / (w.sum(dim=1, keepdim=True) + 1e-8)          # (B, P)  normalised weights
+
+        # ---- per-slice MSE, averaged only over channels ----------------
+        mse_j = (mu_hat - mu_target).pow(2).mean(dim=-1)      # (B, P)  mean over C
+
+        # ---- weight and reduce -----------------------------------------
+        # sum over slices, then mean over batch
+        return (w * mse_j).sum(dim=1).mean()                  # scalar
 
     @staticmethod
     def _lowpass_patch_mean(patch_mean: torch.Tensor) -> torch.Tensor:
@@ -675,6 +714,23 @@ class SAN(nn.Module):
 
         max_level = self.num_levels - 1
         true_windows = self._extract_windows(true)
+
+        # Build raw windows per hierarchy level for energy-weighting.
+        # level_raw_windows[l] has shape (B, P_l, W_l, C).
+        level_raw_windows: dict[int, torch.Tensor] = {0: true_windows}
+        for l_idx, spec in enumerate(self.level_transition_specs):
+            mp = spec['meta_patch']
+            ms = spec['meta_stride']
+            prev = level_raw_windows[l_idx]           # (B, P_prev, W_prev, C)
+            B_rw, P_prev, W_prev, C_rw = prev.shape
+            P_next = (P_prev - mp) // ms + 1
+            merged = torch.stack(
+                [prev[:, i * ms: i * ms + mp, :, :].reshape(B_rw, 1, mp * W_prev, C_rw)
+                 for i in range(P_next)],
+                dim=1,
+            ).squeeze(2)                               # (B, P_next, mp*W_prev, C)
+            level_raw_windows[l_idx + 1] = merged
+
         oracle_mean_seq_l0, oracle_std_seq_l0 = self._compute_window_stats(true_windows)
         oracle_mean_seq, oracle_std_seq = self._build_recursive_stats_hierarchy(
             oracle_mean_seq_l0,
@@ -698,8 +754,10 @@ class SAN(nn.Module):
         for level_idx in range(self.num_levels):
             cache_l = self._hierarchy_cache[level_idx]
             if level_idx == max_level:
-                base_mean_losses[level_idx] = F.mse_loss(
-                    cache_l['future_mean_base'], oracle_mean_lp_seq[level_idx]
+                base_mean_losses[level_idx] = self._compute_mu_loss(
+                    cache_l['future_mean_base'],
+                    oracle_mean_lp_seq[level_idx],
+                    level_raw_windows[level_idx],
                 )
             std_losses[level_idx] = F.mse_loss(
                 cache_l['future_std_base'], oracle_std_seq[level_idx]
@@ -707,8 +765,10 @@ class SAN(nn.Module):
 
         for level_idx in range(max_level):
             cache_l = self._hierarchy_cache[level_idx]
-            final_mean_losses[level_idx] = F.mse_loss(
-                cache_l['future_mean_final'], oracle_mean_lp_seq[level_idx]
+            final_mean_losses[level_idx] = self._compute_mu_loss(
+                cache_l['future_mean_final'],
+                oracle_mean_lp_seq[level_idx],
+                level_raw_windows[level_idx],
             )
 
         top_level_weight = 0.20 / (2.0 ** max(max_level - 1, 0)) if self.num_levels > 1 else 1.0

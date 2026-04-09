@@ -84,7 +84,7 @@ from ttn_norm.experiments.train import (
     _set_seed,
 )
 from ttn_norm.models import TTNModel
-from ttn_norm.normalizations import SANRouteNorm
+from ttn_norm.normalizations import SANRouteNorm, FlowNorm, OTNorm, RegimeNorm
 
 
 def _forward(
@@ -214,6 +214,23 @@ class StateRouteConfig:
     timeapn_enable_late_merge: bool = False  # must be True to activate twice_epoch late merge
     timeapn_station_lr: float = 1e-3    # APN pretrain optimizer lr
 
+    # ------------------------------------------------------------------ norm dispatch
+    # "san_route" → SANRouteNorm (default; full stage-order protocol)
+    # "flow_norm" | "ot_norm" | "regime_norm" → simplified joint training
+    norm_type: str = "san_route"
+
+    # FlowNorm hyperparams (norm_type="flow_norm")
+    flow_num_knots:      int   = 8
+    flow_hidden_dim:     int   = 32
+    flow_tail_bound:     float = 5.0
+    # OTNorm hyperparams (norm_type="ot_norm")
+    ot_num_quantiles:    int   = 64
+    # RegimeNorm hyperparams (norm_type="regime_norm")
+    regime_num_prototypes:   int   = 8
+    regime_hidden_dim:       int   = 32
+    regime_temperature:      float = 1.0
+    regime_diversity_weight: float = 0.0
+
     def seed_list(self) -> list[int]:
         return [int(s.strip()) for s in self.seeds.split(",") if s.strip()]
 
@@ -328,6 +345,59 @@ def _build_san_route_model(cfg: StateRouteConfig, num_features: int) -> TTNModel
                 f"(got stride={norm.stride}, period_len={norm.window_len}). "
                 f"Use san_stride=0 or san_stride=san_period_len."
             )
+    tc = TrainConfig(
+        backbone_type=cfg.backbone,
+        window=cfg.window,
+        pred_len=cfg.pred_len,
+        horizon=cfg.horizon,
+        label_len=cfg.label_len,
+        freq=cfg.freq,
+    )
+    label_len_v = min(cfg.label_len, cfg.window // 2)
+    backbone_kwargs = _build_backbone_kwargs(tc, num_features, label_len_v)
+    return TTNModel(
+        backbone_type=cfg.backbone,
+        backbone_kwargs=backbone_kwargs,
+        norm_model=norm,
+    )
+
+
+def _is_san_route(cfg: StateRouteConfig) -> bool:
+    return cfg.norm_type.lower() == "san_route"
+
+
+def _build_model(cfg: StateRouteConfig, num_features: int) -> TTNModel:
+    """Dispatch to the correct norm builder based on cfg.norm_type."""
+    _nt = cfg.norm_type.lower()
+    if _nt == "san_route":
+        return _build_san_route_model(cfg, num_features)
+
+    if _nt == "flow_norm":
+        norm: nn.Module = FlowNorm(
+            num_features=num_features,
+            num_knots=cfg.flow_num_knots,
+            hidden_dim=cfg.flow_hidden_dim,
+            tail_bound=cfg.flow_tail_bound,
+        )
+    elif _nt == "ot_norm":
+        norm = OTNorm(
+            num_features=num_features,
+            num_quantiles=cfg.ot_num_quantiles,
+        )
+    elif _nt == "regime_norm":
+        norm = RegimeNorm(
+            num_features=num_features,
+            num_prototypes=cfg.regime_num_prototypes,
+            hidden_dim=cfg.regime_hidden_dim,
+            temperature=cfg.regime_temperature,
+            diversity_weight=cfg.regime_diversity_weight,
+        )
+    else:
+        raise ValueError(
+            f"Unsupported norm_type '{cfg.norm_type}'. "
+            f"Supported: san_route, flow_norm, ot_norm, regime_norm"
+        )
+
     tc = TrainConfig(
         backbone_type=cfg.backbone,
         window=cfg.window,
@@ -676,7 +746,7 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
         f" test={dataloader.test_size}"
     )
 
-    model   = _move_model_to_device(_build_san_route_model(cfg, num_features), cfg)
+    model   = _move_model_to_device(_build_model(cfg, num_features), cfg)
     metrics = _build_metrics(torch.device(cfg.device))
 
     stage_order = _parse_stage_order(cfg)
@@ -1200,18 +1270,204 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
 
 
 # ---------------------------------------------------------------------------
+# Simplified training for non-SANRouteNorm norms
+# (flow_norm / ot_norm / regime_norm):  joint fm+nm training, single stage.
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _eval_loader_simple(
+    model: nn.Module,
+    loader,
+    cfg: StateRouteConfig,
+    metrics: dict,
+    loss_fn: nn.Module,
+) -> dict[str, float]:
+    model.eval()
+    for metric in metrics.values():
+        metric.reset()
+
+    task_list: list[float] = []
+
+    for batch_x, batch_y, _origin_y, batch_x_enc, batch_y_enc in loader:
+        batch_x     = batch_x.to(cfg.device).float()
+        batch_y     = batch_y.to(cfg.device).float()
+        batch_x_enc = batch_x_enc.to(cfg.device).float()
+        batch_y_enc = batch_y_enc.to(cfg.device).float()
+        pred = _forward(model, batch_x, batch_x_enc, batch_y_enc, cfg)
+        task_list.append(float(loss_fn(pred, batch_y).item()))
+
+        pred    = pred.contiguous()
+        batch_y = batch_y.contiguous()
+        if cfg.pred_len == 1:
+            B = pred.shape[0]
+            pred    = pred.view(B, -1)
+            batch_y = batch_y.view(B, -1)
+        for metric in metrics.values():
+            metric.update(pred, batch_y)
+
+    results = {name: float(m.compute()) for name, m in metrics.items()}
+    results["task_loss"] = float(np.mean(task_list)) if task_list else 0.0
+    return results
+
+
+def _run_simple_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]:
+    """Joint fm+nm training for non-SANRouteNorm norms (flow_norm / ot_norm / regime_norm)."""
+    _set_seed(seed)
+
+    tc = TrainConfig(
+        dataset_type=cfg.dataset,
+        data_path=cfg.data_path,
+        device=cfg.device,
+        num_worker=cfg.num_worker,
+        seed=seed,
+        backbone_type=cfg.backbone,
+        window=cfg.window,
+        pred_len=cfg.pred_len,
+        horizon=cfg.horizon,
+        batch_size=cfg.batch_size,
+        scaler_type=cfg.scaler_type,
+        scale_in_train=cfg.scale_in_train,
+        train_ratio=cfg.train_ratio,
+        val_ratio=cfg.val_ratio,
+        split_type=cfg.split_type,
+        freq=cfg.freq,
+        norm_type=cfg.norm_type,
+        wav_ctx_patches=0,
+    )
+    dataloader, dataset, _scaler, _split_info = _build_dataloader(tc)
+    num_features = dataset.num_features
+
+    print(
+        f"[Split] train={dataloader.train_size}, val={dataloader.val_size},"
+        f" test={dataloader.test_size}"
+    )
+
+    model   = _move_model_to_device(_build_model(cfg, num_features), cfg)
+    metrics = _build_metrics(torch.device(cfg.device))
+    loss_fn = nn.MSELoss()
+
+    best_ckpt     = os.path.join(tmp_dir, f"best_s{seed}.pt")
+    best_val_mse  = float("inf")
+    best_val_mae  = float("inf")
+    best_test_mse = float("inf")
+    best_test_mae = float("inf")
+    best_epoch    = 0
+    patience      = 0
+
+    optim = torch.optim.Adam(
+        list(model.parameters()), lr=cfg.lr, weight_decay=cfg.weight_decay
+    )
+
+    t0 = time.time()
+    for epoch in range(cfg.epochs):
+        model.train()
+        tr_task_list: list[float] = []
+        tr_aux_list:  list[float] = []
+
+        for batch_x, batch_y, _origin_y, batch_x_enc, batch_y_enc in dataloader.train_loader:
+            batch_x     = batch_x.to(cfg.device).float()
+            batch_y     = batch_y.to(cfg.device).float()
+            batch_x_enc = batch_x_enc.to(cfg.device).float()
+            batch_y_enc = batch_y_enc.to(cfg.device).float()
+
+            optim.zero_grad()
+            pred      = _forward(model, batch_x, batch_x_enc, batch_y_enc, cfg)
+            task_loss = loss_fn(pred, batch_y)
+            aux_loss  = model.nm.loss()
+            total     = task_loss + cfg.aux_loss_scale * aux_loss
+            total.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+            optim.step()
+
+            tr_task_list.append(float(task_loss.item()))
+            tr_aux_list.append(float(aux_loss.item()))
+
+        val_m  = _eval_loader_simple(model, dataloader.val_loader,  cfg, metrics, loss_fn)
+        test_m = _eval_loader_simple(model, dataloader.test_loader, cfg, metrics, loss_fn)
+        val_mse = val_m["mse"]
+        val_mae = val_m["mae"]
+
+        improved = val_mse < best_val_mse - cfg.early_stop_delta
+        marker   = "  *" if improved else ""
+        if improved:
+            best_val_mse  = val_mse
+            best_val_mae  = val_mae
+            best_test_mse = test_m["mse"]
+            best_test_mae = test_m["mae"]
+            best_epoch    = epoch + 1
+            patience      = 0
+            torch.save(model.state_dict(), best_ckpt)
+        else:
+            patience += 1
+
+        print(
+            f"[Epoch {epoch+1:4d}]"
+            f"  train_task={np.mean(tr_task_list):.6f}"
+            f"  train_aux={np.mean(tr_aux_list):.6e}"
+            f"  val_mse={val_mse:.6f}  val_mae={val_mae:.6f}"
+            f"  test_mse={test_m['mse']:.6f}  test_mae={test_m['mae']:.6f}"
+            + marker
+        )
+
+        if (
+            cfg.early_stop
+            and patience >= cfg.early_stop_patience
+            and epoch + 1 >= cfg.early_stop_min_epochs
+        ):
+            print(f"  Early stopping at epoch {epoch + 1}.")
+            break
+
+    if os.path.exists(best_ckpt):
+        model.load_state_dict(torch.load(best_ckpt, weights_only=True))
+
+    train_time = time.time() - t0
+
+    result: dict[str, Any] = {
+        "exp_name":        cfg.exp_name,
+        "dataset":         cfg.dataset,
+        "backbone":        cfg.backbone,
+        "seed":            seed,
+        "window":          cfg.window,
+        "pred_len":        cfg.pred_len,
+        "best_val_mse":    best_val_mse,
+        "best_val_mae":    best_val_mae,
+        "best_test_mse":   best_test_mse,
+        "best_test_mae":   best_test_mae,
+        "best_epoch":      best_epoch,
+        "best_stage":      "joint",
+        "train_time_sec":  round(train_time, 1),
+        "route_diagnostics": {"norm_type": cfg.norm_type},
+    }
+
+    del model, metrics
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Results I/O
 # ---------------------------------------------------------------------------
 
 def _result_dir(cfg: StateRouteConfig) -> str:
+    if _is_san_route(cfg):
+        return os.path.join(
+            cfg.result_dir,
+            cfg.exp_name,
+            cfg.dataset,
+            cfg.backbone,
+            f"pred_len_{cfg.pred_len}",
+            cfg.route_path,
+            cfg.route_state,
+        )
     return os.path.join(
         cfg.result_dir,
         cfg.exp_name,
         cfg.dataset,
         cfg.backbone,
         f"pred_len_{cfg.pred_len}",
-        cfg.route_path,
-        cfg.route_state,
+        cfg.norm_type,
     )
 
 
@@ -1302,64 +1558,98 @@ def _parse_args(argv=None) -> StateRouteConfig:
 
 def main(argv=None):
     cfg = _parse_args(argv)
-    seeds       = cfg.seed_list()
-    stage_order = _parse_stage_order(cfg)   # validate early before launching
+    seeds = cfg.seed_list()
 
     is_timeapn = (cfg.route_path == "timeapn_correction" and cfg.route_state == "timeapn_state")
+
+    # For SANRouteNorm: validate stage order early; for other norms skip that.
+    if _is_san_route(cfg):
+        _parse_stage_order(cfg)   # validate early before launching
 
     print(
         f"[Config] exp_name={cfg.exp_name}  dataset={cfg.dataset}"
         f"  backbone={cfg.backbone}  window={cfg.window}  pred_len={cfg.pred_len}"
     )
     print(
-        f"[Config] seeds={seeds}  san_period_len={cfg.san_period_len}"
-        f"  san_stride={cfg.san_stride}  device={cfg.device}"
+        f"[Config] norm_type={cfg.norm_type}  seeds={seeds}  device={cfg.device}"
     )
-    print(f"[Config] san_pretrain_epochs={cfg.san_pretrain_epochs}")
-    print(
-        f"[Config] route_path={cfg.route_path}  route_state={cfg.route_state}"
-        f"  route_state_loss_scale={cfg.route_state_loss_scale}"
-    )
-    print(
-        f"[Config] route_stage_epochs={cfg.route_stage_epochs}"
-        f"  route_stage_lr={cfg.route_stage_lr}"
-        f"  route_task_loss_scale={cfg.route_task_loss_scale}"
-    )
-    print(
-        f"[Config] joint_finetune_epochs={cfg.joint_finetune_epochs}"
-        f"  route_require_nonoverlap={cfg.route_require_nonoverlap}"
-    )
-    if is_timeapn:
+
+    if _is_san_route(cfg):
+        stage_order = _parse_stage_order(cfg)
         print(
-            f"[Config] timeapn_pre_epoch={cfg.timeapn_pre_epoch}"
-            f"  timeapn_enable_late_merge={cfg.timeapn_enable_late_merge}"
-            f"  timeapn_twice_epoch={cfg.timeapn_twice_epoch}"
-            f"  timeapn_station_lr={cfg.timeapn_station_lr}"
+            f"[Config] san_period_len={cfg.san_period_len}"
+            f"  san_stride={cfg.san_stride}"
+        )
+        print(f"[Config] san_pretrain_epochs={cfg.san_pretrain_epochs}")
+        print(
+            f"[Config] route_path={cfg.route_path}  route_state={cfg.route_state}"
+            f"  route_state_loss_scale={cfg.route_state_loss_scale}"
         )
         print(
-            f"[Config] timeapn_j={cfg.timeapn_j}"
-            f"  timeapn_wavelet={cfg.timeapn_wavelet}"
-            f"  timeapn_dr={cfg.timeapn_dr}"
-            f"  timeapn_kernel_len={cfg.timeapn_kernel_len}"
-            f"  timeapn_hkernel_len={cfg.timeapn_hkernel_len}"
+            f"[Config] route_stage_epochs={cfg.route_stage_epochs}"
+            f"  route_stage_lr={cfg.route_stage_lr}"
+            f"  route_task_loss_scale={cfg.route_task_loss_scale}"
         )
         print(
-            f"[Config] timeapn_pd_model={cfg.timeapn_pd_model}"
-            f"  timeapn_pd_ff={cfg.timeapn_pd_ff}"
-            f"  timeapn_pe_layers={cfg.timeapn_pe_layers}"
+            f"[Config] joint_finetune_epochs={cfg.joint_finetune_epochs}"
+            f"  route_require_nonoverlap={cfg.route_require_nonoverlap}"
         )
-    print(f"[Config] stage_order={stage_order}")
-    if cfg.baseline_ckpt_dir:
-        print(f"[Config] baseline_ckpt_dir={cfg.baseline_ckpt_dir}  (skip stage1+pretrain+stage2)")
-    if cfg.save_stage2_ckpt:
-        print(f"[Config] save_stage2_ckpt=True")
+        if is_timeapn:
+            print(
+                f"[Config] timeapn_pre_epoch={cfg.timeapn_pre_epoch}"
+                f"  timeapn_enable_late_merge={cfg.timeapn_enable_late_merge}"
+                f"  timeapn_twice_epoch={cfg.timeapn_twice_epoch}"
+                f"  timeapn_station_lr={cfg.timeapn_station_lr}"
+            )
+            print(
+                f"[Config] timeapn_j={cfg.timeapn_j}"
+                f"  timeapn_wavelet={cfg.timeapn_wavelet}"
+                f"  timeapn_dr={cfg.timeapn_dr}"
+                f"  timeapn_kernel_len={cfg.timeapn_kernel_len}"
+                f"  timeapn_hkernel_len={cfg.timeapn_hkernel_len}"
+            )
+            print(
+                f"[Config] timeapn_pd_model={cfg.timeapn_pd_model}"
+                f"  timeapn_pd_ff={cfg.timeapn_pd_ff}"
+                f"  timeapn_pe_layers={cfg.timeapn_pe_layers}"
+            )
+        print(f"[Config] stage_order={stage_order}")
+        if cfg.baseline_ckpt_dir:
+            print(f"[Config] baseline_ckpt_dir={cfg.baseline_ckpt_dir}  (skip stage1+pretrain+stage2)")
+        if cfg.save_stage2_ckpt:
+            print(f"[Config] save_stage2_ckpt=True")
+    else:
+        _nt = cfg.norm_type.lower()
+        if _nt == "flow_norm":
+            print(
+                f"[Config] flow_num_knots={cfg.flow_num_knots}"
+                f"  flow_hidden_dim={cfg.flow_hidden_dim}"
+                f"  flow_tail_bound={cfg.flow_tail_bound}"
+            )
+        elif _nt == "ot_norm":
+            print(f"[Config] ot_num_quantiles={cfg.ot_num_quantiles}")
+        elif _nt == "regime_norm":
+            print(
+                f"[Config] regime_num_prototypes={cfg.regime_num_prototypes}"
+                f"  regime_hidden_dim={cfg.regime_hidden_dim}"
+                f"  regime_temperature={cfg.regime_temperature}"
+                f"  regime_diversity_weight={cfg.regime_diversity_weight}"
+            )
+        print(
+            f"[Config] aux_loss_scale={cfg.aux_loss_scale}"
+            f"  epochs={cfg.epochs}  lr={cfg.lr}"
+            f"  early_stop_patience={cfg.early_stop_patience}"
+        )
 
     trials: list[dict] = []
     with tempfile.TemporaryDirectory() as tmp_dir:
         for seed in seeds:
             print(f"\n{'='*60}")
             print(f"[Seed {seed}]")
-            trial = _run_trial(cfg, seed, tmp_dir)
+            if _is_san_route(cfg):
+                trial = _run_trial(cfg, seed, tmp_dir)
+            else:
+                trial = _run_simple_trial(cfg, seed, tmp_dir)
             trials.append(trial)
             print(
                 f"[Seed {seed}] done — test_mse={trial['best_test_mse']:.6f}"

@@ -16,7 +16,7 @@ from tqdm import tqdm
 from torchmetrics import MeanAbsoluteError, MeanAbsolutePercentageError, MeanSquaredError
 
 from ttn_norm.models import LocalTFNorm, TTNModel
-from ttn_norm.normalizations import DishTS, FAN, LFAN, No, RevIN, SAN, SANMS, TFBackgroundNorm, WaveBandNormB
+from ttn_norm.normalizations import DishTS, FAN, LFAN, No, RevIN, SAN, SANMS, TFBackgroundNorm, WaveBandNormB, FlowNorm, OTNorm, RegimeNorm
 from ttn_norm.utils.metrics import RMSE
 
 
@@ -526,6 +526,17 @@ class TrainConfig:
     lfan_loss_mu:        float = 0.2
     lfan_loss_sigma:     float = 0.2
     lfan_loss_res:       float = 0.2
+    # FlowNorm (norm_type="flow_norm")
+    flow_num_knots:      int   = 8
+    flow_hidden_dim:     int   = 32
+    flow_tail_bound:     float = 5.0
+    # OTNorm (norm_type="ot_norm")
+    ot_num_quantiles:    int   = 64
+    # RegimeNorm (norm_type="regime_norm")
+    regime_num_prototypes:   int   = 8
+    regime_hidden_dim:       int   = 32
+    regime_temperature:      float = 1.0
+    regime_diversity_weight: float = 0.0
 
 
 def _next_power_of_two(n: int) -> int:
@@ -631,6 +642,29 @@ def build_model(cfg: TrainConfig, num_features: int) -> TTNModel:
             time_kernel=cfg.tfbg_time_kernel,
             freq_kernel=cfg.tfbg_freq_kernel,
             bmax=cfg.tfbg_bmax,
+        )
+
+    elif _nt == "flow_norm":
+        norm_model = FlowNorm(
+            num_features=num_features,
+            num_knots=cfg.flow_num_knots,
+            hidden_dim=cfg.flow_hidden_dim,
+            tail_bound=cfg.flow_tail_bound,
+        )
+
+    elif _nt == "ot_norm":
+        norm_model = OTNorm(
+            num_features=num_features,
+            num_quantiles=cfg.ot_num_quantiles,
+        )
+
+    elif _nt == "regime_norm":
+        norm_model = RegimeNorm(
+            num_features=num_features,
+            num_prototypes=cfg.regime_num_prototypes,
+            hidden_dim=cfg.regime_hidden_dim,
+            temperature=cfg.regime_temperature,
+            diversity_weight=cfg.regime_diversity_weight,
         )
 
     elif _nt == "lfan":
