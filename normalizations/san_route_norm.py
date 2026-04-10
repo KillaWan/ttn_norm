@@ -176,6 +176,11 @@ class SANRouteNorm(nn.Module):
         timeapn_pd_model: int = 128,
         timeapn_pd_ff: int = 128,
         timeapn_pe_layers: int = 2,
+        # B2SC inference-time update parameters
+        b2sc_enable: bool = False,
+        b2sc_recent_weight: float = 0.75,
+        b2sc_prev_weight: float = 0.25,
+        b2sc_second_slice_scale: float = 0.5,
         **kwargs,
     ):
         super().__init__()
@@ -193,6 +198,24 @@ class SANRouteNorm(nn.Module):
         self.route_state = route_state
         self.route_state_loss_scale = float(route_state_loss_scale)
 
+        # ------------------------------------------------------------------
+        # B2SC inference-time update
+        # ------------------------------------------------------------------
+        if b2sc_recent_weight < 0 or b2sc_prev_weight < 0 or b2sc_second_slice_scale < 0:
+            raise ValueError(
+                "b2sc_recent_weight, b2sc_prev_weight, and b2sc_second_slice_scale "
+                "must each be >= 0."
+            )
+        if b2sc_recent_weight + b2sc_prev_weight <= 0:
+            raise ValueError(
+                "b2sc_recent_weight + b2sc_prev_weight must be > 0."
+            )
+        self.b2sc_enable             = bool(b2sc_enable)
+        self.b2sc_recent_weight      = float(b2sc_recent_weight)
+        self.b2sc_prev_weight        = float(b2sc_prev_weight)
+        self.b2sc_second_slice_scale = float(b2sc_second_slice_scale)
+        self._b2sc_mode              = False
+
         self._validate_config()
 
         self.hist_stat_len = self._compute_n_windows(self.seq_len)
@@ -200,10 +223,19 @@ class SANRouteNorm(nn.Module):
         raw_hist_len = self.hist_stat_len * self.window_len
 
         # ------------------------------------------------------------------
-        # SAN base predictor — used by all routes EXCEPT timeapn pair
+        # SAN base predictor — pure SAN uses causal-EMA patch predictor;
+        # all other routes (except timeapn pair) use _SANBasePredictor.
         # ------------------------------------------------------------------
         self.predictor: Optional[nn.Module] = None
-        if route_path != "timeapn_correction":
+        if route_path == "none":
+            self.predictor = _PureSANSeqPredictor(
+                hist_stat_len=self.hist_stat_len,
+                pred_stat_len=self.pred_stat_len,
+                window_len=self.window_len,
+                enc_in=enc_in,
+                sigma_min=sigma_min,
+            )
+        elif route_path != "timeapn_correction":
             self.predictor = _SANBasePredictor(
                 hist_stat_len=self.hist_stat_len,
                 raw_hist_len=raw_hist_len,
@@ -442,6 +474,11 @@ class SANRouteNorm(nn.Module):
         self._last_apn_loss_mean:     float = 0.0
         self._last_apn_loss_phase:    float = 0.0
         self._last_apn_loss_recon:    float = 0.0
+        # B2SC cache
+        self._b2sc_input_raw:             Optional[torch.Tensor] = None
+        self._last_b2sc_applied:          bool                   = False
+        self._last_b2sc_delta_mu:         Optional[torch.Tensor] = None
+        self._last_b2sc_delta_logsigma:   Optional[torch.Tensor] = None
 
     # ------------------------------------------------------------------
     # Parameter group accessors
@@ -506,6 +543,129 @@ class SANRouteNorm(nn.Module):
         return self.route_state not in ("omega_spec", "lp_state", "timeapn_state")
 
     # ------------------------------------------------------------------
+    # B2SC: inference-time update
+    # ------------------------------------------------------------------
+
+    def set_b2sc_mode(self, enabled: bool) -> None:
+        """Enable or disable B2SC correction.  Called by the trainer before eval."""
+        self._b2sc_mode = bool(enabled)
+
+    def _b2sc_block_state(
+        self, block_x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(mu, logstd) summary for a block of shape (B, h, C)."""
+        mu_block     = block_x.mean(dim=1)
+        logstd_block = torch.log(block_x.std(dim=1).clamp(min=self.sigma_min))
+        return mu_block, logstd_block
+
+    def _compute_b2sc_delta(
+        self,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Compute (delta_mu, delta_logsigma) from observed block drifts.
+
+        Compares the locally-observed recent drift (between the last two or three
+        input blocks) with the base predictor's implicit first-step drift at the
+        boundary.  Returns None when B2SC cannot fire.
+        """
+        if (
+            not self.b2sc_enable
+            or not self._b2sc_mode
+            or self._b2sc_input_raw is None
+            or self.predictor is None
+            or self.route_path == "timeapn_correction"
+        ):
+            return None
+        if self._base_mu_fut_hat is None or self._base_std_fut_hat is None:
+            return None
+
+        x = self._b2sc_input_raw
+        h = self.window_len
+        L = x.shape[1]
+        if L < 2 * h:
+            return None
+
+        # --- observed blocks ---
+        B1 = x[:, L - h:L,     :]   # most recent
+        B2 = x[:, L - 2*h:L-h, :]   # second most recent
+        mu1, logstd1 = self._b2sc_block_state(B1)
+        mu2, logstd2 = self._b2sc_block_state(B2)
+
+        # --- observed drift (most recent step) ---
+        d_recent_mu       = mu1     - mu2
+        d_recent_logsigma = logstd1 - logstd2
+
+        if L >= 3 * h:
+            B3 = x[:, L - 3*h:L-2*h, :]
+            mu3, logstd3 = self._b2sc_block_state(B3)
+            d_prev_mu       = mu2     - mu3
+            d_prev_logsigma = logstd2 - logstd3
+
+            # Consistency gate: both drifts must agree in sign
+            g_mu       = (d_recent_mu       * d_prev_mu       > 0).to(d_recent_mu.dtype)
+            g_logsigma = (d_recent_logsigma * d_prev_logsigma > 0).to(d_recent_logsigma.dtype)
+
+            obs_step_mu = g_mu * (
+                self.b2sc_recent_weight * d_recent_mu + self.b2sc_prev_weight * d_prev_mu
+            )
+            obs_step_logsigma = g_logsigma * (
+                self.b2sc_recent_weight * d_recent_logsigma
+                + self.b2sc_prev_weight * d_prev_logsigma
+            )
+        else:
+            # Only two blocks available: use recent drift directly
+            obs_step_mu       = d_recent_mu
+            obs_step_logsigma = d_recent_logsigma
+
+        # --- base predictor's implied first-step drift at the boundary ---
+        base_mu0    = self._base_mu_fut_hat[:, 0, :]
+        base_logstd0 = torch.log(
+            self._base_std_fut_hat[:, 0, :].clamp(min=self.sigma_min)
+        )
+        base_step_mu       = base_mu0    - mu1
+        base_step_logsigma = base_logstd0 - logstd1
+
+        # --- correction: observed drift minus base drift ---
+        delta_mu       = obs_step_mu       - base_step_mu
+        delta_logsigma = obs_step_logsigma - base_step_logsigma
+
+        self._last_b2sc_applied        = True
+        self._last_b2sc_delta_mu       = delta_mu.detach()
+        self._last_b2sc_delta_logsigma = delta_logsigma.detach()
+        return delta_mu, delta_logsigma
+
+    def _apply_b2sc_to_patch_stats(
+        self,
+        mu_fut:  torch.Tensor,
+        std_fut: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Correct patch-level future (mu, std) with B2SC delta.
+
+        Returns the originals unchanged when B2SC is inactive or delta is None.
+        Corrections are always in log-sigma space and clipped back to std space.
+        """
+        result = self._compute_b2sc_delta()
+        if result is None:
+            return mu_fut, std_fut
+
+        delta_mu, delta_logsigma = result
+
+        logstd_fut = torch.log(std_fut.clamp(min=self.sigma_min))
+        mu_cal     = mu_fut.clone()
+        logstd_cal = logstd_fut.clone()
+
+        # First future slice
+        mu_cal[:, 0, :]     += delta_mu
+        logstd_cal[:, 0, :] += delta_logsigma
+
+        # Second future slice (attenuated)
+        if mu_fut.shape[1] >= 2:
+            mu_cal[:, 1, :]     += self.b2sc_second_slice_scale * delta_mu
+            logstd_cal[:, 1, :] += self.b2sc_second_slice_scale * delta_logsigma
+
+        std_cal = logstd_cal.exp().clamp(min=self.sigma_min)
+        return mu_cal, std_cal
+
+    # ------------------------------------------------------------------
     # Main interface: normalize
     # ------------------------------------------------------------------
 
@@ -519,6 +679,7 @@ class SANRouteNorm(nn.Module):
             Exact SAN (reshape-based) or overlap-add generalised implementation.
         """
         self._reset_cache()
+        self._b2sc_input_raw = x.detach()
         B, T, C = x.shape
         if T != self.seq_len and self.route_path != "timeapn_correction":
             raise ValueError(
@@ -558,7 +719,8 @@ class SANRouteNorm(nn.Module):
             xbar_raw = x.detach().reshape(B, -1, C)
             anchor   = mu_hist.mean(dim=1, keepdim=True)
             mu_base_fut, std_base_fut = self.predictor.predict(
-                mu_hist, std_hist, None, anchor, xbar_raw=xbar_raw
+                mu_hist, std_hist, anchor,
+                raw_patches=x_patches.detach(), eps=self.epsilon,
             )
             self._base_mu_fut_hat  = mu_base_fut
             self._base_std_fut_hat = std_base_fut
@@ -692,21 +854,20 @@ class SANRouteNorm(nn.Module):
         # Pure SAN exact reshape-based denorm
         # ==============================================================
         if self.route_path == "none":
+            mu_fut_cal, std_fut_cal = self._apply_b2sc_to_patch_stats(
+                self._base_mu_fut_hat, self._base_std_fut_hat
+            )
             if T != self.pred_len:
-                ts = self._window_stats_to_time_stats(
-                    self._base_mu_fut_hat, self._base_std_fut_hat, T
-                )
+                ts = self._window_stats_to_time_stats(mu_fut_cal, std_fut_cal, T)
                 mu, sig = self._split_stats(ts)
                 return (mu + (sig + self.epsilon) * y_norm).contiguous()
 
             B, _, C = y_norm.shape
             P_fut = self.pred_stat_len
-            y_patches  = y_norm.reshape(B, P_fut, self.window_len, C)
-            pred_mean  = self._base_mu_fut_hat
-            pred_std   = self._base_std_fut_hat
+            y_patches = y_norm.reshape(B, P_fut, self.window_len, C)
             y_san = (
-                y_patches * (pred_std.unsqueeze(2) + self.epsilon)
-                + pred_mean.unsqueeze(2)
+                y_patches * (std_fut_cal.unsqueeze(2) + self.epsilon)
+                + mu_fut_cal.unsqueeze(2)
             ).reshape(B, self.pred_len, C)
             return y_san.contiguous()
 
@@ -719,23 +880,29 @@ class SANRouteNorm(nn.Module):
             and self._base_std_fut_hat is not None
             and T == self.pred_len
         ):
-            lp_ts = self._window_stats_to_time_stats(
-                self._lp_mu_fut_hat, self._base_std_fut_hat, T
+            _, std_fut_cal = self._apply_b2sc_to_patch_stats(
+                self._base_mu_fut_hat, self._base_std_fut_hat
             )
+            lp_mu_cal = self._lp_mu_fut_hat.clone()
+            if self._last_b2sc_applied and self._last_b2sc_delta_mu is not None:
+                lp_mu_cal[:, 0, :] += self._last_b2sc_delta_mu
+                if lp_mu_cal.shape[1] >= 2:
+                    lp_mu_cal[:, 1, :] += (
+                        self.b2sc_second_slice_scale * self._last_b2sc_delta_mu
+                    )
+            lp_ts = self._window_stats_to_time_stats(lp_mu_cal, std_fut_cal, T)
             mu_lp, sig_base = self._split_stats(lp_ts)
             return (mu_lp + (sig_base + self.epsilon) * y_norm).contiguous()
 
         # ==============================================================
         # Generic overlap-add + route_path_impl
         # ==============================================================
-        if T == self._pred_time_stats.shape[1]:
-            time_stats = self._pred_time_stats
-        else:
-            time_stats = self._window_stats_to_time_stats(
-                self._base_mu_fut_hat, self._base_std_fut_hat, T
-            )
-        mean, std = self._split_stats(time_stats)
-        y_base = mean + (std + self.epsilon) * y_norm
+        mu_fut_cal, std_fut_cal = self._apply_b2sc_to_patch_stats(
+            self._base_mu_fut_hat, self._base_std_fut_hat
+        )
+        time_stats_cal = self._window_stats_to_time_stats(mu_fut_cal, std_fut_cal, T)
+        base_time_mean_cal, base_time_std_cal = self._split_stats(time_stats_cal)
+        y_base = base_time_mean_cal + (base_time_std_cal + self.epsilon) * y_norm
 
         if (
             self.route_path not in ("none", "lp_state_correction")
@@ -749,10 +916,10 @@ class SANRouteNorm(nn.Module):
                 y_base=y_base,
                 future_state_hat=self._route_future_state_hat,
                 future_state_time=self._route_future_state_time,
-                mu_base_fut=self._base_mu_fut_hat,
-                std_base_fut=self._base_std_fut_hat,
-                base_time_mean=self._base_time_mean,
-                base_time_std=self._base_time_std,
+                mu_base_fut=mu_fut_cal,
+                std_base_fut=std_fut_cal,
+                base_time_mean=base_time_mean_cal,
+                base_time_std=base_time_std_cal,
             )
         return y_base
 
@@ -943,8 +1110,21 @@ class SANRouteNorm(nn.Module):
         }
 
     def get_route_diagnostics(self) -> dict:
+        _b2sc_fields: dict = {
+            "b2sc_enable":  self.b2sc_enable,
+            "b2sc_mode":    self._b2sc_mode,
+            "b2sc_applied": self._last_b2sc_applied,
+            "b2sc_delta_mu_abs_mean": (
+                float(self._last_b2sc_delta_mu.abs().mean().item())
+                if self._last_b2sc_delta_mu is not None else 0.0
+            ),
+            "b2sc_delta_logsigma_abs_mean": (
+                float(self._last_b2sc_delta_logsigma.abs().mean().item())
+                if self._last_b2sc_delta_logsigma is not None else 0.0
+            ),
+        }
         if self.route_path == "none":
-            return {}
+            return _b2sc_fields
         diag: dict = {
             "route_path":  self._route_path_name,
             "route_state": self._route_state_name,
@@ -985,6 +1165,7 @@ class SANRouteNorm(nn.Module):
             self.route_path_impl, "get_route_diagnostics"
         ):
             diag.update(self.route_path_impl.get_route_diagnostics())
+        diag.update(_b2sc_fields)
         return diag
 
     def forward(
@@ -998,6 +1179,147 @@ class SANRouteNorm(nn.Module):
         if mode == "d":
             return self.denormalize(x)
         return x
+
+
+# ---------------------------------------------------------------------------
+# Internal classes for pure SAN causal-EMA sequence predictor
+# ---------------------------------------------------------------------------
+
+
+class _PatchCausalEMAEncoder(nn.Module):
+    """Causal EMA encoder over a patch sequence.
+
+    Processes tokens of shape ``(B*C, P_hist, H)`` and returns the final
+    hidden state ``(B*C, H)`` via the stable recursion:
+
+        h_t = a * h_{t-1} + (1 – a) * u_t,   h_0 = 0
+
+    where ``a = sigmoid(a_logit)`` is a learnable per-dimension smoothing
+    coefficient initialised near 0.9 (smooth, long-memory).
+    """
+
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        # sigmoid(log 9) ≈ 0.9 → start with strong memory
+        init_val = torch.log(torch.tensor(9.0))
+        self.a_logit = nn.Parameter(torch.full((hidden_dim,), float(init_val)))
+
+    def forward(self, u: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            u: ``(BC, P, H)`` — projected patch tokens
+        Returns:
+            ``(BC, H)`` — final EMA hidden state
+        """
+        a = torch.sigmoid(self.a_logit)   # (H,)
+        BC, P, H = u.shape
+        h = u.new_zeros(BC, H)
+        one_minus_a = 1.0 - a
+        for t in range(P):
+            h = a * h + one_minus_a * u[:, t, :]
+        return h
+
+
+class _PureSANSeqPredictor(nn.Module):
+    """Pure-SAN patch-sequence predictor (causal EMA encoder).
+
+    Replaces the flatten-then-Linear approach of ``_SANBasePredictor`` for
+    ``route_path='none'``.  All other route paths continue to use
+    ``_SANBasePredictor`` unchanged.
+
+    Interface is intentionally different from ``_SANBasePredictor.predict``
+    (it takes patch-form raw input, not a flat xbar), so there is no risk of
+    accidental cross-use.
+
+    Construction-time initialisation guarantees:
+      - ``gamma_mu  = 0``  →  ``mu_fut``  starts at *anchor* (constant extrapolation).
+      - ``gamma_std = 0``  →  ``std_fut`` starts at exp(logstd_anchor)
+                              = mean of historical patch stds.
+    """
+
+    def __init__(
+        self,
+        hist_stat_len: int,
+        pred_stat_len: int,
+        window_len: int,
+        enc_in: int,
+        sigma_min: float = 1e-3,
+        hidden_dim: int = 128,
+    ):
+        super().__init__()
+        self.pred_stat_len = pred_stat_len
+        self.sigma_min     = sigma_min
+        self.enc_in        = enc_in
+
+        token_len = window_len + 1   # 1 stat token + window_len raw values
+
+        # ---- mean branch ----
+        self.mean_in_proj = nn.Linear(token_len, hidden_dim)
+        self.mean_encoder = _PatchCausalEMAEncoder(hidden_dim)
+        self.mean_post    = nn.Linear(hidden_dim, hidden_dim)
+        self.mean_out     = nn.Linear(hidden_dim, pred_stat_len)
+        nn.init.zeros_(self.mean_out.weight)
+        nn.init.zeros_(self.mean_out.bias)
+        self.gamma_mu = nn.Parameter(torch.zeros(enc_in))
+
+        # ---- std branch ----
+        self.std_in_proj = nn.Linear(token_len, hidden_dim)
+        self.std_encoder = _PatchCausalEMAEncoder(hidden_dim)
+        self.std_post    = nn.Linear(hidden_dim, hidden_dim)
+        self.std_out     = nn.Linear(hidden_dim, pred_stat_len)
+        nn.init.zeros_(self.std_out.weight)
+        nn.init.zeros_(self.std_out.bias)
+        self.gamma_std = nn.Parameter(torch.zeros(enc_in))
+
+    def predict(
+        self,
+        mu_hist:     torch.Tensor,   # (B, P_hist, C)
+        std_hist:    torch.Tensor,   # (B, P_hist, C)
+        anchor:      torch.Tensor,   # (B, 1, C)
+        raw_patches: torch.Tensor,   # (B, P_hist, window_len, C)
+        eps: float = 1e-5,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (mu_fut, std_fut), each of shape (B, P_fut, C)."""
+        B, P_hist, W, C = raw_patches.shape
+        BC = B * C
+
+        # ----------------------------------------------------------------
+        # Mean branch
+        # ----------------------------------------------------------------
+        mu_center    = mu_hist - anchor                                      # (B, P_hist, C)
+        raw_center   = raw_patches - anchor.unsqueeze(2)                     # (B, P_hist, W, C)
+
+        # rearrange to (BC, P_hist, token_len)
+        mu_center_t  = mu_center.permute(0, 2, 1).reshape(BC, P_hist, 1)    # (BC, P_hist, 1)
+        raw_center_t = raw_center.permute(0, 3, 1, 2).reshape(BC, P_hist, W)# (BC, P_hist, W)
+        mean_token   = torch.cat([mu_center_t, raw_center_t], dim=-1)        # (BC, P_hist, W+1)
+
+        mean_h = self.mean_encoder(self.mean_in_proj(mean_token))            # (BC, hidden)
+        mean_h = mean_h + self.mean_post(F.gelu(mean_h))
+        mu_res = self.mean_out(mean_h)                                        # (BC, P_fut)
+        mu_res = mu_res.reshape(B, C, self.pred_stat_len).permute(0, 2, 1)   # (B, P_fut, C)
+        mu_fut = anchor.expand(-1, self.pred_stat_len, -1) + self.gamma_mu.view(1, 1, -1) * mu_res
+
+        # ----------------------------------------------------------------
+        # Std branch (all in log-sigma space)
+        # ----------------------------------------------------------------
+        logstd_hist   = torch.log(std_hist.clamp(min=self.sigma_min))        # (B, P_hist, C)
+        logstd_anchor = logstd_hist.mean(dim=1, keepdim=True)                # (B, 1,      C)
+        logstd_center = logstd_hist - logstd_anchor                          # (B, P_hist, C)
+        z_patch       = (raw_patches - mu_hist.unsqueeze(2)) / (std_hist.unsqueeze(2) + eps)  # (B, P_hist, W, C)
+
+        logstd_center_t = logstd_center.permute(0, 2, 1).reshape(BC, P_hist, 1)   # (BC, P_hist, 1)
+        z_patch_t       = z_patch.permute(0, 3, 1, 2).reshape(BC, P_hist, W)       # (BC, P_hist, W)
+        std_token       = torch.cat([logstd_center_t, z_patch_t], dim=-1)          # (BC, P_hist, W+1)
+
+        std_h      = self.std_encoder(self.std_in_proj(std_token))                  # (BC, hidden)
+        std_h      = std_h + self.std_post(F.gelu(std_h))
+        logstd_res = self.std_out(std_h)                                            # (BC, P_fut)
+        logstd_res = logstd_res.reshape(B, C, self.pred_stat_len).permute(0, 2, 1) # (B, P_fut, C)
+        logstd_fut = logstd_anchor.expand(-1, self.pred_stat_len, -1) + self.gamma_std.view(1, 1, -1) * logstd_res
+        std_fut    = logstd_fut.exp().clamp(min=self.sigma_min)
+
+        return mu_fut, std_fut
 
 
 # ---------------------------------------------------------------------------

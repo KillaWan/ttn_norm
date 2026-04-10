@@ -84,7 +84,7 @@ from ttn_norm.experiments.train import (
     _set_seed,
 )
 from ttn_norm.models import TTNModel
-from ttn_norm.normalizations import SANRouteNorm, FlowNorm, OTNorm, RegimeNorm
+from ttn_norm.normalizations import SANRouteNorm
 
 
 def _forward(
@@ -214,22 +214,15 @@ class StateRouteConfig:
     timeapn_enable_late_merge: bool = False  # must be True to activate twice_epoch late merge
     timeapn_station_lr: float = 1e-3    # APN pretrain optimizer lr
 
-    # ------------------------------------------------------------------ norm dispatch
-    # "san_route" → SANRouteNorm (default; full stage-order protocol)
-    # "flow_norm" | "ot_norm" | "regime_norm" → simplified joint training
-    norm_type: str = "san_route"
-
-    # FlowNorm hyperparams (norm_type="flow_norm")
-    flow_num_knots:      int   = 8
-    flow_hidden_dim:     int   = 32
-    flow_tail_bound:     float = 5.0
-    # OTNorm hyperparams (norm_type="ot_norm")
-    ot_num_quantiles:    int   = 64
-    # RegimeNorm hyperparams (norm_type="regime_norm")
-    regime_num_prototypes:   int   = 8
-    regime_hidden_dim:       int   = 32
-    regime_temperature:      float = 1.0
-    regime_diversity_weight: float = 0.0
+    # ------------------------------------------------------------------
+    # Inference-time update (B2SC) parameters
+    # ------------------------------------------------------------------
+    b2sc_enable: bool = False
+    b2sc_recent_weight: float = 0.75
+    b2sc_prev_weight: float = 0.25
+    b2sc_second_slice_scale: float = 0.5
+    b2sc_apply_on_val: bool = True
+    b2sc_apply_on_test: bool = True
 
     def seed_list(self) -> list[int]:
         return [int(s.strip()) for s in self.seeds.split(",") if s.strip()]
@@ -262,9 +255,10 @@ def _parse_stage_order(cfg: StateRouteConfig) -> list[str]:
 
     Raises ValueError for unknown tokens, duplicates, or invalid combos.
     lp combo: joint and stage3 are forbidden.
+    pure SAN baseline: only ["stage1", "stage2"] is valid.
     """
     is_lp      = (cfg.route_path == "lp_state_correction" and cfg.route_state == "lp_state")
-    is_pure_san = (cfg.route_path == "none" and cfg.route_state == "none")
+    is_pure_san = _is_pure_san_baseline(cfg)
     is_timeapn = (cfg.route_path == "timeapn_correction" and cfg.route_state == "timeapn_state")
 
     if cfg.stage_order == "":
@@ -276,6 +270,15 @@ def _parse_stage_order(cfg: StateRouteConfig) -> list[str]:
             return ["timeapn_pretrain", "stage2"]
         else:
             return ["stage1", "stage2", "stage3", "joint"]
+
+    if is_pure_san:
+        tokens = [t.strip() for t in cfg.stage_order.split(",") if t.strip()]
+        if tokens != ["stage1", "stage2"]:
+            raise ValueError(
+                f"pure SAN baseline only allows stage_order='stage1,stage2', "
+                f"got {tokens}"
+            )
+        return tokens
 
     tokens = [t.strip() for t in cfg.stage_order.split(",") if t.strip()]
     for tok in tokens:
@@ -304,10 +307,6 @@ def _parse_stage_order(cfg: StateRouteConfig) -> list[str]:
             "lp_pretrain is not valid for timeapn_correction + timeapn_state. "
             "Use timeapn_pretrain instead."
         )
-    if is_pure_san and "timeapn_pretrain" in tokens:
-        raise ValueError("timeapn_pretrain is not valid for pure SAN.")
-    if is_pure_san and "lp_pretrain" in tokens:
-        raise ValueError("lp_pretrain is not valid for pure SAN.")
     return tokens
 
 
@@ -315,89 +314,76 @@ def _parse_stage_order(cfg: StateRouteConfig) -> list[str]:
 # Model construction
 # ---------------------------------------------------------------------------
 
+def _is_pure_san_baseline(cfg: StateRouteConfig) -> bool:
+    """True iff this run is the pure SAN baseline (no routing)."""
+    return cfg.route_path == "none" and cfg.route_state == "none"
+
+
 def _build_san_route_model(cfg: StateRouteConfig, num_features: int) -> TTNModel:
-    norm = SANRouteNorm(
-        seq_len=cfg.window,
-        pred_len=cfg.pred_len,
-        period_len=cfg.san_period_len,
-        enc_in=num_features,
-        stride=cfg.san_stride,
-        sigma_min=cfg.san_sigma_min,
-        w_mu=cfg.san_w_mu,
-        w_std=cfg.san_w_std,
-        route_path=cfg.route_path,
-        route_state=cfg.route_state,
-        route_state_loss_scale=cfg.route_state_loss_scale,
-        timeapn_j=cfg.timeapn_j,
-        timeapn_learnable=cfg.timeapn_learnable,
-        timeapn_wavelet=cfg.timeapn_wavelet,
-        timeapn_dr=cfg.timeapn_dr,
-        timeapn_kernel_len=cfg.timeapn_kernel_len,
-        timeapn_hkernel_len=cfg.timeapn_hkernel_len,
-        timeapn_pd_model=cfg.timeapn_pd_model,
-        timeapn_pd_ff=cfg.timeapn_pd_ff,
-        timeapn_pe_layers=cfg.timeapn_pe_layers,
-    )
-    if cfg.route_require_nonoverlap:
-        if norm.stride != norm.window_len:
+    if _is_pure_san_baseline(cfg):
+        # Hard divisibility checks for pure SAN
+        if cfg.window % cfg.san_period_len != 0:
             raise ValueError(
-                f"route_require_nonoverlap=True requires stride == period_len "
-                f"(got stride={norm.stride}, period_len={norm.window_len}). "
-                f"Use san_stride=0 or san_stride=san_period_len."
+                f"pure SAN baseline requires window % san_period_len == 0, "
+                f"got window={cfg.window}, san_period_len={cfg.san_period_len}"
             )
-    tc = TrainConfig(
-        backbone_type=cfg.backbone,
-        window=cfg.window,
-        pred_len=cfg.pred_len,
-        horizon=cfg.horizon,
-        label_len=cfg.label_len,
-        freq=cfg.freq,
-    )
-    label_len_v = min(cfg.label_len, cfg.window // 2)
-    backbone_kwargs = _build_backbone_kwargs(tc, num_features, label_len_v)
-    return TTNModel(
-        backbone_type=cfg.backbone,
-        backbone_kwargs=backbone_kwargs,
-        norm_model=norm,
-    )
-
-
-def _is_san_route(cfg: StateRouteConfig) -> bool:
-    return cfg.norm_type.lower() == "san_route"
-
-
-def _build_model(cfg: StateRouteConfig, num_features: int) -> TTNModel:
-    """Dispatch to the correct norm builder based on cfg.norm_type."""
-    _nt = cfg.norm_type.lower()
-    if _nt == "san_route":
-        return _build_san_route_model(cfg, num_features)
-
-    if _nt == "flow_norm":
-        norm: nn.Module = FlowNorm(
-            num_features=num_features,
-            num_knots=cfg.flow_num_knots,
-            hidden_dim=cfg.flow_hidden_dim,
-            tail_bound=cfg.flow_tail_bound,
-        )
-    elif _nt == "ot_norm":
-        norm = OTNorm(
-            num_features=num_features,
-            num_quantiles=cfg.ot_num_quantiles,
-        )
-    elif _nt == "regime_norm":
-        norm = RegimeNorm(
-            num_features=num_features,
-            num_prototypes=cfg.regime_num_prototypes,
-            hidden_dim=cfg.regime_hidden_dim,
-            temperature=cfg.regime_temperature,
-            diversity_weight=cfg.regime_diversity_weight,
+        if cfg.pred_len % cfg.san_period_len != 0:
+            raise ValueError(
+                f"pure SAN baseline requires pred_len % san_period_len == 0, "
+                f"got pred_len={cfg.pred_len}, san_period_len={cfg.san_period_len}"
+            )
+        # stride=0 → SANRouteNorm internally sets stride=period_len (non-overlapping)
+        norm = SANRouteNorm(
+            seq_len=cfg.window,
+            pred_len=cfg.pred_len,
+            period_len=cfg.san_period_len,
+            enc_in=num_features,
+            stride=0,
+            sigma_min=cfg.san_sigma_min,
+            w_mu=cfg.san_w_mu,
+            w_std=cfg.san_w_std,
+            route_path="none",
+            route_state="none",
+            route_state_loss_scale=0.0,
+            b2sc_enable=cfg.b2sc_enable,
+            b2sc_recent_weight=cfg.b2sc_recent_weight,
+            b2sc_prev_weight=cfg.b2sc_prev_weight,
+            b2sc_second_slice_scale=cfg.b2sc_second_slice_scale,
         )
     else:
-        raise ValueError(
-            f"Unsupported norm_type '{cfg.norm_type}'. "
-            f"Supported: san_route, flow_norm, ot_norm, regime_norm"
+        norm = SANRouteNorm(
+            seq_len=cfg.window,
+            pred_len=cfg.pred_len,
+            period_len=cfg.san_period_len,
+            enc_in=num_features,
+            stride=cfg.san_stride,
+            sigma_min=cfg.san_sigma_min,
+            w_mu=cfg.san_w_mu,
+            w_std=cfg.san_w_std,
+            route_path=cfg.route_path,
+            route_state=cfg.route_state,
+            route_state_loss_scale=cfg.route_state_loss_scale,
+            timeapn_j=cfg.timeapn_j,
+            timeapn_learnable=cfg.timeapn_learnable,
+            timeapn_wavelet=cfg.timeapn_wavelet,
+            timeapn_dr=cfg.timeapn_dr,
+            timeapn_kernel_len=cfg.timeapn_kernel_len,
+            timeapn_hkernel_len=cfg.timeapn_hkernel_len,
+            timeapn_pd_model=cfg.timeapn_pd_model,
+            timeapn_pd_ff=cfg.timeapn_pd_ff,
+            timeapn_pe_layers=cfg.timeapn_pe_layers,
+            b2sc_enable=cfg.b2sc_enable,
+            b2sc_recent_weight=cfg.b2sc_recent_weight,
+            b2sc_prev_weight=cfg.b2sc_prev_weight,
+            b2sc_second_slice_scale=cfg.b2sc_second_slice_scale,
         )
-
+        if cfg.route_require_nonoverlap:
+            if norm.stride != norm.window_len:
+                raise ValueError(
+                    f"route_require_nonoverlap=True requires stride == period_len "
+                    f"(got stride={norm.stride}, period_len={norm.window_len}). "
+                    f"Use san_stride=0 or san_stride=san_period_len."
+                )
     tc = TrainConfig(
         backbone_type=cfg.backbone,
         window=cfg.window,
@@ -413,6 +399,7 @@ def _build_model(cfg: StateRouteConfig, num_features: int) -> TTNModel:
         backbone_kwargs=backbone_kwargs,
         norm_model=norm,
     )
+
 
 
 # ---------------------------------------------------------------------------
@@ -437,10 +424,13 @@ def _train_epoch_stage1(
         batch_x_enc = batch_x_enc.to(cfg.device).float()
         batch_y_enc = batch_y_enc.to(cfg.device).float()
 
+        if hasattr(model.nm, "set_b2sc_mode"):
+            model.nm.set_b2sc_mode(False)
         optim.zero_grad()
         _forward(model, batch_x, batch_x_enc, batch_y_enc, cfg)
         base_aux = model.nm.compute_base_aux_loss(batch_y)
-        base_aux.backward()
+        loss = base_aux
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(
             model.nm.parameters_base_predictor(), cfg.max_grad_norm
         )
@@ -476,6 +466,8 @@ def _train_epoch_lp_pretrain(
         batch_x_enc = batch_x_enc.to(cfg.device).float()
         batch_y_enc = batch_y_enc.to(cfg.device).float()
 
+        if hasattr(model.nm, "set_b2sc_mode"):
+            model.nm.set_b2sc_mode(False)
         optim.zero_grad()
         _forward(model, batch_x, batch_x_enc, batch_y_enc, cfg)
         rs_loss = model.nm.compute_route_state_loss(batch_y)
@@ -516,6 +508,8 @@ def _train_epoch_timeapn_pretrain(
         batch_x_enc = batch_x_enc.to(cfg.device).float()
         batch_y_enc = batch_y_enc.to(cfg.device).float()
 
+        if hasattr(model.nm, "set_b2sc_mode"):
+            model.nm.set_b2sc_mode(False)
         optim.zero_grad()
         _forward(model, batch_x, batch_x_enc, batch_y_enc, cfg)
         rs_loss = model.nm.compute_route_state_loss(batch_y)
@@ -558,6 +552,8 @@ def _train_epoch_stage2(
         batch_x_enc = batch_x_enc.to(cfg.device).float()
         batch_y_enc = batch_y_enc.to(cfg.device).float()
 
+        if hasattr(model.nm, "set_b2sc_mode"):
+            model.nm.set_b2sc_mode(False)
         optim.zero_grad()
         pred = _forward(model, batch_x, batch_x_enc, batch_y_enc, cfg)
         task_loss = loss_fn(pred, batch_y)
@@ -602,6 +598,8 @@ def _train_epoch_stage3(
         batch_x_enc = batch_x_enc.to(cfg.device).float()
         batch_y_enc = batch_y_enc.to(cfg.device).float()
 
+        if hasattr(model.nm, "set_b2sc_mode"):
+            model.nm.set_b2sc_mode(False)
         optim.zero_grad()
         pred = _forward(model, batch_x, batch_x_enc, batch_y_enc, cfg)
         task_loss        = loss_fn(pred, batch_y)
@@ -643,6 +641,8 @@ def _train_epoch_joint(
         batch_x_enc = batch_x_enc.to(cfg.device).float()
         batch_y_enc = batch_y_enc.to(cfg.device).float()
 
+        if hasattr(model.nm, "set_b2sc_mode"):
+            model.nm.set_b2sc_mode(False)
         optim.zero_grad()
         pred = _forward(model, batch_x, batch_x_enc, batch_y_enc, cfg)
         task_loss = loss_fn(pred, batch_y)
@@ -667,6 +667,7 @@ def _eval_loader(
     loader,
     cfg: StateRouteConfig,
     metrics: dict,
+    enable_b2sc_eval: bool = False,
 ) -> dict[str, float]:
     model.eval()
     for metric in metrics.values():
@@ -682,6 +683,10 @@ def _eval_loader(
         batch_y     = batch_y.to(cfg.device).float()
         batch_x_enc = batch_x_enc.to(cfg.device).float()
         batch_y_enc = batch_y_enc.to(cfg.device).float()
+
+        if hasattr(model.nm, "set_b2sc_mode"):
+            model.nm.set_b2sc_mode(enable_b2sc_eval)
+
         pred = _forward(model, batch_x, batch_x_enc, batch_y_enc, cfg)
         task_loss = loss_fn(pred, batch_y)
         task_list.append(float(task_loss.item()))
@@ -706,6 +711,8 @@ def _eval_loader(
         "base_aux_loss":    float(np.mean(base_aux_list))    if base_aux_list    else 0.0,
         "route_state_loss": float(np.mean(route_state_list)) if route_state_list else 0.0,
     })
+    if hasattr(model.nm, "set_b2sc_mode"):
+        model.nm.set_b2sc_mode(False)
     return results
 
 
@@ -715,8 +722,17 @@ def _eval_loader(
 
 def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]:
     _set_seed(seed)
+    pure_baseline = _is_pure_san_baseline(cfg)
     is_lp      = (cfg.route_path == "lp_state_correction" and cfg.route_state == "lp_state")
     is_timeapn = (cfg.route_path == "timeapn_correction"  and cfg.route_state == "timeapn_state")
+
+    enable_val_b2sc  = bool(cfg.b2sc_enable and cfg.b2sc_apply_on_val)
+    enable_test_b2sc = bool(cfg.b2sc_enable and cfg.b2sc_apply_on_test)
+
+    if pure_baseline and cfg.baseline_ckpt_dir:
+        raise ValueError(
+            "pure SAN baseline run cannot use baseline_ckpt_dir"
+        )
 
     tc = TrainConfig(
         dataset_type=cfg.dataset,
@@ -746,7 +762,7 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
         f" test={dataloader.test_size}"
     )
 
-    model   = _move_model_to_device(_build_model(cfg, num_features), cfg)
+    model   = _move_model_to_device(_build_san_route_model(cfg, num_features), cfg)
     metrics = _build_metrics(torch.device(cfg.device))
 
     stage_order = _parse_stage_order(cfg)
@@ -774,8 +790,35 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
 
     # -------------------------------------------------------------------
     # Baseline checkpoint loading (skip stage1, lp_pretrain, stage2)
+    # Only allowed for route experiments (not pure baseline)
     # -------------------------------------------------------------------
     if cfg.baseline_ckpt_dir:
+        # pure_baseline guard already raised above; this branch is route-only
+        meta_path = os.path.join(cfg.baseline_ckpt_dir, f"stage2_s{seed}_meta.json")
+        if os.path.isfile(meta_path):
+            with open(meta_path) as _mf:
+                _meta = json.load(_mf)
+            if _meta.get("route_path") != "none" or _meta.get("route_state") != "none":
+                raise ValueError(
+                    f"baseline_ckpt_dir must come from a pure SAN baseline "
+                    f"(route_path='none', route_state='none'), "
+                    f"but meta reports route_path='{_meta.get('route_path')}', "
+                    f"route_state='{_meta.get('route_state')}'"
+                )
+        else:
+            # Fall back to config.json if meta not present
+            cfg_json_path = os.path.join(cfg.baseline_ckpt_dir, "..", "config.json")
+            cfg_json_path = os.path.normpath(cfg_json_path)
+            if os.path.isfile(cfg_json_path):
+                with open(cfg_json_path) as _cf:
+                    _bcfg = json.load(_cf)
+                if _bcfg.get("route_path") != "none" or _bcfg.get("route_state") != "none":
+                    raise ValueError(
+                        f"baseline_ckpt_dir must come from a pure SAN baseline "
+                        f"(route_path='none', route_state='none'), "
+                        f"but config.json reports route_path='{_bcfg.get('route_path')}', "
+                        f"route_state='{_bcfg.get('route_state')}'"
+                    )
         ckpt_path = os.path.join(cfg.baseline_ckpt_dir, f"stage2_s{seed}.pt")
         if not os.path.isfile(ckpt_path):
             raise FileNotFoundError(
@@ -790,8 +833,8 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
         if unexpected:
             print(f"  Unexpected keys: {unexpected}")
 
-        val_m  = _eval_loader(model, dataloader.val_loader,  cfg, metrics)
-        test_m = _eval_loader(model, dataloader.test_loader, cfg, metrics)
+        val_m  = _eval_loader(model, dataloader.val_loader,  cfg, metrics, enable_b2sc_eval=enable_val_b2sc)
+        test_m = _eval_loader(model, dataloader.test_loader, cfg, metrics, enable_b2sc_eval=enable_test_b2sc)
         best_val_mse  = val_m["mse"]
         best_val_mae  = val_m["mae"]
         best_test_mse = test_m["mse"]
@@ -824,8 +867,13 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
         if stage_name == "stage1":
             if cfg.san_pretrain_epochs <= 0:
                 continue
+            _s1_label = (
+                "Stage 1: pure SAN predictor pretrain"
+                if pure_baseline else
+                "Stage 1: base predictor pretrain"
+            )
             print(
-                f"\n--- Stage 1: base predictor pretrain"
+                f"\n--- {_s1_label}"
                 f" (max {cfg.san_pretrain_epochs} epochs, patience={cfg.early_stop_patience}) ---"
             )
             for p in model.fm.parameters():
@@ -841,7 +889,7 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
 
             for epoch in range(cfg.san_pretrain_epochs):
                 tr    = _train_epoch_stage1(model, dataloader.train_loader, s1_optim, cfg)
-                val_m = _eval_loader(model, dataloader.val_loader, cfg, metrics)
+                val_m = _eval_loader(model, dataloader.val_loader, cfg, metrics, enable_b2sc_eval=enable_val_b2sc)
                 val_base_aux = val_m["base_aux_loss"]
 
                 improved = val_base_aux < best_s1_val - cfg.early_stop_delta
@@ -906,7 +954,7 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
 
             for epoch in range(cfg.route_stage_epochs):
                 tr    = _train_epoch_lp_pretrain(model, dataloader.train_loader, lp_optim, cfg)
-                val_m = _eval_loader(model, dataloader.val_loader, cfg, metrics)
+                val_m = _eval_loader(model, dataloader.val_loader, cfg, metrics, enable_b2sc_eval=enable_val_b2sc)
                 val_rs = val_m["route_state_loss"]
 
                 improved_lp = val_rs < best_lp_val - cfg.early_stop_delta
@@ -967,7 +1015,7 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
                 tr    = _train_epoch_timeapn_pretrain(
                     model, dataloader.train_loader, tapn_optim, cfg
                 )
-                val_m = _eval_loader(model, dataloader.val_loader, cfg, metrics)
+                val_m = _eval_loader(model, dataloader.val_loader, cfg, metrics, enable_b2sc_eval=enable_val_b2sc)
                 val_rs = val_m["route_state_loss"]
 
                 improved_tapn = val_rs < best_tapn_val - cfg.early_stop_delta
@@ -1008,8 +1056,13 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
         # For TimeAPN: alpha gates must stay at 0 → exact SAN baseline.
         # ==========================================================
         elif stage_name == "stage2":
+            _s2_label = (
+                "Stage 2: pure SAN backbone training"
+                if pure_baseline else
+                "Stage 2: backbone training"
+            )
             print(
-                f"\n--- Stage 2: backbone training (max {cfg.epochs} epochs,"
+                f"\n--- {_s2_label} (max {cfg.epochs} epochs,"
                 f" patience={cfg.early_stop_patience}) ---"
             )
 
@@ -1047,8 +1100,8 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
                     )
 
                 tr    = _train_epoch_stage2(model, dataloader.train_loader, s2_optim, cfg)
-                val_m = _eval_loader(model, dataloader.val_loader,  cfg, metrics)
-                test_m = _eval_loader(model, dataloader.test_loader, cfg, metrics)
+                val_m  = _eval_loader(model, dataloader.val_loader,  cfg, metrics, enable_b2sc_eval=enable_val_b2sc)
+                test_m = _eval_loader(model, dataloader.test_loader, cfg, metrics, enable_b2sc_eval=enable_test_b2sc)
                 val_mse = val_m["mse"]
                 val_mae = val_m["mae"]
 
@@ -1092,6 +1145,26 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
                 persist_path = os.path.join(ckpt_dir, f"stage2_s{seed}.pt")
                 shutil.copy2(stage2_ckpt, persist_path)
                 print(f"  Saved stage2 checkpoint to {persist_path}")
+                meta = {
+                    "exp_name":               cfg.exp_name,
+                    "dataset":                cfg.dataset,
+                    "backbone":               cfg.backbone,
+                    "pred_len":               cfg.pred_len,
+                    "route_path":             cfg.route_path,
+                    "route_state":            cfg.route_state,
+                    "baseline_mode":          "pure_san" if pure_baseline else "san_route",
+                    "seed":                   seed,
+                    "b2sc_enable":            cfg.b2sc_enable,
+                    "b2sc_apply_on_val":      cfg.b2sc_apply_on_val,
+                    "b2sc_apply_on_test":     cfg.b2sc_apply_on_test,
+                    "b2sc_recent_weight":     cfg.b2sc_recent_weight,
+                    "b2sc_prev_weight":       cfg.b2sc_prev_weight,
+                    "b2sc_second_slice_scale": cfg.b2sc_second_slice_scale,
+                }
+                meta_path = os.path.join(ckpt_dir, f"stage2_s{seed}_meta.json")
+                with open(meta_path, "w") as _mf:
+                    json.dump(meta, _mf, indent=2)
+                print(f"  Saved stage2 meta to {meta_path}")
 
             if os.path.exists(stage2_ckpt):
                 model.load_state_dict(torch.load(stage2_ckpt, weights_only=True))
@@ -1128,8 +1201,8 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
                 tr    = _train_epoch_stage3(
                     model, dataloader.train_loader, s3_optim, cfg, stage3_params
                 )
-                val_m  = _eval_loader(model, dataloader.val_loader,  cfg, metrics)
-                test_m = _eval_loader(model, dataloader.test_loader, cfg, metrics)
+                val_m  = _eval_loader(model, dataloader.val_loader,  cfg, metrics, enable_b2sc_eval=enable_val_b2sc)
+                test_m = _eval_loader(model, dataloader.test_loader, cfg, metrics, enable_b2sc_eval=enable_test_b2sc)
                 val_mse = val_m["mse"]
                 val_mae = val_m["mae"]
                 route_diag = model.nm.get_route_diagnostics()
@@ -1206,8 +1279,8 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
                 tr    = _train_epoch_joint(
                     model, dataloader.train_loader, jf_optim, cfg, joint_params
                 )
-                val_m  = _eval_loader(model, dataloader.val_loader,  cfg, metrics)
-                test_m = _eval_loader(model, dataloader.test_loader, cfg, metrics)
+                val_m  = _eval_loader(model, dataloader.val_loader,  cfg, metrics, enable_b2sc_eval=enable_val_b2sc)
+                test_m = _eval_loader(model, dataloader.test_loader, cfg, metrics, enable_b2sc_eval=enable_test_b2sc)
                 val_mse = val_m["mse"]
 
                 improved = val_mse < best_val_mse - cfg.early_stop_delta
@@ -1269,205 +1342,20 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
     return result
 
 
-# ---------------------------------------------------------------------------
-# Simplified training for non-SANRouteNorm norms
-# (flow_norm / ot_norm / regime_norm):  joint fm+nm training, single stage.
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def _eval_loader_simple(
-    model: nn.Module,
-    loader,
-    cfg: StateRouteConfig,
-    metrics: dict,
-    loss_fn: nn.Module,
-) -> dict[str, float]:
-    model.eval()
-    for metric in metrics.values():
-        metric.reset()
-
-    task_list: list[float] = []
-
-    for batch_x, batch_y, _origin_y, batch_x_enc, batch_y_enc in loader:
-        batch_x     = batch_x.to(cfg.device).float()
-        batch_y     = batch_y.to(cfg.device).float()
-        batch_x_enc = batch_x_enc.to(cfg.device).float()
-        batch_y_enc = batch_y_enc.to(cfg.device).float()
-        pred = _forward(model, batch_x, batch_x_enc, batch_y_enc, cfg)
-        task_list.append(float(loss_fn(pred, batch_y).item()))
-
-        pred    = pred.contiguous()
-        batch_y = batch_y.contiguous()
-        if cfg.pred_len == 1:
-            B = pred.shape[0]
-            pred    = pred.view(B, -1)
-            batch_y = batch_y.view(B, -1)
-        for metric in metrics.values():
-            metric.update(pred, batch_y)
-
-    results = {name: float(m.compute()) for name, m in metrics.items()}
-    results["task_loss"] = float(np.mean(task_list)) if task_list else 0.0
-    return results
-
-
-def _run_simple_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]:
-    """Joint fm+nm training for non-SANRouteNorm norms (flow_norm / ot_norm / regime_norm)."""
-    _set_seed(seed)
-
-    tc = TrainConfig(
-        dataset_type=cfg.dataset,
-        data_path=cfg.data_path,
-        device=cfg.device,
-        num_worker=cfg.num_worker,
-        seed=seed,
-        backbone_type=cfg.backbone,
-        window=cfg.window,
-        pred_len=cfg.pred_len,
-        horizon=cfg.horizon,
-        batch_size=cfg.batch_size,
-        scaler_type=cfg.scaler_type,
-        scale_in_train=cfg.scale_in_train,
-        train_ratio=cfg.train_ratio,
-        val_ratio=cfg.val_ratio,
-        split_type=cfg.split_type,
-        freq=cfg.freq,
-        norm_type=cfg.norm_type,
-        wav_ctx_patches=0,
-    )
-    dataloader, dataset, _scaler, _split_info = _build_dataloader(tc)
-    num_features = dataset.num_features
-
-    print(
-        f"[Split] train={dataloader.train_size}, val={dataloader.val_size},"
-        f" test={dataloader.test_size}"
-    )
-
-    model   = _move_model_to_device(_build_model(cfg, num_features), cfg)
-    metrics = _build_metrics(torch.device(cfg.device))
-    loss_fn = nn.MSELoss()
-
-    best_ckpt     = os.path.join(tmp_dir, f"best_s{seed}.pt")
-    best_val_mse  = float("inf")
-    best_val_mae  = float("inf")
-    best_test_mse = float("inf")
-    best_test_mae = float("inf")
-    best_epoch    = 0
-    patience      = 0
-
-    optim = torch.optim.Adam(
-        list(model.parameters()), lr=cfg.lr, weight_decay=cfg.weight_decay
-    )
-
-    t0 = time.time()
-    for epoch in range(cfg.epochs):
-        model.train()
-        tr_task_list: list[float] = []
-        tr_aux_list:  list[float] = []
-
-        for batch_x, batch_y, _origin_y, batch_x_enc, batch_y_enc in dataloader.train_loader:
-            batch_x     = batch_x.to(cfg.device).float()
-            batch_y     = batch_y.to(cfg.device).float()
-            batch_x_enc = batch_x_enc.to(cfg.device).float()
-            batch_y_enc = batch_y_enc.to(cfg.device).float()
-
-            optim.zero_grad()
-            pred      = _forward(model, batch_x, batch_x_enc, batch_y_enc, cfg)
-            task_loss = loss_fn(pred, batch_y)
-            aux_loss  = model.nm.loss()
-            total     = task_loss + cfg.aux_loss_scale * aux_loss
-            total.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-            optim.step()
-
-            tr_task_list.append(float(task_loss.item()))
-            tr_aux_list.append(float(aux_loss.item()))
-
-        val_m  = _eval_loader_simple(model, dataloader.val_loader,  cfg, metrics, loss_fn)
-        test_m = _eval_loader_simple(model, dataloader.test_loader, cfg, metrics, loss_fn)
-        val_mse = val_m["mse"]
-        val_mae = val_m["mae"]
-
-        improved = val_mse < best_val_mse - cfg.early_stop_delta
-        marker   = "  *" if improved else ""
-        if improved:
-            best_val_mse  = val_mse
-            best_val_mae  = val_mae
-            best_test_mse = test_m["mse"]
-            best_test_mae = test_m["mae"]
-            best_epoch    = epoch + 1
-            patience      = 0
-            torch.save(model.state_dict(), best_ckpt)
-        else:
-            patience += 1
-
-        print(
-            f"[Epoch {epoch+1:4d}]"
-            f"  train_task={np.mean(tr_task_list):.6f}"
-            f"  train_aux={np.mean(tr_aux_list):.6e}"
-            f"  val_mse={val_mse:.6f}  val_mae={val_mae:.6f}"
-            f"  test_mse={test_m['mse']:.6f}  test_mae={test_m['mae']:.6f}"
-            + marker
-        )
-
-        if (
-            cfg.early_stop
-            and patience >= cfg.early_stop_patience
-            and epoch + 1 >= cfg.early_stop_min_epochs
-        ):
-            print(f"  Early stopping at epoch {epoch + 1}.")
-            break
-
-    if os.path.exists(best_ckpt):
-        model.load_state_dict(torch.load(best_ckpt, weights_only=True))
-
-    train_time = time.time() - t0
-
-    result: dict[str, Any] = {
-        "exp_name":        cfg.exp_name,
-        "dataset":         cfg.dataset,
-        "backbone":        cfg.backbone,
-        "seed":            seed,
-        "window":          cfg.window,
-        "pred_len":        cfg.pred_len,
-        "best_val_mse":    best_val_mse,
-        "best_val_mae":    best_val_mae,
-        "best_test_mse":   best_test_mse,
-        "best_test_mae":   best_test_mae,
-        "best_epoch":      best_epoch,
-        "best_stage":      "joint",
-        "train_time_sec":  round(train_time, 1),
-        "route_diagnostics": {"norm_type": cfg.norm_type},
-    }
-
-    del model, metrics
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    return result
-
 
 # ---------------------------------------------------------------------------
 # Results I/O
 # ---------------------------------------------------------------------------
 
 def _result_dir(cfg: StateRouteConfig) -> str:
-    if _is_san_route(cfg):
-        return os.path.join(
-            cfg.result_dir,
-            cfg.exp_name,
-            cfg.dataset,
-            cfg.backbone,
-            f"pred_len_{cfg.pred_len}",
-            cfg.route_path,
-            cfg.route_state,
-        )
     return os.path.join(
         cfg.result_dir,
         cfg.exp_name,
         cfg.dataset,
         cfg.backbone,
         f"pred_len_{cfg.pred_len}",
-        cfg.norm_type,
+        cfg.route_path,
+        cfg.route_state,
     )
 
 
@@ -1512,13 +1400,24 @@ def _write_results(cfg: StateRouteConfig, trials: list[dict]) -> None:
                 agg_diag[k] = vals_d[0] if vals_d else None
     summary["route_diagnostics_mean"] = agg_diag
 
+    _bm = "pure_san" if _is_pure_san_baseline(cfg) else "san_route"
+    summary["baseline_mode"] = _bm
+    summary["b2sc_enable"]             = cfg.b2sc_enable
+    summary["b2sc_apply_on_val"]       = cfg.b2sc_apply_on_val
+    summary["b2sc_apply_on_test"]      = cfg.b2sc_apply_on_test
+    summary["b2sc_recent_weight"]      = cfg.b2sc_recent_weight
+    summary["b2sc_prev_weight"]        = cfg.b2sc_prev_weight
+    summary["b2sc_second_slice_scale"] = cfg.b2sc_second_slice_scale
+
     summary_path = os.path.join(out_dir, "summary.json")
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
 
+    cfg_dict = asdict(cfg)
+    cfg_dict["baseline_mode"] = _bm
     config_path = os.path.join(out_dir, "config.json")
     with open(config_path, "w") as f:
-        json.dump(asdict(cfg), f, indent=2)
+        json.dump(cfg_dict, f, indent=2)
 
     print(f"\n[Results] Written to {out_dir}")
     print(
@@ -1562,94 +1461,78 @@ def main(argv=None):
 
     is_timeapn = (cfg.route_path == "timeapn_correction" and cfg.route_state == "timeapn_state")
 
-    # For SANRouteNorm: validate stage order early; for other norms skip that.
-    if _is_san_route(cfg):
-        _parse_stage_order(cfg)   # validate early before launching
+    _parse_stage_order(cfg)   # validate early before launching
 
     print(
         f"[Config] exp_name={cfg.exp_name}  dataset={cfg.dataset}"
         f"  backbone={cfg.backbone}  window={cfg.window}  pred_len={cfg.pred_len}"
     )
     print(
-        f"[Config] norm_type={cfg.norm_type}  seeds={seeds}  device={cfg.device}"
+        f"[Config] seeds={seeds}  device={cfg.device}"
     )
 
-    if _is_san_route(cfg):
-        stage_order = _parse_stage_order(cfg)
+    stage_order = _parse_stage_order(cfg)
+    _mode_str = "pure_san_baseline" if _is_pure_san_baseline(cfg) else "san_route_experiment"
+    print(f"[Config] mode={_mode_str}")
+    print(
+        f"[Config] san_period_len={cfg.san_period_len}"
+        f"  san_stride={cfg.san_stride}"
+    )
+    print(f"[Config] san_pretrain_epochs={cfg.san_pretrain_epochs}")
+    print(
+        f"[Config] route_path={cfg.route_path}  route_state={cfg.route_state}"
+        f"  route_state_loss_scale={cfg.route_state_loss_scale}"
+    )
+    print(
+        f"[Config] route_stage_epochs={cfg.route_stage_epochs}"
+        f"  route_stage_lr={cfg.route_stage_lr}"
+        f"  route_task_loss_scale={cfg.route_task_loss_scale}"
+    )
+    print(
+        f"[Config] joint_finetune_epochs={cfg.joint_finetune_epochs}"
+        f"  route_require_nonoverlap={cfg.route_require_nonoverlap}"
+    )
+    if is_timeapn:
         print(
-            f"[Config] san_period_len={cfg.san_period_len}"
-            f"  san_stride={cfg.san_stride}"
-        )
-        print(f"[Config] san_pretrain_epochs={cfg.san_pretrain_epochs}")
-        print(
-            f"[Config] route_path={cfg.route_path}  route_state={cfg.route_state}"
-            f"  route_state_loss_scale={cfg.route_state_loss_scale}"
+            f"[Config] timeapn_pre_epoch={cfg.timeapn_pre_epoch}"
+            f"  timeapn_enable_late_merge={cfg.timeapn_enable_late_merge}"
+            f"  timeapn_twice_epoch={cfg.timeapn_twice_epoch}"
+            f"  timeapn_station_lr={cfg.timeapn_station_lr}"
         )
         print(
-            f"[Config] route_stage_epochs={cfg.route_stage_epochs}"
-            f"  route_stage_lr={cfg.route_stage_lr}"
-            f"  route_task_loss_scale={cfg.route_task_loss_scale}"
+            f"[Config] timeapn_j={cfg.timeapn_j}"
+            f"  timeapn_wavelet={cfg.timeapn_wavelet}"
+            f"  timeapn_dr={cfg.timeapn_dr}"
+            f"  timeapn_kernel_len={cfg.timeapn_kernel_len}"
+            f"  timeapn_hkernel_len={cfg.timeapn_hkernel_len}"
         )
         print(
-            f"[Config] joint_finetune_epochs={cfg.joint_finetune_epochs}"
-            f"  route_require_nonoverlap={cfg.route_require_nonoverlap}"
+            f"[Config] timeapn_pd_model={cfg.timeapn_pd_model}"
+            f"  timeapn_pd_ff={cfg.timeapn_pd_ff}"
+            f"  timeapn_pe_layers={cfg.timeapn_pe_layers}"
         )
-        if is_timeapn:
-            print(
-                f"[Config] timeapn_pre_epoch={cfg.timeapn_pre_epoch}"
-                f"  timeapn_enable_late_merge={cfg.timeapn_enable_late_merge}"
-                f"  timeapn_twice_epoch={cfg.timeapn_twice_epoch}"
-                f"  timeapn_station_lr={cfg.timeapn_station_lr}"
-            )
-            print(
-                f"[Config] timeapn_j={cfg.timeapn_j}"
-                f"  timeapn_wavelet={cfg.timeapn_wavelet}"
-                f"  timeapn_dr={cfg.timeapn_dr}"
-                f"  timeapn_kernel_len={cfg.timeapn_kernel_len}"
-                f"  timeapn_hkernel_len={cfg.timeapn_hkernel_len}"
-            )
-            print(
-                f"[Config] timeapn_pd_model={cfg.timeapn_pd_model}"
-                f"  timeapn_pd_ff={cfg.timeapn_pd_ff}"
-                f"  timeapn_pe_layers={cfg.timeapn_pe_layers}"
-            )
-        print(f"[Config] stage_order={stage_order}")
-        if cfg.baseline_ckpt_dir:
-            print(f"[Config] baseline_ckpt_dir={cfg.baseline_ckpt_dir}  (skip stage1+pretrain+stage2)")
-        if cfg.save_stage2_ckpt:
-            print(f"[Config] save_stage2_ckpt=True")
-    else:
-        _nt = cfg.norm_type.lower()
-        if _nt == "flow_norm":
-            print(
-                f"[Config] flow_num_knots={cfg.flow_num_knots}"
-                f"  flow_hidden_dim={cfg.flow_hidden_dim}"
-                f"  flow_tail_bound={cfg.flow_tail_bound}"
-            )
-        elif _nt == "ot_norm":
-            print(f"[Config] ot_num_quantiles={cfg.ot_num_quantiles}")
-        elif _nt == "regime_norm":
-            print(
-                f"[Config] regime_num_prototypes={cfg.regime_num_prototypes}"
-                f"  regime_hidden_dim={cfg.regime_hidden_dim}"
-                f"  regime_temperature={cfg.regime_temperature}"
-                f"  regime_diversity_weight={cfg.regime_diversity_weight}"
-            )
-        print(
-            f"[Config] aux_loss_scale={cfg.aux_loss_scale}"
-            f"  epochs={cfg.epochs}  lr={cfg.lr}"
-            f"  early_stop_patience={cfg.early_stop_patience}"
-        )
+    print(f"[Config] stage_order={stage_order}")
+    if cfg.baseline_ckpt_dir:
+        print(f"[Config] baseline_ckpt_dir={cfg.baseline_ckpt_dir}  (skip stage1+pretrain+stage2)")
+    if cfg.save_stage2_ckpt:
+        print(f"[Config] save_stage2_ckpt=True")
+    _eval_upd = "enabled_on_val_test_by_flags" if cfg.b2sc_enable else "disabled"
+    print(
+        f"[Config] b2sc_enable={cfg.b2sc_enable}"
+        f"  b2sc_apply_on_val={cfg.b2sc_apply_on_val}"
+        f"  b2sc_apply_on_test={cfg.b2sc_apply_on_test}"
+        f"  b2sc_recent_weight={cfg.b2sc_recent_weight}"
+        f"  b2sc_prev_weight={cfg.b2sc_prev_weight}"
+        f"  b2sc_second_slice_scale={cfg.b2sc_second_slice_scale}"
+    )
+    print(f"[Config] eval_update={_eval_upd}")
 
     trials: list[dict] = []
     with tempfile.TemporaryDirectory() as tmp_dir:
         for seed in seeds:
             print(f"\n{'='*60}")
             print(f"[Seed {seed}]")
-            if _is_san_route(cfg):
-                trial = _run_trial(cfg, seed, tmp_dir)
-            else:
-                trial = _run_simple_trial(cfg, seed, tmp_dir)
+            trial = _run_trial(cfg, seed, tmp_dir)
             trials.append(trial)
             print(
                 f"[Seed {seed}] done — test_mse={trial['best_test_mse']:.6f}"
