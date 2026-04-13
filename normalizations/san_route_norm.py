@@ -72,6 +72,7 @@ timeapn_correction + timeapn_state
 """
 from __future__ import annotations
 
+from collections import deque
 from typing import Optional
 
 import torch
@@ -181,6 +182,12 @@ class SANRouteNorm(nn.Module):
         b2sc_recent_weight: float = 0.75,
         b2sc_prev_weight: float = 0.25,
         b2sc_second_slice_scale: float = 0.5,
+        # SSC (streaming state calibration) parameters
+        ssc_enable: bool = False,
+        ssc_lambda: float = 0.9,
+        ssc_decay_rho: float = 0.5,
+        ssc_scale_beta: float = 0.5,
+        ssc_trend_scale: float = 0.1,
         **kwargs,
     ):
         super().__init__()
@@ -215,6 +222,23 @@ class SANRouteNorm(nn.Module):
         self.b2sc_prev_weight        = float(b2sc_prev_weight)
         self.b2sc_second_slice_scale = float(b2sc_second_slice_scale)
         self._b2sc_mode              = False
+
+        # ------------------------------------------------------------------
+        # SSC (streaming state calibration)
+        # ------------------------------------------------------------------
+        self.ssc_enable = bool(ssc_enable)
+        self.ssc_lambda = float(ssc_lambda)
+        if self.ssc_lambda < 0.0 or self.ssc_lambda >= 1.0:
+            raise ValueError("ssc_lambda must satisfy 0 <= ssc_lambda < 1.")
+        self.ssc_decay_rho = float(ssc_decay_rho)
+        if self.ssc_decay_rho <= 0.0 or self.ssc_decay_rho > 1.0:
+            raise ValueError("ssc_decay_rho must satisfy 0 < ssc_decay_rho <= 1.")
+        self.ssc_scale_beta = float(ssc_scale_beta)
+        if self.ssc_scale_beta < 0.0:
+            raise ValueError("ssc_scale_beta must satisfy ssc_scale_beta >= 0.")
+        self.ssc_trend_scale = float(ssc_trend_scale)
+        if self.ssc_enable and self.route_path != "none":
+            raise ValueError("SSC supports pure SAN only.")
 
         self._validate_config()
 
@@ -288,6 +312,14 @@ class SANRouteNorm(nn.Module):
             self.route_state_impl = build_route_state(route_state)
 
         self._reset_cache()
+        # SSC persistent state — must live outside _reset_cache so it
+        # survives per-sample normalize() calls during sequential eval.
+        self._ssc_mode:            bool                   = False
+        self._ssc_trend_mem:       Optional[torch.Tensor] = None
+        self._ssc_prev_obs_point:  Optional[torch.Tensor] = None
+        self._ssc_prev_mu_pred:    Optional[torch.Tensor] = None
+        self._ssc_prev_std_pred:   Optional[torch.Tensor] = None
+        self._ssc_pred_queue:      deque                  = deque()
 
     # ------------------------------------------------------------------
     # Config validation
@@ -541,6 +573,114 @@ class SANRouteNorm(nn.Module):
 
     def _should_normalize_route_state(self) -> bool:
         return self.route_state not in ("omega_spec", "lp_state", "timeapn_state")
+
+    # ------------------------------------------------------------------
+    # SSC: streaming state calibration
+    # ------------------------------------------------------------------
+
+    def set_ssc_mode(self, enabled: bool) -> None:
+        self._ssc_mode = bool(enabled)
+
+    def reset_ssc_state(self) -> None:
+        self._ssc_trend_mem      = None
+        self._ssc_prev_obs_point = None
+        self._ssc_prev_mu_pred   = None
+        self._ssc_prev_std_pred  = None
+        self._ssc_pred_queue     = deque()
+
+    def ssc_update_from_current_lookback(
+        self, x: torch.Tensor, sample_start: int
+    ) -> None:
+        """Update SSC bias from any queued prediction whose target point is now
+        the boundary of the current lookback window.
+
+        ``sample_start`` is the absolute time index of the first point of the
+        current lookback ``x`` (shape ``(1, seq_len, C)``).  The boundary point
+        of the current lookback is ``sample_start + seq_len - 1``.  A queued
+        entry matches when its ``target_point`` equals that boundary point.
+        Past entries (target_point < boundary) are discarded; future entries
+        stop the scan.
+        """
+        if not self.ssc_enable or not self._ssc_mode:
+            return
+        if x.shape[0] != 1:
+            raise ValueError("SSC expects single-sample sequential eval.")
+        current_boundary_point = int(sample_start) + self.seq_len - 1
+
+        while self._ssc_pred_queue:
+            target_point, mu_pred, std_pred = self._ssc_pred_queue[0]
+
+            if target_point < current_boundary_point:
+                # Already passed — discard without updating
+                self._ssc_pred_queue.popleft()
+                continue
+
+            if target_point > current_boundary_point:
+                # Not yet reached — stop
+                break
+
+            # Exact match: target_point == current_boundary_point
+            self._ssc_pred_queue.popleft()
+            obs_point = x[:, -1, :].detach()   # (1, C) — last point of the lookback
+
+            if self._ssc_prev_obs_point is None:
+                # First observation — cache and wait for the next pair
+                self._ssc_prev_obs_point = obs_point
+                self._ssc_prev_mu_pred   = mu_pred
+                self._ssc_prev_std_pred  = std_pred
+                break
+
+            # Compute trend observation: normalised (real change - predicted change)
+            d_obs  = obs_point - self._ssc_prev_obs_point
+            d_pred = mu_pred   - self._ssc_prev_mu_pred
+            denom  = 0.5 * (std_pred + self._ssc_prev_std_pred) + self.epsilon
+            trend_obs = (d_obs - d_pred) / denom
+
+            if self._ssc_trend_mem is None:
+                self._ssc_trend_mem = trend_obs
+            else:
+                lam = self.ssc_lambda
+                self._ssc_trend_mem = lam * self._ssc_trend_mem + (1.0 - lam) * trend_obs
+
+            self._ssc_prev_obs_point = obs_point
+            self._ssc_prev_mu_pred   = mu_pred
+            self._ssc_prev_std_pred  = std_pred
+            break
+
+    def ssc_cache_current_base_prediction(
+        self, first_future_start: int
+    ) -> None:
+        """Push the boundary-point prediction keyed by its global time index.
+
+        ``first_future_start`` is the absolute time index of the first future
+        point (i.e. one step beyond the current lookback).  This is the
+        boundary point that will be observed when the window advances by one
+        step.
+        """
+        if not self.ssc_enable or not self._ssc_mode:
+            return
+        if self._base_mu_fut_hat is None or self._base_std_fut_hat is None:
+            return
+        mu_pred  = self._base_mu_fut_hat[:, 0, :].detach()
+        std_pred = self._base_std_fut_hat[:, 0, :].detach()
+        self._ssc_pred_queue.append((int(first_future_start), mu_pred, std_pred))
+
+    def _apply_ssc_to_patch_stats(
+        self,
+        mu_fut:  torch.Tensor,
+        std_fut: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply trend SSC: accumulated correction grows with patch distance."""
+        if not self.ssc_enable or not self._ssc_mode:
+            return mu_fut, std_fut
+        if self._ssc_trend_mem is None:
+            return mu_fut, std_fut
+        mu_cal = mu_fut.clone()
+        for j in range(mu_cal.shape[1]):
+            time_scale = (j + 0.5) * self.window_len
+            weight = time_scale * (self.ssc_decay_rho ** j)
+            mu_cal[:, j, :] = mu_cal[:, j, :] + self.ssc_trend_scale * weight * std_fut[:, j, :] * self._ssc_trend_mem
+        return mu_cal, std_fut
 
     # ------------------------------------------------------------------
     # B2SC: inference-time update
@@ -854,8 +994,11 @@ class SANRouteNorm(nn.Module):
         # Pure SAN exact reshape-based denorm
         # ==============================================================
         if self.route_path == "none":
-            mu_fut_cal, std_fut_cal = self._apply_b2sc_to_patch_stats(
+            mu_fut_cal, std_fut_cal = self._apply_ssc_to_patch_stats(
                 self._base_mu_fut_hat, self._base_std_fut_hat
+            )
+            mu_fut_cal, std_fut_cal = self._apply_b2sc_to_patch_stats(
+                mu_fut_cal, std_fut_cal
             )
             if T != self.pred_len:
                 ts = self._window_stats_to_time_stats(mu_fut_cal, std_fut_cal, T)
@@ -1124,7 +1267,17 @@ class SANRouteNorm(nn.Module):
             ),
         }
         if self.route_path == "none":
-            return _b2sc_fields
+            _ssc_fields: dict = {
+                "ssc_enable":             self.ssc_enable,
+                "ssc_mode":               self._ssc_mode,
+                "ssc_decay_rho":          self.ssc_decay_rho,
+                "ssc_trend_mem_abs_mean": (
+                    float(self._ssc_trend_mem.abs().mean().item())
+                    if self._ssc_trend_mem is not None else 0.0
+                ),
+                "ssc_queue_len": len(self._ssc_pred_queue),
+            }
+            return {**_b2sc_fields, **_ssc_fields}
         diag: dict = {
             "route_path":  self._route_path_name,
             "route_state": self._route_state_name,

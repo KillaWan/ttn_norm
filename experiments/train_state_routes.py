@@ -73,6 +73,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
 
 from ttn_norm.experiments.train import (
     TrainConfig,
@@ -224,6 +225,25 @@ class StateRouteConfig:
     b2sc_apply_on_val: bool = True
     b2sc_apply_on_test: bool = True
 
+    # ------------------------------------------------------------------
+    # Inference-time streaming state calibration (SSC) parameters
+    # ------------------------------------------------------------------
+    ssc_enable: bool = False
+    ssc_lambda: float = 0.9
+    ssc_decay_rho: float = 0.5
+    ssc_scale_beta: float = 0.5
+    ssc_trend_scale: float = 0.1
+    ssc_apply_on_val: bool = True
+    ssc_apply_on_test: bool = True
+    ssc_sample_stride: int = 1
+
+    # ------------------------------------------------------------------
+    # Post-training plot parameters
+    # ------------------------------------------------------------------
+    plot_comparison: bool = True    # save oracle vs pred line plots after training
+    plot_n_samples: int = 8         # number of consecutive test samples to plot
+    plot_channel: int = 0           # which feature channel to visualise
+
     def seed_list(self) -> list[int]:
         return [int(s.strip()) for s in self.seeds.split(",") if s.strip()]
 
@@ -320,6 +340,19 @@ def _is_pure_san_baseline(cfg: StateRouteConfig) -> bool:
 
 
 def _build_san_route_model(cfg: StateRouteConfig, num_features: int) -> TTNModel:
+    # SSC hard constraints (must be checked before pure/non-pure split)
+    if cfg.ssc_enable and not _is_pure_san_baseline(cfg):
+        raise ValueError(
+            "ssc_enable requires pure SAN baseline "
+            "(route_path='none', route_state='none')."
+        )
+    if cfg.ssc_enable and cfg.b2sc_enable:
+        raise ValueError(
+            "ssc_enable and b2sc_enable cannot be enabled together."
+        )
+    if cfg.ssc_enable and cfg.ssc_sample_stride != 1:
+        raise ValueError("ssc_sample_stride must be 1 when ssc_enable=True.")
+
     if _is_pure_san_baseline(cfg):
         # Hard divisibility checks for pure SAN
         if cfg.window % cfg.san_period_len != 0:
@@ -349,6 +382,11 @@ def _build_san_route_model(cfg: StateRouteConfig, num_features: int) -> TTNModel
             b2sc_recent_weight=cfg.b2sc_recent_weight,
             b2sc_prev_weight=cfg.b2sc_prev_weight,
             b2sc_second_slice_scale=cfg.b2sc_second_slice_scale,
+            ssc_enable=cfg.ssc_enable,
+            ssc_lambda=cfg.ssc_lambda,
+            ssc_decay_rho=cfg.ssc_decay_rho,
+            ssc_scale_beta=cfg.ssc_scale_beta,
+            ssc_trend_scale=cfg.ssc_trend_scale,
         )
     else:
         norm = SANRouteNorm(
@@ -576,6 +614,79 @@ def _train_epoch_stage2(
     }
 
 
+def _train_epoch_stage2_ssc(
+    model: nn.Module,
+    loader,
+    optim: torch.optim.Optimizer,
+    cfg: StateRouteConfig,
+) -> dict[str, float]:
+    """Stage 2 (SSC-aware): sequential sample-by-sample training with live SSC update."""
+    model.train()
+    loss_fn = nn.MSELoss()
+    task_list: list[float] = []
+    base_aux_list: list[float] = []
+    route_state_list: list[float] = []
+
+    model.nm.reset_ssc_state()
+    model.nm.set_ssc_mode(True)
+
+    optim.zero_grad()
+    sample_counter = 0
+    batch_loss_accum = torch.tensor(0.0, device=cfg.device)
+
+    for batch_x, batch_y, _origin_y, batch_x_enc, batch_y_enc in loader:
+        batch_x     = batch_x.to(cfg.device).float()
+        batch_y     = batch_y.to(cfg.device).float()
+        batch_x_enc = batch_x_enc.to(cfg.device).float()
+        batch_y_enc = batch_y_enc.to(cfg.device).float()
+        batch_size  = batch_x.shape[0]
+
+        batch_base_aux_vals: list[float] = []
+        batch_route_state_vals: list[float] = []
+
+        for i in range(batch_size):
+            x_i   = batch_x[i:i+1]
+            y_i   = batch_y[i:i+1]
+            xe_i  = batch_x_enc[i:i+1]
+            ye_i  = batch_y_enc[i:i+1]
+
+            sample_start = sample_counter * cfg.ssc_sample_stride
+            model.nm.ssc_update_from_current_lookback(x_i, sample_start)
+
+            pred_i    = _forward(model, x_i, xe_i, ye_i, cfg)
+            samp_loss = loss_fn(pred_i, y_i)
+            batch_loss_accum = batch_loss_accum + samp_loss
+
+            model.nm.ssc_cache_current_base_prediction(sample_start + cfg.window)
+            sample_counter += 1
+
+            with torch.no_grad():
+                model.nm.compute_total_aux_loss(y_i)
+            aux_stats = model.nm.get_last_aux_stats()
+            batch_base_aux_vals.append(aux_stats["base_aux_loss"])
+            batch_route_state_vals.append(aux_stats["route_state_loss"])
+
+        # backward once per original batch
+        avg_loss = batch_loss_accum / batch_size
+        avg_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.fm.parameters(), cfg.max_grad_norm)
+        optim.step()
+        optim.zero_grad()
+        batch_loss_accum = torch.tensor(0.0, device=cfg.device)
+
+        task_list.append(float(avg_loss.item()))
+        base_aux_list.append(float(np.mean(batch_base_aux_vals)) if batch_base_aux_vals else 0.0)
+        route_state_list.append(float(np.mean(batch_route_state_vals)) if batch_route_state_vals else 0.0)
+
+    model.nm.set_ssc_mode(False)
+
+    return {
+        "task_loss":        float(np.mean(task_list))        if task_list        else 0.0,
+        "base_aux_loss":    float(np.mean(base_aux_list))    if base_aux_list    else 0.0,
+        "route_state_loss": float(np.mean(route_state_list)) if route_state_list else 0.0,
+    }
+
+
 def _train_epoch_stage3(
     model: nn.Module,
     loader,
@@ -668,7 +779,15 @@ def _eval_loader(
     cfg: StateRouteConfig,
     metrics: dict,
     enable_b2sc_eval: bool = False,
+    enable_ssc_eval: bool = False,
+    reset_ssc: bool = True,
 ) -> dict[str, float]:
+    """Evaluate *loader*.
+
+    ``reset_ssc``: when True (the default and the only value used for test
+    loaders) SSC state is reset before eval so that test always cold-starts,
+    never inheriting val's end-of-pass memory.
+    """
     model.eval()
     for metric in metrics.values():
         metric.reset()
@@ -678,6 +797,63 @@ def _eval_loader(
     base_aux_list: list[float] = []
     route_state_list: list[float] = []
 
+    # ------------------------------------------------------------------
+    # SSC sequential eval path
+    # ------------------------------------------------------------------
+    if enable_ssc_eval and hasattr(model.nm, "set_ssc_mode"):
+        if reset_ssc:
+            model.nm.reset_ssc_state()
+        model.nm.set_ssc_mode(True)
+        sample_counter = 0
+
+        for batch_x, batch_y, _origin_y, batch_x_enc, batch_y_enc in loader:
+            batch_x     = batch_x.to(cfg.device).float()
+            batch_y     = batch_y.to(cfg.device).float()
+            batch_x_enc = batch_x_enc.to(cfg.device).float()
+            batch_y_enc = batch_y_enc.to(cfg.device).float()
+
+            for i in range(batch_x.shape[0]):
+                x_i     = batch_x[i:i+1]
+                y_i     = batch_y[i:i+1]
+                xenc_i  = batch_x_enc[i:i+1]
+                yenc_i  = batch_y_enc[i:i+1]
+
+                sample_start = sample_counter * cfg.ssc_sample_stride
+                model.nm.ssc_update_from_current_lookback(x_i, sample_start)
+                pred_i = _forward(model, x_i, xenc_i, yenc_i, cfg)
+                model.nm.ssc_cache_current_base_prediction(
+                    sample_start + cfg.window
+                )
+                sample_counter += 1
+
+                task_loss = loss_fn(pred_i, y_i)
+                task_list.append(float(task_loss.item()))
+
+                model.nm.compute_total_aux_loss(y_i)
+                aux_stats = model.nm.get_last_aux_stats()
+                base_aux_list.append(aux_stats["base_aux_loss"])
+                route_state_list.append(aux_stats["route_state_loss"])
+
+                pred_i = pred_i.contiguous()
+                y_i    = y_i.contiguous()
+                if cfg.pred_len == 1:
+                    pred_i = pred_i.view(1, -1)
+                    y_i    = y_i.view(1, -1)
+                for metric in metrics.values():
+                    metric.update(pred_i, y_i)
+
+        model.nm.set_ssc_mode(False)
+        results = {name: float(m.compute()) for name, m in metrics.items()}
+        results.update({
+            "task_loss":        float(np.mean(task_list))        if task_list        else 0.0,
+            "base_aux_loss":    float(np.mean(base_aux_list))    if base_aux_list    else 0.0,
+            "route_state_loss": float(np.mean(route_state_list)) if route_state_list else 0.0,
+        })
+        return results
+
+    # ------------------------------------------------------------------
+    # Standard batched eval path
+    # ------------------------------------------------------------------
     for batch_x, batch_y, _origin_y, batch_x_enc, batch_y_enc in loader:
         batch_x     = batch_x.to(cfg.device).float()
         batch_y     = batch_y.to(cfg.device).float()
@@ -728,6 +904,8 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
 
     enable_val_b2sc  = bool(cfg.b2sc_enable and cfg.b2sc_apply_on_val)
     enable_test_b2sc = bool(cfg.b2sc_enable and cfg.b2sc_apply_on_test)
+    enable_val_ssc   = bool(cfg.ssc_enable and cfg.ssc_apply_on_val)
+    enable_test_ssc  = bool(cfg.ssc_enable and cfg.ssc_apply_on_test)
 
     if pure_baseline and cfg.baseline_ckpt_dir:
         raise ValueError(
@@ -756,6 +934,15 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
     )
     dataloader, dataset, scaler, split_info = _build_dataloader(tc)
     num_features = dataset.num_features
+
+    # Ordered (non-shuffled) replay loader for SSC-aware stage2 training
+    _ssc_train_loader = DataLoader(
+        dataloader.train_loader.dataset,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        drop_last=False,
+        num_workers=cfg.num_worker,
+    ) if cfg.ssc_enable else None
 
     print(
         f"[Split] train={dataloader.train_size}, val={dataloader.val_size},"
@@ -833,8 +1020,8 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
         if unexpected:
             print(f"  Unexpected keys: {unexpected}")
 
-        val_m  = _eval_loader(model, dataloader.val_loader,  cfg, metrics, enable_b2sc_eval=enable_val_b2sc)
-        test_m = _eval_loader(model, dataloader.test_loader, cfg, metrics, enable_b2sc_eval=enable_test_b2sc)
+        val_m  = _eval_loader(model, dataloader.val_loader,  cfg, metrics, enable_b2sc_eval=enable_val_b2sc,  enable_ssc_eval=enable_val_ssc)
+        test_m = _eval_loader(model, dataloader.test_loader, cfg, metrics, enable_b2sc_eval=enable_test_b2sc, enable_ssc_eval=enable_test_ssc, reset_ssc=True)
         best_val_mse  = val_m["mse"]
         best_val_mae  = val_m["mae"]
         best_test_mse = test_m["mse"]
@@ -889,7 +1076,7 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
 
             for epoch in range(cfg.san_pretrain_epochs):
                 tr    = _train_epoch_stage1(model, dataloader.train_loader, s1_optim, cfg)
-                val_m = _eval_loader(model, dataloader.val_loader, cfg, metrics, enable_b2sc_eval=enable_val_b2sc)
+                val_m = _eval_loader(model, dataloader.val_loader, cfg, metrics, enable_b2sc_eval=enable_val_b2sc, enable_ssc_eval=False)
                 val_base_aux = val_m["base_aux_loss"]
 
                 improved = val_base_aux < best_s1_val - cfg.early_stop_delta
@@ -954,7 +1141,7 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
 
             for epoch in range(cfg.route_stage_epochs):
                 tr    = _train_epoch_lp_pretrain(model, dataloader.train_loader, lp_optim, cfg)
-                val_m = _eval_loader(model, dataloader.val_loader, cfg, metrics, enable_b2sc_eval=enable_val_b2sc)
+                val_m = _eval_loader(model, dataloader.val_loader, cfg, metrics, enable_b2sc_eval=enable_val_b2sc, enable_ssc_eval=enable_val_ssc)
                 val_rs = val_m["route_state_loss"]
 
                 improved_lp = val_rs < best_lp_val - cfg.early_stop_delta
@@ -1015,7 +1202,7 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
                 tr    = _train_epoch_timeapn_pretrain(
                     model, dataloader.train_loader, tapn_optim, cfg
                 )
-                val_m = _eval_loader(model, dataloader.val_loader, cfg, metrics, enable_b2sc_eval=enable_val_b2sc)
+                val_m = _eval_loader(model, dataloader.val_loader, cfg, metrics, enable_b2sc_eval=enable_val_b2sc, enable_ssc_eval=enable_val_ssc)
                 val_rs = val_m["route_state_loss"]
 
                 improved_tapn = val_rs < best_tapn_val - cfg.early_stop_delta
@@ -1099,9 +1286,12 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
                         f" APN added to optimizer (lr={_current_lr:.2e})."
                     )
 
-                tr    = _train_epoch_stage2(model, dataloader.train_loader, s2_optim, cfg)
-                val_m  = _eval_loader(model, dataloader.val_loader,  cfg, metrics, enable_b2sc_eval=enable_val_b2sc)
-                test_m = _eval_loader(model, dataloader.test_loader, cfg, metrics, enable_b2sc_eval=enable_test_b2sc)
+                if cfg.ssc_enable:
+                    tr = _train_epoch_stage2_ssc(model, _ssc_train_loader, s2_optim, cfg)
+                else:
+                    tr = _train_epoch_stage2(model, dataloader.train_loader, s2_optim, cfg)
+                val_m  = _eval_loader(model, dataloader.val_loader,  cfg, metrics, enable_b2sc_eval=enable_val_b2sc,  enable_ssc_eval=enable_val_ssc)
+                test_m = _eval_loader(model, dataloader.test_loader, cfg, metrics, enable_b2sc_eval=enable_test_b2sc, enable_ssc_eval=enable_test_ssc, reset_ssc=True)
                 val_mse = val_m["mse"]
                 val_mae = val_m["mae"]
 
@@ -1201,8 +1391,8 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
                 tr    = _train_epoch_stage3(
                     model, dataloader.train_loader, s3_optim, cfg, stage3_params
                 )
-                val_m  = _eval_loader(model, dataloader.val_loader,  cfg, metrics, enable_b2sc_eval=enable_val_b2sc)
-                test_m = _eval_loader(model, dataloader.test_loader, cfg, metrics, enable_b2sc_eval=enable_test_b2sc)
+                val_m  = _eval_loader(model, dataloader.val_loader,  cfg, metrics, enable_b2sc_eval=enable_val_b2sc,  enable_ssc_eval=enable_val_ssc)
+                test_m = _eval_loader(model, dataloader.test_loader, cfg, metrics, enable_b2sc_eval=enable_test_b2sc, enable_ssc_eval=enable_test_ssc, reset_ssc=True)
                 val_mse = val_m["mse"]
                 val_mae = val_m["mae"]
                 route_diag = model.nm.get_route_diagnostics()
@@ -1279,8 +1469,8 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
                 tr    = _train_epoch_joint(
                     model, dataloader.train_loader, jf_optim, cfg, joint_params
                 )
-                val_m  = _eval_loader(model, dataloader.val_loader,  cfg, metrics, enable_b2sc_eval=enable_val_b2sc)
-                test_m = _eval_loader(model, dataloader.test_loader, cfg, metrics, enable_b2sc_eval=enable_test_b2sc)
+                val_m  = _eval_loader(model, dataloader.val_loader,  cfg, metrics, enable_b2sc_eval=enable_val_b2sc,  enable_ssc_eval=enable_val_ssc)
+                test_m = _eval_loader(model, dataloader.test_loader, cfg, metrics, enable_b2sc_eval=enable_test_b2sc, enable_ssc_eval=enable_test_ssc, reset_ssc=True)
                 val_mse = val_m["mse"]
 
                 improved = val_mse < best_val_mse - cfg.early_stop_delta
@@ -1335,12 +1525,405 @@ def _run_trial(cfg: StateRouteConfig, seed: int, tmp_dir: str) -> dict[str, Any]
         "route_diagnostics": final_route_diag,
     }
 
+    if cfg.plot_comparison:
+        _plot_oracle_pred_comparison(
+            model=model,
+            loader=dataloader.test_loader,
+            cfg=cfg,
+            scaler=scaler,
+            out_dir=_result_dir(cfg),
+            seed=seed,
+            enable_b2sc=enable_test_b2sc,
+            enable_ssc=enable_test_ssc,
+        )
+        _plot_states_comparison(
+            model=model,
+            train_loader=dataloader.train_loader,
+            val_loader=dataloader.val_loader,
+            test_loader=dataloader.test_loader,
+            cfg=cfg,
+            out_dir=_result_dir(cfg),
+            seed=seed,
+        )
+
     del model, metrics
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     return result
 
+
+
+# ---------------------------------------------------------------------------
+# Post-training plot helpers
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _collect_preds_and_targets(
+    model: nn.Module,
+    loader,
+    cfg: "StateRouteConfig",
+    n_samples: int,
+    enable_b2sc: bool = False,
+    enable_ssc: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Collect up to *n_samples* (pred, target) pairs from *loader*.
+
+    Returns tensors ``(preds, targets)`` each shaped ``(N, pred_len, C)``.
+    """
+    model.eval()
+    preds_list:   list[torch.Tensor] = []
+    targets_list: list[torch.Tensor] = []
+
+    if enable_ssc and hasattr(model.nm, "set_ssc_mode"):
+        model.nm.reset_ssc_state()
+        model.nm.set_ssc_mode(True)
+        sample_counter = 0
+        for batch_x, batch_y, _oy, batch_x_enc, batch_y_enc in loader:
+            if len(preds_list) >= n_samples:
+                break
+            batch_x     = batch_x.to(cfg.device).float()
+            batch_y     = batch_y.to(cfg.device).float()
+            batch_x_enc = batch_x_enc.to(cfg.device).float()
+            batch_y_enc = batch_y_enc.to(cfg.device).float()
+            for i in range(batch_x.shape[0]):
+                if len(preds_list) >= n_samples:
+                    break
+                x_i    = batch_x[i:i+1]
+                y_i    = batch_y[i:i+1]
+                xenc_i = batch_x_enc[i:i+1]
+                yenc_i = batch_y_enc[i:i+1]
+                sample_start = sample_counter * cfg.ssc_sample_stride
+                model.nm.ssc_update_from_current_lookback(x_i, sample_start)
+                pred_i = _forward(model, x_i, xenc_i, yenc_i, cfg)
+                model.nm.ssc_cache_current_base_prediction(sample_start + cfg.window)
+                sample_counter += 1
+                preds_list.append(pred_i.cpu())
+                targets_list.append(y_i.cpu())
+        model.nm.set_ssc_mode(False)
+    else:
+        if hasattr(model.nm, "set_b2sc_mode"):
+            model.nm.set_b2sc_mode(enable_b2sc)
+        for batch_x, batch_y, _oy, batch_x_enc, batch_y_enc in loader:
+            if len(preds_list) >= n_samples:
+                break
+            batch_x     = batch_x.to(cfg.device).float()
+            batch_y     = batch_y.to(cfg.device).float()
+            batch_x_enc = batch_x_enc.to(cfg.device).float()
+            batch_y_enc = batch_y_enc.to(cfg.device).float()
+            pred = _forward(model, batch_x, batch_x_enc, batch_y_enc, cfg)
+            for i in range(pred.shape[0]):
+                preds_list.append(pred[i:i+1].cpu())
+                targets_list.append(batch_y[i:i+1].cpu())
+                if len(preds_list) >= n_samples:
+                    break
+        if hasattr(model.nm, "set_b2sc_mode"):
+            model.nm.set_b2sc_mode(False)
+
+    preds   = torch.cat(preds_list[:n_samples],   dim=0)  # (N, pred_len, C)
+    targets = torch.cat(targets_list[:n_samples], dim=0)  # (N, pred_len, C)
+    return preds, targets
+
+
+def _plot_oracle_pred_comparison(
+    model: nn.Module,
+    loader,
+    cfg: "StateRouteConfig",
+    scaler,
+    out_dir: str,
+    seed: int,
+    enable_b2sc: bool,
+    enable_ssc: bool,
+) -> None:
+    """Collect test predictions, inverse-transform, and save comparison plots."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    n  = max(1, cfg.plot_n_samples)
+    ch = cfg.plot_channel
+
+    preds, targets = _collect_preds_and_targets(
+        model, loader, cfg, n_samples=n,
+        enable_b2sc=enable_b2sc, enable_ssc=enable_ssc,
+    )
+
+    # Inverse-transform: move to the scaler's device
+    preds_inv   = scaler.inverse_transform(
+        preds.to(cfg.device).float()
+    ).cpu().numpy()    # (N, pred_len, C)
+    targets_inv = scaler.inverse_transform(
+        targets.to(cfg.device).float()
+    ).cpu().numpy()    # (N, pred_len, C)
+
+    actual_n  = preds_inv.shape[0]
+    actual_ch = min(ch, preds_inv.shape[2] - 1)
+    t = np.arange(cfg.pred_len)
+
+    fig, axes = plt.subplots(
+        actual_n, 1, figsize=(12, 3 * actual_n), squeeze=False
+    )
+    for i in range(actual_n):
+        ax = axes[i, 0]
+        ax.plot(
+            t, targets_inv[i, :, actual_ch],
+            label="Oracle", color="C0", linewidth=1.2,
+        )
+        ax.plot(
+            t, preds_inv[i, :, actual_ch],
+            label="Pred", color="C1", linewidth=1.2, linestyle="--",
+        )
+        ax.set_ylabel("Value")
+        ax.set_title(f"Test sample {i + 1}")
+        if i == 0:
+            ax.legend(loc="upper right")
+    axes[-1, 0].set_xlabel("Forecast horizon step")
+    fig.suptitle(
+        f"Oracle vs Pred  |  {cfg.dataset}  {cfg.backbone}"
+        f"  pred_len={cfg.pred_len}  ch={actual_ch}  seed={seed}",
+        fontsize=11,
+    )
+    fig.tight_layout()
+
+    plot_dir = os.path.join(out_dir, "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+    fig_path = os.path.join(plot_dir, f"oracle_vs_pred_s{seed}.png")
+    fig.savefig(fig_path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [Plot] Saved oracle vs pred comparison → {fig_path}")
+
+
+@torch.no_grad()
+def _collect_states(
+    model: nn.Module,
+    loader,
+    cfg: "StateRouteConfig",
+    enable_b2sc: bool = False,
+    enable_ssc: bool = False,
+    reset_ssc: bool = True,
+) -> tuple:
+    """Collect patch-level state stats for ALL batches in *loader*.
+
+    Runs full-batch forward passes and records **one point per batch**
+    (mean over the B and P dimensions), so the x-axis matches the number
+    of batches rather than individual samples — giving smooth curves
+    comparable to the reference norm-stats plot.
+
+    Returns ``(mu_base, std_base, mu_cal, mu_oracle, std_oracle)`` each shaped
+    ``(N_batches, C)`` — averaged over the B×P dimensions.
+    ``mu_cal`` is SSC-corrected mu (equals mu_base when SSC is off).
+    """
+    model.eval()
+    nm = model.nm
+    if not hasattr(nm, "_base_mu_fut_hat") or not hasattr(nm, "_compute_oracle_stats"):
+        return None, None, None, None, None
+
+    mu_base_list: list[torch.Tensor] = []
+    std_base_list: list[torch.Tensor] = []
+    mu_cal_list:  list[torch.Tensor] = []
+    mu_ora_list:   list[torch.Tensor] = []
+    std_ora_list:  list[torch.Tensor] = []
+
+    if hasattr(nm, "set_b2sc_mode"):
+        nm.set_b2sc_mode(enable_b2sc)
+    if enable_ssc and hasattr(nm, "set_ssc_mode"):
+        if reset_ssc:
+            nm.reset_ssc_state()
+        nm.set_ssc_mode(True)
+
+    sample_counter = 0
+
+    for batch_x, batch_y, _oy, batch_x_enc, batch_y_enc in loader:
+        batch_x     = batch_x.to(cfg.device).float()
+        batch_y     = batch_y.to(cfg.device).float()
+        batch_x_enc = batch_x_enc.to(cfg.device).float()
+        batch_y_enc = batch_y_enc.to(cfg.device).float()
+        batch_size  = batch_x.shape[0]
+
+        if enable_ssc:
+            # True sequential SSC: per-sample update → forward → cache
+            # Record stats per sample so oracle/base/cal are correctly aligned.
+            for i in range(batch_size):
+                x_i  = batch_x[i:i+1]
+                y_i  = batch_y[i:i+1]
+                xe_i = batch_x_enc[i:i+1]
+                ye_i = batch_y_enc[i:i+1]
+                sample_start = sample_counter * cfg.ssc_sample_stride
+                nm.ssc_update_from_current_lookback(x_i, sample_start)
+                with torch.no_grad():
+                    _forward(model, x_i, xe_i, ye_i, cfg)
+                nm.ssc_cache_current_base_prediction(sample_start + cfg.window)
+                sample_counter += 1
+
+                if nm._base_mu_fut_hat is None or nm._base_std_fut_hat is None:
+                    continue
+                _, oracle_mu_i, oracle_std_i = nm._compute_oracle_stats(y_i)
+                mu_cal_i, _ = nm._apply_ssc_to_patch_stats(
+                    nm._base_mu_fut_hat, nm._base_std_fut_hat
+                )
+                # Average over P dim → (1, C)
+                mu_base_list.append(nm._base_mu_fut_hat.mean(dim=1).cpu())
+                std_base_list.append(nm._base_std_fut_hat.mean(dim=1).cpu())
+                mu_cal_list.append(mu_cal_i.mean(dim=1).cpu())
+                mu_ora_list.append(oracle_mu_i.mean(dim=1).cpu())
+                std_ora_list.append(oracle_std_i.mean(dim=1).cpu())
+            continue  # stats already recorded above; skip the batch-level block
+        else:
+            with torch.no_grad():
+                _forward(model, batch_x, batch_x_enc, batch_y_enc, cfg)
+            sample_counter += batch_size
+
+        if nm._base_mu_fut_hat is None or nm._base_std_fut_hat is None:
+            continue
+        _, oracle_mu, oracle_std = nm._compute_oracle_stats(batch_y)
+
+        mu_cal_patch, std_cal_patch = nm._apply_ssc_to_patch_stats(
+            nm._base_mu_fut_hat, nm._base_std_fut_hat
+        )
+
+        # Average over P (patch) dim → (B, C)
+        mu_base_list.append(nm._base_mu_fut_hat.mean(dim=1).cpu())
+        std_base_list.append(nm._base_std_fut_hat.mean(dim=1).cpu())
+        mu_cal_list.append(mu_cal_patch.mean(dim=1).cpu())
+        mu_ora_list.append(oracle_mu.mean(dim=1).cpu())
+        std_ora_list.append(oracle_std.mean(dim=1).cpu())
+
+    if enable_ssc and hasattr(nm, "set_ssc_mode"):
+        nm.set_ssc_mode(False)
+    if hasattr(nm, "set_b2sc_mode"):
+        nm.set_b2sc_mode(False)
+
+    if not mu_base_list:
+        return None, None, None, None, None
+
+    return (
+        torch.cat(mu_base_list, dim=0),   # (N, C)
+        torch.cat(std_base_list, dim=0),  # (N, C)
+        torch.cat(mu_cal_list,  dim=0),   # (N, C)
+        torch.cat(mu_ora_list,  dim=0),   # (N, C)
+        torch.cat(std_ora_list, dim=0),   # (N, C)
+    )
+
+
+def _plot_states_comparison(
+    model: nn.Module,
+    train_loader,
+    val_loader,
+    test_loader,
+    cfg: "StateRouteConfig",
+    out_dir: str,
+    seed: int,
+) -> None:
+    """2-panel continuous time-series (train → val → test) of oracle vs
+    predicted window mean (top) and std (bottom).  Vertical dashed lines
+    mark the split boundaries.
+
+    - train: SSC disabled (no calibration during training)
+    - val:   SSC enabled if cfg.ssc_apply_on_val (with fresh reset)
+    - test:  SSC enabled if cfg.ssc_apply_on_test (with fresh reset, NOT
+             inheriting val state)
+    Three lines per panel: oracle (C0), base mean (C1 dashed), calibrated (C2 dashed)
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    use_ssc = cfg.ssc_enable
+
+    split_cfgs = [
+        # (loader,       enable_ssc,                  reset_ssc)
+        (train_loader,  False,                         True),
+        (val_loader,    use_ssc and cfg.ssc_apply_on_val,  True),
+        (test_loader,   use_ssc and cfg.ssc_apply_on_test, True),  # always reset — no val carry-over
+    ]
+
+    results = []
+    for loader, en_ssc, rst in split_cfgs:
+        r = _collect_states(model, loader, cfg,
+                            enable_b2sc=False, enable_ssc=en_ssc, reset_ssc=rst)
+        results.append(r)
+
+    if all(r[0] is None for r in results):
+        print("  [Plot] States plot skipped: no patch stats available.")
+        return
+
+    ch = cfg.plot_channel
+
+    def _to_np(tensor):
+        if tensor is None:
+            return np.array([])
+        actual_ch = min(ch, tensor.shape[1] - 1)
+        return tensor[:, actual_ch].numpy()
+
+    # results[i] = (mu_base, std_base, mu_cal, mu_ora, std_ora)
+    segs_mu_ora  = [_to_np(r[3]) for r in results]
+    segs_mu_base = [_to_np(r[0]) for r in results]
+    segs_mu_cal  = [_to_np(r[2]) for r in results]
+    segs_std_ora  = [_to_np(r[4]) for r in results]
+    segs_std_base = [_to_np(r[1]) for r in results]
+
+    # Concatenate + track split boundaries
+    boundaries = []
+    offset = 0
+    for seg in segs_mu_ora:
+        offset += len(seg)
+        boundaries.append(offset)
+    boundaries = boundaries[:-1]
+
+    mu_ora_np   = np.concatenate(segs_mu_ora)
+    mu_base_np  = np.concatenate(segs_mu_base)
+    mu_cal_np   = np.concatenate(segs_mu_cal)
+    std_ora_np  = np.concatenate(segs_std_ora)
+    std_base_np = np.concatenate(segs_std_base)
+    x = np.arange(len(mu_ora_np))
+
+    has_cal = use_ssc and (not np.allclose(mu_base_np, mu_cal_np))
+
+    split_labels = ["val", "test"]
+    split_colors = ["C1", "C2"]
+
+    fig, (ax_mu, ax_std) = plt.subplots(2, 1, figsize=(14, 6), sharex=True)
+
+    # -- mean panel --
+    ax_mu.plot(x, mu_ora_np,  color="C0", linewidth=1.0, label="oracle mean")
+    ax_mu.plot(x, mu_base_np, color="C1", linewidth=1.0, linestyle="--", label="base mean")
+    if has_cal:
+        ax_mu.plot(x, mu_cal_np, color="C2", linewidth=1.0, linestyle="--", label="calibrated mean")
+    for b, lbl, col in zip(boundaries, split_labels, split_colors):
+        ax_mu.axvline(x=b, color=col, linestyle="--", linewidth=1.0)
+        ax_mu.text(b + 0.5, 1.0, lbl,
+                   transform=ax_mu.get_xaxis_transform(),
+                   color=col, fontsize=9, va="top", ha="left")
+    ax_mu.set_ylabel("Window Mean")
+    ax_mu.legend(loc="upper right")
+    ax_mu.grid(True, alpha=0.3)
+
+    # -- std panel --
+    ax_std.plot(x, std_ora_np,  color="C0", linewidth=1.0, label="oracle std")
+    ax_std.plot(x, std_base_np, color="C1", linewidth=1.0, linestyle="--", label="base std")
+    for b, lbl, col in zip(boundaries, split_labels, split_colors):
+        ax_std.axvline(x=b, color=col, linestyle="--", linewidth=1.0)
+        ax_std.text(b + 0.5, 1.0, lbl,
+                    transform=ax_std.get_xaxis_transform(),
+                    color=col, fontsize=9, va="top", ha="left")
+    ax_std.set_ylabel("Window Std")
+    ax_std.set_xlabel("Batch index")
+    ax_std.legend(loc="upper right")
+    ax_std.grid(True, alpha=0.3)
+
+    backbone = getattr(cfg, "backbone", "")
+    fig.suptitle(
+        f"SAN Predicted vs Oracle Window Stats — {backbone} | {cfg.dataset} | pred={cfg.pred_len}",
+        fontsize=12,
+    )
+    fig.tight_layout()
+
+    plot_dir = os.path.join(out_dir, "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+    fig_path = os.path.join(plot_dir, f"states_oracle_vs_pred_s{seed}.png")
+    fig.savefig(fig_path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [Plot] Saved states comparison → {fig_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -1408,6 +1991,14 @@ def _write_results(cfg: StateRouteConfig, trials: list[dict]) -> None:
     summary["b2sc_recent_weight"]      = cfg.b2sc_recent_weight
     summary["b2sc_prev_weight"]        = cfg.b2sc_prev_weight
     summary["b2sc_second_slice_scale"] = cfg.b2sc_second_slice_scale
+    summary["ssc_enable"]              = cfg.ssc_enable
+    summary["ssc_apply_on_val"]        = cfg.ssc_apply_on_val
+    summary["ssc_apply_on_test"]       = cfg.ssc_apply_on_test
+    summary["ssc_lambda"]              = cfg.ssc_lambda
+    summary["ssc_decay_rho"]           = cfg.ssc_decay_rho
+    summary["ssc_scale_beta_legacy"]   = cfg.ssc_scale_beta  # legacy / unused since trend-SSC
+    summary["ssc_trend_scale"]         = cfg.ssc_trend_scale
+    summary["ssc_sample_stride"]       = cfg.ssc_sample_stride
 
     summary_path = os.path.join(out_dir, "summary.json")
     with open(summary_path, "w") as f:
@@ -1516,7 +2107,14 @@ def main(argv=None):
         print(f"[Config] baseline_ckpt_dir={cfg.baseline_ckpt_dir}  (skip stage1+pretrain+stage2)")
     if cfg.save_stage2_ckpt:
         print(f"[Config] save_stage2_ckpt=True")
-    _eval_upd = "enabled_on_val_test_by_flags" if cfg.b2sc_enable else "disabled"
+    _b2sc_upd = cfg.b2sc_enable
+    _ssc_upd  = cfg.ssc_enable
+    _eval_upd = (
+        "b2sc+ssc" if (_b2sc_upd and _ssc_upd) else
+        "b2sc" if _b2sc_upd else
+        "ssc"  if _ssc_upd  else
+        "disabled"
+    )
     print(
         f"[Config] b2sc_enable={cfg.b2sc_enable}"
         f"  b2sc_apply_on_val={cfg.b2sc_apply_on_val}"
@@ -1524,6 +2122,16 @@ def main(argv=None):
         f"  b2sc_recent_weight={cfg.b2sc_recent_weight}"
         f"  b2sc_prev_weight={cfg.b2sc_prev_weight}"
         f"  b2sc_second_slice_scale={cfg.b2sc_second_slice_scale}"
+    )
+    print(
+        f"[Config] ssc_enable={cfg.ssc_enable}"
+        f"  ssc_apply_on_val={cfg.ssc_apply_on_val}"
+        f"  ssc_apply_on_test={cfg.ssc_apply_on_test}"
+        f"  ssc_lambda={cfg.ssc_lambda}"
+        f"  ssc_decay_rho={cfg.ssc_decay_rho}"
+        f"  ssc_scale_beta={cfg.ssc_scale_beta}(legacy/unused)"
+        f"  ssc_trend_scale={cfg.ssc_trend_scale}"
+        f"  ssc_sample_stride={cfg.ssc_sample_stride}"
     )
     print(f"[Config] eval_update={_eval_upd}")
 
