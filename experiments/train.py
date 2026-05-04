@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import sys
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -12,6 +13,7 @@ import torch
 from torch import nn
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from torchmetrics import MeanAbsoluteError, MeanAbsolutePercentageError, MeanSquaredError
 
@@ -61,6 +63,98 @@ def _parse_scaler(name: str):
 
 # ETT datasets that support the "popular" fixed calendar split
 _ETT_POPULAR_DATASETS = {"ETTh1", "ETTh2", "ETTm1", "ETTm2"}
+
+
+@dataclass
+class _LoaderBundle:
+    train_loader: DataLoader
+    val_loader: DataLoader
+    test_loader: DataLoader
+    train_size: int
+    val_size: int
+    test_size: int
+
+
+def _build_timeapn_official_ratio_dataloader(cfg, dataset, scaler, loader_window: int):
+    """Build the original TimeAPN custom-dataset split for ratio datasets.
+
+    TimeAPN's ``Dataset_Custom`` uses:
+      border1s = [0, num_train - seq_len, n_total - num_test - seq_len]
+      border2s = [num_train, num_train + num_val, n_total]
+
+    FAN's generic ratio loader instead shifts val/test starts by
+    ``window + horizon - 1``. Traffic-336 is sensitive to this difference,
+    so we expose the official split behind an explicit flag.
+    """
+    _ensure_fan_on_path()
+    from torch_timeseries.datasets.dataset import TimeseriesSubset
+    from torch_timeseries.datasets.wrapper import MultiStepTimeFeatureSet
+
+    n_total = len(dataset)
+    num_train = int(cfg.train_ratio * n_total)
+    num_val = int(cfg.val_ratio * n_total)
+    num_test = n_total - num_train - num_val
+    w = loader_window
+
+    border1s = [0, num_train - w, n_total - num_test - w]
+    border2s = [num_train, num_train + num_val, n_total]
+
+    scaler.fit(dataset.data[border1s[0]:border2s[0]])
+
+    def _make_ds(t0: int, t1: int):
+        subset = TimeseriesSubset(dataset, range(t0, t1))
+        return MultiStepTimeFeatureSet(
+            subset,
+            scaler=scaler,
+            time_enc=0,
+            window=loader_window,
+            horizon=cfg.horizon,
+            steps=cfg.pred_len,
+            freq=cfg.freq,
+            scaler_fit=False,
+        )
+
+    train_dataset = _make_ds(border1s[0], border2s[0])
+    val_dataset = _make_ds(border1s[1], border2s[1])
+    test_dataset = _make_ds(border1s[2], border2s[2])
+
+    return (
+        _LoaderBundle(
+            train_loader=DataLoader(
+                train_dataset,
+                batch_size=cfg.batch_size,
+                shuffle=True,
+                num_workers=cfg.num_worker,
+            ),
+            val_loader=DataLoader(
+                val_dataset,
+                batch_size=cfg.batch_size,
+                shuffle=False,
+                num_workers=cfg.num_worker,
+            ),
+            test_loader=DataLoader(
+                test_dataset,
+                batch_size=cfg.batch_size,
+                shuffle=False,
+                num_workers=cfg.num_worker,
+            ),
+            train_size=len(train_dataset),
+            val_size=len(val_dataset),
+            test_size=len(test_dataset),
+        ),
+        {
+            "split_type": "timeapn_official_ratio",
+            "dataset_len": n_total,
+            "train_rows": num_train,
+            "val_rows": num_val,
+            "test_rows": num_test,
+            "train_ratio": cfg.train_ratio,
+            "val_ratio": cfg.val_ratio,
+            "train_idx": (border1s[0], border2s[0]),
+            "val_idx": (border1s[1], border2s[1]),
+            "test_idx": (border1s[2], border2s[2]),
+        },
+    )
 
 
 def _build_dataloader(cfg):
@@ -153,6 +247,15 @@ def _build_dataloader(cfg):
         )
 
     else:  # split_type == "ratio"
+        if getattr(cfg, "timeapn_official_split", False):
+            dataloader, split_info = _build_timeapn_official_ratio_dataloader(
+                cfg=cfg,
+                dataset=dataset,
+                scaler=scaler,
+                loader_window=loader_window,
+            )
+            return dataloader, dataset, scaler, split_info
+
         train_size = int(cfg.train_ratio * n_total)
         val_size   = int(cfg.val_ratio   * n_total)
         test_size  = n_total - train_size - val_size
@@ -189,6 +292,7 @@ def _build_dataloader(cfg):
 
 
 def _set_seed(seed: int) -> None:
+    random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -369,10 +473,11 @@ class TrainConfig:
     aux_loss_decay_epochs: int = 16
 
     scaler_type: str = "StandarScaler"
-    scale_in_train: bool = False
+    scale_in_train: bool = True
     train_ratio: float = 0.7
     val_ratio: float = 0.2
     split_type: str = "ratio"   # "ratio" | "popular"
+    timeapn_official_split: bool = False
     freq: str | None = None
 
     label_len: int = 48

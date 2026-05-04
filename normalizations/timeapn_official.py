@@ -14,8 +14,12 @@ Design notes
   learnable_wavelet.py.  It requires only PyTorch and pywt (at init time).
 - Statics_MLP matches the official architecture, including the known std_r1 /
   std_r discrepancy that is faithfully reproduced.
-- TCN channels default to [16, 32, 64, 32, enc_in] (the "else" branch in the
-  official Statics_MLP constructor).
+- TCN channels follow the official data_path-dependent branches when a
+  data_path/dataset hint is provided:
+    traffic -> [512, 1024, 1024, 512, enc_in]
+    elec    -> [256, 512, 1024, 512, enc_in]
+    wea     -> [32, 64, 32, enc_in]
+    else    -> [16, 32, 64, 32, enc_in]
 
 Interface expected by SANRouteNorm
 -----------------------------------
@@ -48,6 +52,22 @@ import torch.nn.functional as F
 # DWT1D — learnable QMF analysis / synthesis filter bank
 # (ported from utils/learnable_wavelet.py; no pytorch_wavelets dependency)
 # ---------------------------------------------------------------------------
+
+def official_tcn_channels(enc_in: int, data_path: Optional[str] = None) -> List[int]:
+    """Return the official TimeAPN TCN channel schedule for a dataset hint.
+
+    The original ``models/APN.py`` branches on ``configs.data_path`` using
+    substring checks.  ``ttn_norm`` usually has a dataset name rather than the
+    exact CSV path, so this helper accepts either.
+    """
+    key = (data_path or "").lower()
+    if "traffic" in key:
+        return [512, 1024, 1024, 512, enc_in]
+    if "elec" in key:
+        return [256, 512, 1024, 512, enc_in]
+    if "wea" in key:
+        return [32, 64, 32, enc_in]
+    return [16, 32, 64, 32, enc_in]
 
 def _dwt_coeff_len(n: int, filt_len: int) -> int:
     """Compute DWT coefficient array length (mode='zero')."""
@@ -212,7 +232,6 @@ class TemporalBlock(nn.Module):
         self.downsample = (
             nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
         )
-        self.relu = nn.ReLU()
         self._init_weights()
 
     def _init_weights(self):
@@ -224,7 +243,7 @@ class TemporalBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.net(x)
         res = x if self.downsample is None else self.downsample(x)
-        return self.relu(out + res)
+        return out + res
 
 
 class TemporalConvNet(nn.Module):
@@ -295,8 +314,9 @@ class Statics_MLP(nn.Module):
         pred_len:   Prediction horizon.
         drop_rate:  Dropout probability.
         layer:      Number of FFN layers in mean_ffn.
-        tcn_channels: TCN channel list for std_ffn.  Defaults to
-                    [16, 32, 64, 32, enc_in] (official "else" branch).
+        tcn_channels: TCN channel list for std_ffn.  Defaults to the official
+                    data_path-dependent branch when data_path is provided.
+        data_path: Dataset/path hint used to select official TCN channels.
     """
 
     def __init__(
@@ -310,10 +330,12 @@ class Statics_MLP(nn.Module):
         bias: bool = False,
         layer: int = 1,
         tcn_channels: Optional[List[int]] = None,
+        data_path: Optional[str] = None,
     ):
         super().__init__()
         if tcn_channels is None:
-            tcn_channels = [16, 32, 64, 32, enc_in]
+            tcn_channels = official_tcn_channels(enc_in, data_path)
+        self.tcn_channels = list(tcn_channels)
 
         project = nn.Sequential(
             nn.Linear(seq_len, d_model, bias=bias), nn.Dropout(drop_rate)
@@ -331,16 +353,27 @@ class Statics_MLP(nn.Module):
         self.s_concat = nn.Sequential(
             nn.Linear(d_model * 2, d_model), nn.Dropout(drop_rate)
         )
+        ffn_tcn = TemporalConvNet(
+            num_inputs=enc_in, num_channels=self.tcn_channels, kernel_size=3, dropout=drop_rate
+        )
         ffn1 = nn.Sequential(
             *[FFN(d_model, d_ff, nn.LeakyReLU(), drop_rate, bias) for _ in range(layer)]
-        )
-        ffn_tcn = TemporalConvNet(
-            num_inputs=enc_in, num_channels=tcn_channels, kernel_size=3, dropout=drop_rate
         )
         self.mean_ffn = copy.deepcopy(ffn1)
         self.std_ffn  = copy.deepcopy(ffn_tcn)
         self.mean_pred = nn.Linear(d_model, pred_len, bias=bias)
         self.std_pred  = nn.Linear(d_model, pred_len, bias=bias)
+        self.down_sampling_window = 2
+        self.down_sampling_layers = 3
+        self.predict_layers = torch.nn.ModuleList(
+            [
+                torch.nn.Linear(
+                    seq_len // (self.down_sampling_window ** i),
+                    pred_len,
+                )
+                for i in range(self.down_sampling_layers + 1)
+            ]
+        )
 
     def forward(
         self,
@@ -417,7 +450,9 @@ class OfficialAPN(nn.Module):
         pd_model:     Hidden dimension d_model for Statics_MLP (default 128).
         pd_ff:        FFN hidden dimension d_ff for Statics_MLP (default 128).
         pe_layers:    Number of FFN layers in mean_ffn (default 2).
-        tcn_channels: TCN channel list for std_ffn (default [16,32,64,32,enc_in]).
+        tcn_channels: TCN channel list for std_ffn.  If omitted, selected from
+                      data_path/dataset using the official APN.py branches.
+        data_path:    Dataset/path hint used for official TCN channel selection.
     """
 
     def __init__(
@@ -435,6 +470,7 @@ class OfficialAPN(nn.Module):
         pd_ff: int = 128,
         pe_layers: int = 2,
         tcn_channels: Optional[List[int]] = None,
+        data_path: Optional[str] = None,
     ):
         super().__init__()
         self.seq_len   = seq_len
@@ -464,7 +500,8 @@ class OfficialAPN(nn.Module):
 
         # Shared Statics_MLP
         if tcn_channels is None:
-            tcn_channels = [16, 32, 64, 32, enc_in]
+            tcn_channels = official_tcn_channels(enc_in, data_path)
+        self.tcn_channels = list(tcn_channels)
         self.mlp = Statics_MLP(
             seq_len=seq_len,
             d_model=pd_model,
@@ -473,7 +510,8 @@ class OfficialAPN(nn.Module):
             pred_len=pred_len,
             drop_rate=dr,
             layer=pe_layers,
-            tcn_channels=tcn_channels,
+            tcn_channels=self.tcn_channels,
+            data_path=data_path,
         )
 
     # ------------------------------------------------------------------

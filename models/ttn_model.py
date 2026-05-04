@@ -7,7 +7,17 @@ import torch.nn as nn
 
 from ttn_norm.backbones import build_backbone
 from ttn_norm.models.local_tf_norm.local_norm import LocalTFNorm, LocalTFNormState
-from ttn_norm.normalizations import DishTS, FAN, No, RevIN, SAN, SANRouteNorm
+from ttn_norm.normalizations import (
+    DishTS,
+    FAN,
+    No,
+    RevIN,
+    SAN,
+    SANRouteNorm,
+    SANPhasePatchFilterNorm,
+    SANPhaseResidualGainNorm,
+    PointMeanPhaseNorm,
+)
 
 
 class TTNModel(nn.Module):
@@ -17,6 +27,7 @@ class TTNModel(nn.Module):
         backbone_kwargs: dict,
         norm_model: Optional[nn.Module] = None,
         is_former: Optional[bool] = None,
+        effective_label_len: Optional[int] = None,
     ):
         super().__init__()
         self.backbone_type = backbone_type
@@ -28,6 +39,13 @@ class TTNModel(nn.Module):
             self.is_former = "former" in name or name in former_names
         else:
             self.is_former = is_former
+        if effective_label_len is not None:
+            self.effective_label_len = effective_label_len
+        else:
+            self.effective_label_len = min(
+                backbone_kwargs.get("label_len", 0),
+                backbone_kwargs.get("seq_len", backbone_kwargs.get("label_len", 0)),
+            )
         self._last_state: Optional[LocalTFNormState] = None
 
     def normalize(
@@ -47,7 +65,7 @@ class TTNModel(nn.Module):
             # normalize() returns (normalized_x, normalized_dec_inp)
             batch_x, dec_inp = nm.normalize(batch_x, dec_inp)
 
-        elif isinstance(nm, (SAN, SANRouteNorm)):
+        elif isinstance(nm, (SAN, SANRouteNorm, SANPhasePatchFilterNorm, SANPhaseResidualGainNorm, PointMeanPhaseNorm)):
             # normalize() stores pred stats internally, returns normalized tensor.
             batch_x = nm.normalize(batch_x)
 
@@ -73,7 +91,7 @@ class TTNModel(nn.Module):
         elif isinstance(nm, (RevIN, DishTS, FAN)):
             return nm.denormalize(pred)
 
-        elif isinstance(nm, (SAN, SANRouteNorm)):
+        elif isinstance(nm, (SAN, SANRouteNorm, SANPhasePatchFilterNorm, SANPhaseResidualGainNorm, PointMeanPhaseNorm)):
             # Uses internally stored pred stats from last normalize() call.
             return nm.denormalize(pred)
 
@@ -92,16 +110,18 @@ class TTNModel(nn.Module):
         dec_inp: Optional[torch.Tensor] = None,
         dec_inp_enc: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        batch_x, dec_inp = self.normalize(batch_x, dec_inp=dec_inp)
+        x_norm, _ = self.normalize(batch_x, dec_inp=None)
         if self.is_former:
-            if dec_inp is None:
-                pred_len = getattr(self.fm, "pred_len", batch_x.shape[1])
-                dec_inp = torch.zeros(
-                    batch_x.shape[0], pred_len, batch_x.shape[2],
-                    dtype=batch_x.dtype, device=batch_x.device,
-                )
-            pred = self.fm(batch_x, batch_x_enc, dec_inp, dec_inp_enc)
+            label_len = self.effective_label_len
+            pred_len = dec_inp_enc.shape[1] - label_len if dec_inp_enc is not None else getattr(self.fm, "pred_len", batch_x.shape[1])
+            dec_label = x_norm[:, -label_len:, :]
+            dec_future = torch.zeros(
+                x_norm.size(0), pred_len, x_norm.size(-1),
+                device=x_norm.device, dtype=x_norm.dtype,
+            )
+            dec_inp_norm = torch.cat([dec_label, dec_future], dim=1)
+            pred = self.fm(x_norm, batch_x_enc, dec_inp_norm, dec_inp_enc)
         else:
-            pred = self.fm(batch_x)
+            pred = self.fm(x_norm)
         pred = self.denormalize(pred)
         return pred

@@ -147,11 +147,12 @@ class SANRouteNorm(nn.Module):
         route_path:            One of _VALID_PATHS.
         route_state:           One of _VALID_STATES.
         route_state_loss_scale: Weight for route state loss.
+        san_ablation_mode:     "none", "seq_std", or "base_mean_only".
 
         # TimeAPN parameters (only used when route_path="timeapn_correction")
         timeapn_j, timeapn_learnable, timeapn_wavelet, timeapn_dr,
         timeapn_kernel_len, timeapn_hkernel_len,
-        timeapn_pd_model, timeapn_pd_ff, timeapn_pe_layers
+        timeapn_pd_model, timeapn_pd_ff, timeapn_pe_layers, timeapn_data_path
     """
 
     def __init__(
@@ -167,6 +168,7 @@ class SANRouteNorm(nn.Module):
         route_path: str = "none",
         route_state: str = "none",
         route_state_loss_scale: float = 0.1,
+        san_ablation_mode: str = "none",
         # TimeAPN-specific (official APN defaults)
         timeapn_j: int = 1,
         timeapn_learnable: bool = True,
@@ -177,6 +179,7 @@ class SANRouteNorm(nn.Module):
         timeapn_pd_model: int = 128,
         timeapn_pd_ff: int = 128,
         timeapn_pe_layers: int = 2,
+        timeapn_data_path: Optional[str] = None,
         # B2SC inference-time update parameters
         b2sc_enable: bool = False,
         b2sc_recent_weight: float = 0.75,
@@ -188,6 +191,20 @@ class SANRouteNorm(nn.Module):
         ssc_decay_rho: float = 0.5,
         ssc_scale_beta: float = 0.5,
         ssc_trend_scale: float = 0.1,
+        # Phase correction (pure baseline only: route_path="none", route_state="none")
+        use_phase: bool = False,
+        phase_k: int = 8,
+        phase_zero_init: bool = True,
+        phase_loss_weight: float = 1.0,
+        phase_energy_gate: bool = False,
+        phase_energy_gate_center: float = 0.25,
+        phase_energy_gate_temp: float = 0.05,
+        phase_energy_gate_strength: float = 0.3,
+        phase_energy_gate_min: float = 0.7,
+        phase_energy_gate_eps: float = 1e-8,
+        phase_energy_mean_gate: bool = False,
+        phase_energy_mean_strength: float = 0.3,
+        phase_output_zero_mean: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -204,6 +221,24 @@ class SANRouteNorm(nn.Module):
         self.route_path  = route_path
         self.route_state = route_state
         self.route_state_loss_scale = float(route_state_loss_scale)
+        self.san_ablation_mode = str(san_ablation_mode)
+        if self.san_ablation_mode not in ("none", "seq_std", "base_mean_only"):
+            raise ValueError(
+                "san_ablation_mode must be one of "
+                "('none', 'seq_std', 'base_mean_only'), "
+                f"got '{self.san_ablation_mode}'."
+            )
+        if self.san_ablation_mode != "none":
+            if route_path != "none" or route_state != "none":
+                raise ValueError(
+                    "san_ablation_mode requires route_path='none' and "
+                    "route_state='none'."
+                )
+            use_phase = False
+            phase_energy_gate = False
+            phase_energy_mean_gate = False
+            phase_output_zero_mean = False
+            phase_loss_weight = 0.0
 
         # ------------------------------------------------------------------
         # B2SC inference-time update
@@ -240,6 +275,21 @@ class SANRouteNorm(nn.Module):
         if self.ssc_enable and self.route_path != "none":
             raise ValueError("SSC supports pure SAN only.")
 
+        # Phase correction: only active for pure baseline (route_path/state both "none").
+        # Silently disabled for any other route combination.
+        self.use_phase = bool(use_phase) and (route_path == "none") and (route_state == "none")
+        self._phase_k  = int(phase_k)
+        self._phase_loss_weight = float(phase_loss_weight)
+        self.phase_energy_gate          = bool(phase_energy_gate)
+        self.phase_energy_gate_center   = float(phase_energy_gate_center)
+        self.phase_energy_gate_temp     = float(phase_energy_gate_temp)
+        self.phase_energy_gate_strength = float(phase_energy_gate_strength)
+        self.phase_energy_gate_min      = float(phase_energy_gate_min)
+        self.phase_energy_gate_eps      = float(phase_energy_gate_eps)
+        self.phase_energy_mean_gate     = bool(phase_energy_mean_gate)
+        self.phase_energy_mean_strength = float(phase_energy_mean_strength)
+        self.phase_output_zero_mean     = bool(phase_output_zero_mean)
+
         self._validate_config()
 
         self.hist_stat_len = self._compute_n_windows(self.seq_len)
@@ -247,17 +297,43 @@ class SANRouteNorm(nn.Module):
         raw_hist_len = self.hist_stat_len * self.window_len
 
         # ------------------------------------------------------------------
-        # SAN base predictor — pure SAN uses causal-EMA patch predictor;
-        # all other routes (except timeapn pair) use _SANBasePredictor.
+        # SAN base predictor:
+        #   route_path="none" + use_phase=True  → _PureSANSeqPredictor (mean+phase)
+        #   route_path="none" + use_phase=False → _SANBasePredictor
+        #   other routes (except timeapn pair)  → _SANBasePredictor
         # ------------------------------------------------------------------
         self.predictor: Optional[nn.Module] = None
-        if route_path == "none":
+        if route_path == "none" and self.san_ablation_mode == "seq_std":
             self.predictor = _PureSANSeqPredictor(
                 hist_stat_len=self.hist_stat_len,
                 pred_stat_len=self.pred_stat_len,
                 window_len=self.window_len,
                 enc_in=enc_in,
                 sigma_min=sigma_min,
+                use_phase=False,
+                phase_k=phase_k,
+                phase_zero_init=phase_zero_init,
+                state_residual_scale_init=0.1,
+            )
+        elif route_path == "none" and self.san_ablation_mode == "base_mean_only":
+            self.predictor = _SANBasePredictor(
+                hist_stat_len=self.hist_stat_len,
+                raw_hist_len=raw_hist_len,
+                pred_stat_len=self.pred_stat_len,
+                enc_in=enc_in,
+                sigma_min=sigma_min,
+            )
+        elif route_path == "none" and self.use_phase:
+            self.predictor = _PureSANSeqPredictor(
+                hist_stat_len=self.hist_stat_len,
+                pred_stat_len=self.pred_stat_len,
+                window_len=self.window_len,
+                enc_in=enc_in,
+                sigma_min=sigma_min,
+                use_phase=True,
+                phase_k=phase_k,
+                phase_zero_init=phase_zero_init,
+                state_residual_scale_init=0.1,
             )
         elif route_path != "timeapn_correction":
             self.predictor = _SANBasePredictor(
@@ -297,6 +373,7 @@ class SANRouteNorm(nn.Module):
                 pd_model=timeapn_pd_model,
                 pd_ff=timeapn_pd_ff,
                 pe_layers=timeapn_pe_layers,
+                data_path=timeapn_data_path,
             )
 
         elif route_path != "none":
@@ -501,11 +578,46 @@ class SANRouteNorm(nn.Module):
         self._last_mu_loss:           float = 0.0
         self._last_std_loss:          float = 0.0
         self._last_base_aux_loss:     float = 0.0
+        self._last_phase_loss:        float = 0.0
         self._last_route_state_loss:  float = 0.0
         self._last_aux_total:         float = 0.0
+        # phase aux cache (pure baseline + phase mode)
+        self._hist_last_patch_norm: Optional[torch.Tensor] = None  # (B, W, C) mean-normalized
+        self._phase_rot_fut_hat: Optional[torch.Tensor]    = None  # (B, P_fut, K, C, 2) residual rotation
+        self._phase_energy_gate:   Optional[torch.Tensor] = None  # (B, C)
+        self._phase_energy_r_high: Optional[torch.Tensor] = None  # (B, C)
+        self._phase_energy_risk:   Optional[torch.Tensor] = None  # (B, C)
+        self._last_phase_output_mean_abs:          float = 0.0
+        self._last_phase_output_zero_mean_applied: bool  = False
+        self._last_input_residual_rms: float = 0.0
+        # output_patch_mean_abs_before_gauge: gauge 删除了多少 patch DC。
+        self._last_output_patch_mean_abs_before_gauge: float = 0.0
+        self._last_output_rms_before_gauge: float = 0.0
+        self._last_output_rms_after_gauge: float = 0.0
+        self._last_phase_angle_abs_mean: float = 0.0
+        # phase_effect_rms: phase rotation 实际改变 backbone 输出的幅度。
+        self._last_phase_effect_rms: float = 0.0
+        self._last_phase_effect_ratio: float = 0.0
+        self._last_dc_gauge_ratio: float = 0.0
+        self._last_pred_residual_rms_after_phase: float = 0.0
+        self._last_oracle_residual_rms: float = 0.0
+        # residual_rms_ratio: 预测 residual 能量相对 oracle residual 能量是否过大或过小。
+        self._last_residual_rms_ratio: float = 0.0
         self._last_apn_loss_mean:     float = 0.0
         self._last_apn_loss_phase:    float = 0.0
         self._last_apn_loss_recon:    float = 0.0
+        self._last_apn_conv_effect_rms: float = 0.0
+        self._last_apn_conv_effect_ratio: float = 0.0
+        self._last_apn_pred_residual_rms: float = 0.0
+        self._last_apn_oracle_residual_rms: float = 0.0
+        self._last_apn_residual_rms_ratio: float = 0.0
+        self._last_apn_kernel_l1: float = 0.0
+        self._last_apn_kernel_l2: float = 0.0
+        self._last_apn_kernel_max_ratio: float = 0.0
+        self._last_apn_kernel_center_ratio: float = 0.0
+        self._last_apn_kernel_entropy: float = 0.0
+        self._last_apn_phase_abs_err: float = 0.0
+        self._last_apn_phase_cos: float = 0.0
         # B2SC cache
         self._b2sc_input_raw:             Optional[torch.Tensor] = None
         self._last_b2sc_applied:          bool                   = False
@@ -844,23 +956,168 @@ class SANRouteNorm(nn.Module):
         # Exact SAN reshape-based path (pure SAN)
         # ==============================================================
         if is_pure_san:
-            P_hist = self.hist_stat_len
+            P_hist    = self.hist_stat_len
             x_patches = x.reshape(B, P_hist, self.window_len, C)
             mu_hist   = x_patches.mean(dim=2)
             std_hist  = x_patches.std(dim=2).clamp(min=self.sigma_min)
             self._mu_hist  = mu_hist
             self._std_hist = std_hist
+            anchor = mu_hist.mean(dim=1, keepdim=True)
 
-            z_san = (
+            # ----------------------------------------------------------
+            # Ablation: PureSANSeqPredictor architecture with std
+            # normalize/denorm restored.
+            # ----------------------------------------------------------
+            if self.san_ablation_mode == "seq_std":
+                if not isinstance(self.predictor, _PureSANSeqPredictor):
+                    raise RuntimeError(
+                        "seq_std ablation must use _PureSANSeqPredictor"
+                    )
+                z_patches = (
+                    (x_patches - mu_hist.unsqueeze(2))
+                    / (std_hist.unsqueeze(2) + self.epsilon)
+                )
+                z_out = z_patches.reshape(B, T, C)
+                self._hist_last_patch_norm = None
+
+                mu_fut_hat, std_fut_hat = self.predictor.predict_mean_std_seq(
+                    mu_hist=mu_hist,
+                    std_hist=std_hist,
+                    anchor=anchor,
+                    raw_patches=x_patches.detach(),
+                    z_patches=z_patches.detach(),
+                    eps=self.epsilon,
+                )
+                self._base_mu_fut_hat  = mu_fut_hat
+                self._base_std_fut_hat = std_fut_hat
+                self._pred_time_stats  = self._window_stats_to_time_stats(
+                    mu_fut_hat, std_fut_hat, self.pred_len
+                )
+                bts_m, bts_s = self._split_stats(self._pred_time_stats)
+                self._base_time_mean = bts_m
+                self._base_time_std  = bts_s
+                return z_out
+
+            # ----------------------------------------------------------
+            # Ablation: original SAN predictor architecture, mean-only
+            # normalize/denorm.  std is computed for predictor input but
+            # ignored by recovery and aux loss.
+            # ----------------------------------------------------------
+            if self.san_ablation_mode == "base_mean_only":
+                if not isinstance(self.predictor, _SANBasePredictor):
+                    raise RuntimeError(
+                        "base_mean_only ablation must use _SANBasePredictor"
+                    )
+                z_patches = x_patches - mu_hist.unsqueeze(2)
+                z_out = z_patches.reshape(B, T, C)
+                self._hist_last_patch_norm = None
+
+                xbar_raw = x_patches.reshape(B, -1, C).detach()
+                mu_fut_hat, _std_unused = self.predictor.predict(
+                    mu_hist=mu_hist,
+                    std_hist=std_hist,
+                    xbar=None,
+                    anchor=anchor,
+                    xbar_raw=xbar_raw,
+                )
+                self._base_mu_fut_hat  = mu_fut_hat
+                self._base_std_fut_hat = None
+                std_compat = std_hist.mean(dim=1, keepdim=True).expand(
+                    -1, self.pred_stat_len, -1
+                ).contiguous()
+                self._pred_time_stats  = self._window_stats_to_time_stats(
+                    mu_fut_hat, std_compat, self.pred_len
+                )
+                bts_m, bts_s = self._split_stats(self._pred_time_stats)
+                self._base_time_mean = bts_m
+                self._base_time_std  = bts_s
+                return z_out
+
+            # ----------------------------------------------------------
+            # Pure baseline + phase: mean-normalization only
+            # Backbone input space is mean-normalized, NOT std-normalized.
+            # ----------------------------------------------------------
+            if self.use_phase:
+                if self.phase_energy_gate or self.phase_energy_mean_gate:
+                    period_len = self.window_len
+                    x_ref = x[:, -period_len:, :]                    # (B, W, C)
+                    z_ref = x_ref - x_ref.mean(dim=1, keepdim=True)
+                    X_ref = torch.fft.rfft(z_ref, dim=1)             # (B, W//2+1, C)
+                    max_bin = period_len // 2
+                    low_k   = self._phase_k
+                    if low_k + 1 <= max_bin:
+                        E_high  = (X_ref[:, low_k + 1:max_bin + 1, :].abs() ** 2).sum(dim=1)
+                        E_total = (X_ref[:, 1:max_bin + 1, :].abs() ** 2).sum(dim=1) + self.phase_energy_gate_eps
+                        r_high  = E_high / E_total                   # (B, C)
+                        s0_val  = -self.phase_energy_gate_center / self.phase_energy_gate_temp
+                        s0 = torch.sigmoid(
+                            torch.tensor(s0_val, device=x.device, dtype=x.dtype)
+                        )
+                        s    = torch.sigmoid((r_high - self.phase_energy_gate_center) / self.phase_energy_gate_temp)
+                        risk = (s - s0) / (1.0 - s0 + self.phase_energy_gate_eps)
+                        risk = risk.clamp(0.0, 1.0)
+                        gate = (1.0 - self.phase_energy_gate_strength * risk).clamp(
+                            self.phase_energy_gate_min, 1.0
+                        )
+                    else:
+                        r_high = torch.zeros(B, C, device=x.device, dtype=x.dtype)
+                        gate   = torch.ones(B, C, device=x.device, dtype=x.dtype)
+                        risk   = torch.zeros(B, C, device=x.device, dtype=x.dtype)
+                    self._phase_energy_gate   = gate
+                    self._phase_energy_r_high = r_high
+                    self._phase_energy_risk   = risk
+
+                z_patches = x_patches - mu_hist.unsqueeze(2)          # (B, P_hist, W, C)
+                self._last_input_residual_rms = float(
+                    torch.sqrt(z_patches.detach().pow(2).mean() + self.epsilon).item()
+                )
+                z_out     = z_patches.reshape(B, T, C)
+                # Cache last mean-normalized patch for phase loss supervision
+                self._hist_last_patch_norm = z_patches[:, -1, :, :].detach()   # (B, W, C)
+
+                mu_fut_hat, phase_rot_fut_hat = self.predictor.predict_mean_phase(
+                    mu_hist=mu_hist,
+                    anchor=anchor,
+                    raw_patches=x_patches.detach(),
+                    z_patches=z_patches.detach(),
+                    eps=self.epsilon,
+                )
+                self._base_mu_fut_hat   = mu_fut_hat
+                self._phase_rot_fut_hat = phase_rot_fut_hat
+                # compat only — never used for denorm/loss in pure phase mode
+                std_compat = std_hist.mean(dim=1, keepdim=True).expand(
+                    -1, self.pred_stat_len, -1
+                ).contiguous()
+                self._base_std_fut_hat = std_compat
+                self._pred_time_stats  = self._window_stats_to_time_stats(
+                    mu_fut_hat, std_compat, self.pred_len
+                )
+                bts_m, bts_s = self._split_stats(self._pred_time_stats)
+                self._base_time_mean = bts_m
+                self._base_time_std  = bts_s
+                return z_out
+
+            # ----------------------------------------------------------
+            # Pure SAN (use_phase=False): exact original z = (x-mu)/std
+            # ----------------------------------------------------------
+            if not isinstance(self.predictor, _SANBasePredictor):
+                raise RuntimeError(
+                    "pure SAN without phase must use _SANBasePredictor"
+                )
+            z_patches = (
                 (x_patches - mu_hist.unsqueeze(2))
                 / (std_hist.unsqueeze(2) + self.epsilon)
-            ).reshape(B, T, C)
+            )  # (B, P_hist, W, C)
+            z_san = z_patches.reshape(B, T, C)
+            self._hist_last_patch_norm = None
 
-            xbar_raw = x.detach().reshape(B, -1, C)
-            anchor   = mu_hist.mean(dim=1, keepdim=True)
+            xbar_raw = x_patches.reshape(B, -1, C).detach()
             mu_base_fut, std_base_fut = self.predictor.predict(
-                mu_hist, std_hist, anchor,
-                raw_patches=x_patches.detach(), eps=self.epsilon,
+                mu_hist=mu_hist,
+                std_hist=std_hist,
+                xbar=None,
+                anchor=anchor,
+                xbar_raw=xbar_raw,
             )
             self._base_mu_fut_hat  = mu_base_fut
             self._base_std_fut_hat = std_base_fut
@@ -963,15 +1220,15 @@ class SANRouteNorm(nn.Module):
             pred_m, pred_s = self._apn_pred_ms  # (B, C, pred_len) each
 
             # seq_ms of model output — needed for phase supervision in loss
-            y_BCT = y_norm.detach().transpose(-1, -2)  # (B, C, pred_len)
+            y_BCT = y_norm.transpose(-1, -2)  # (B, C, pred_len)
             _, (seq_m_y, seq_s_y) = self.apn_module.norm_sliding(y_BCT)
             # seq_s_y: (B, C, pred_len) — phase of model output
 
             # Raw predicted station tensor: only pred_m and pred_s
             # This is the official APN semantics: pred_s is used for phase compensation
-            station_pred_raw = torch.cat(
-                [pred_m, pred_s], dim=1
-            ).transpose(-1, -2)   # (B, pred_len, 2C)
+            station_pred_raw = self.apn_module.build_station_pred_tensor(
+                pred_m, pred_s
+            )  # (B, pred_len, 2C)
 
             # Loss station tensor: combined phase = seq_s_y + pred_s for phase supervision
             station_pred_loss = torch.cat(
@@ -980,6 +1237,43 @@ class SANRouteNorm(nn.Module):
 
             # de_normalize with raw predicted station (official semantics)
             y_out = self.apn_module.de_normalize(y_norm, station_pred_raw)
+            mean_time = pred_m.transpose(-1, -2)
+            y_conv_residual = y_out - mean_time
+            y_norm_rms = torch.sqrt(y_norm.detach().pow(2).mean() + self.epsilon)
+            apn_conv_effect = torch.sqrt(
+                (y_conv_residual.detach() - y_norm.detach()).pow(2).mean()
+                + self.epsilon
+            )
+            self._last_apn_conv_effect_rms = float(apn_conv_effect.detach().item())
+            self._last_apn_conv_effect_ratio = float(
+                (apn_conv_effect / (y_norm_rms + self.epsilon)).detach().item()
+            )
+            self._last_apn_pred_residual_rms = float(
+                torch.sqrt(y_conv_residual.detach().pow(2).mean() + self.epsilon).item()
+            )
+
+            half = station_pred_raw.shape[-1] // 2
+            pred_phase = station_pred_raw[..., half:]  # (B, pred_len, C)
+            kernel_raw = torch.fft.ifft(
+                torch.exp(1j * pred_phase.transpose(-1, -2)), dim=-1
+            ).transpose(-1, -2)
+            kernel = torch.abs(kernel_raw)
+            kernel_sum = kernel.sum(dim=1)
+            kernel_l2 = torch.sqrt(kernel.pow(2).sum(dim=1))
+            kernel_max = kernel.max(dim=1).values
+            center = kernel.shape[1] // 2
+            kernel_center = kernel[:, center, :]
+            p_kernel = kernel / (kernel_sum.unsqueeze(1) + self.epsilon)
+            kernel_entropy = -(p_kernel * torch.log(p_kernel + self.epsilon)).sum(dim=1)
+            self._last_apn_kernel_l1 = float(kernel_sum.detach().mean().item())
+            self._last_apn_kernel_l2 = float(kernel_l2.detach().mean().item())
+            self._last_apn_kernel_max_ratio = float(
+                (kernel_max / (kernel_sum + self.epsilon)).detach().mean().item()
+            )
+            self._last_apn_kernel_center_ratio = float(
+                (kernel_center / (kernel_sum + self.epsilon)).detach().mean().item()
+            )
+            self._last_apn_kernel_entropy = float(kernel_entropy.detach().mean().item())
 
             # Cache for loss
             self._apn_station_pred_raw  = station_pred_raw
@@ -994,6 +1288,151 @@ class SANRouteNorm(nn.Module):
         # Pure SAN exact reshape-based denorm
         # ==============================================================
         if self.route_path == "none":
+            if self.san_ablation_mode == "seq_std":
+                B, _, C = y_norm.shape
+                P_fut = self.pred_stat_len
+                W = self.window_len
+                mu_fut = self._base_mu_fut_hat
+                std_fut = self._base_std_fut_hat
+                if mu_fut is None or std_fut is None:
+                    return y_norm
+                if T != self.pred_len:
+                    ts = self._window_stats_to_time_stats(mu_fut, std_fut, T)
+                    mu, sig = self._split_stats(ts)
+                    return (y_norm * (sig + self.epsilon) + mu).contiguous()
+                y_patches = y_norm.reshape(B, P_fut, W, C)
+                y_residual = y_patches * (std_fut.unsqueeze(2) + self.epsilon)
+                self._last_pred_residual_rms_after_phase = float(
+                    torch.sqrt(y_residual.detach().pow(2).mean() + self.epsilon).item()
+                )
+                y_out = y_residual + mu_fut.unsqueeze(2)
+                return y_out.reshape(B, self.pred_len, C).contiguous()
+
+            if self.san_ablation_mode == "base_mean_only":
+                B, _, C = y_norm.shape
+                P_fut = self.pred_stat_len
+                W = self.window_len
+                mu_fut = self._base_mu_fut_hat
+                if mu_fut is None:
+                    return y_norm
+                if T != self.pred_len:
+                    mu_time = self._patch_features_to_time(mu_fut, T)
+                    return (y_norm + mu_time).contiguous()
+                y_patches = y_norm.reshape(B, P_fut, W, C)
+                self._last_pred_residual_rms_after_phase = float(
+                    torch.sqrt(y_patches.detach().pow(2).mean() + self.epsilon).item()
+                )
+                y_out = y_patches + mu_fut.unsqueeze(2)
+                return y_out.reshape(B, self.pred_len, C).contiguous()
+
+            # ----------------------------------------------------------
+            # Pure baseline + phase: mean + phase main chain.
+            # pred_std is NOT used for output recovery here.
+            # ----------------------------------------------------------
+            if self.use_phase and self._phase_rot_fut_hat is not None:
+                B, _, C = y_norm.shape
+                P_fut   = self.pred_stat_len
+                W       = self.window_len
+                K       = self._phase_k
+                mu_fut  = self._base_mu_fut_hat          # (B, P_fut, C)
+
+                if self.phase_energy_mean_gate and self._phase_energy_risk is not None:
+                    risk      = self._phase_energy_risk              # (B, C)
+                    w         = (self.phase_energy_mean_strength * risk[:, None, :]).clamp(0.0, 1.0)
+                    mu_anchor = mu_fut.mean(dim=1, keepdim=True)     # (B, 1, C)
+                    mu_fut    = (1.0 - w) * mu_fut + w * mu_anchor
+
+                if T != self.pred_len:
+                    # Fallback for non-standard T (e.g. validation with different length):
+                    # broadcast mean over time and add to y_norm (std=1 in mean-norm space).
+                    mu_time = self._patch_features_to_time(mu_fut, T)  # (B, T, C)
+                    return (mu_time + y_norm).contiguous()
+
+                y_patches = y_norm.reshape(B, P_fut, W, C)            # (B, P_fut, W, C)
+
+                patch_mean = y_patches.mean(dim=2, keepdim=True)       # (B, P_fut, 1, C)
+                self._last_phase_output_mean_abs = float(
+                    patch_mean.detach().abs().mean().item()
+                )
+                self._last_output_patch_mean_abs_before_gauge = float(
+                    patch_mean.detach().abs().mean().item()
+                )
+                self._last_output_rms_before_gauge = float(
+                    torch.sqrt(y_patches.detach().pow(2).mean() + self.epsilon).item()
+                )
+                self._last_dc_gauge_ratio = (
+                    self._last_output_patch_mean_abs_before_gauge
+                    / (self._last_output_rms_before_gauge + self.epsilon)
+                )
+
+                if self.phase_output_zero_mean:
+                    y_patches = y_patches - patch_mean
+                    self._last_phase_output_zero_mean_applied = True
+                else:
+                    self._last_phase_output_zero_mean_applied = False
+                self._last_output_rms_after_gauge = float(
+                    torch.sqrt(y_patches.detach().pow(2).mean() + self.epsilon).item()
+                )
+                y_before_phase = y_patches.detach()
+
+                # Apply predicted phase rotation in frequency domain
+                BP     = B * P_fut
+                y_flat = y_patches.reshape(BP, W, C)
+                Y_flat = torch.fft.rfft(y_flat, dim=1)                # (BP, W//2+1, C)
+
+                K_eff     = min(K, Y_flat.shape[1] - 1)               # skip DC bin 0
+                phase_bp  = self._phase_rot_fut_hat.reshape(BP, K, C, 2)
+                a = phase_bp[:, :K_eff, :, 0]                         # (BP, K_eff, C)
+                b = phase_bp[:, :K_eff, :, 1]
+                r_re   = 1.0 + a
+                r_im   = b
+                norm_r = torch.sqrt(r_re.pow(2) + r_im.pow(2) + self.epsilon)
+                r      = torch.complex(r_re / norm_r, r_im / norm_r)  # (BP, K_eff, C)
+
+                Y_tilde = Y_flat.clone()
+                if self.phase_energy_gate and self._phase_energy_gate is not None:
+                    gate      = self._phase_energy_gate                         # (B, C)
+                    angle_hat = torch.atan2(r.imag, r.real).reshape(B, P_fut, K_eff, C)
+                    angle_hat = angle_hat * gate[:, None, None, :]
+                    self._last_phase_angle_abs_mean = (
+                        float(angle_hat.detach().abs().mean().item())
+                        if K_eff > 0 else 0.0
+                    )
+                    r_gated   = torch.polar(
+                        torch.ones_like(angle_hat), angle_hat
+                    ).reshape(BP, K_eff, C)
+                    Y_tilde[:, 1:K_eff + 1, :] = Y_flat[:, 1:K_eff + 1, :] * r_gated
+                else:
+                    angle = torch.atan2(r.imag, r.real)
+                    self._last_phase_angle_abs_mean = (
+                        float(angle.detach().abs().mean().item())
+                        if K_eff > 0 else 0.0
+                    )
+                    Y_tilde[:, 1:K_eff + 1, :] = Y_flat[:, 1:K_eff + 1, :] * r
+                y_phase = torch.fft.irfft(Y_tilde, n=W, dim=1)        # (BP, W, C)
+                y_phase = y_phase.reshape(B, P_fut, W, C)
+                self._last_phase_effect_rms = float(
+                    torch.sqrt(
+                        (y_phase.detach() - y_before_phase).pow(2).mean()
+                        + self.epsilon
+                    ).item()
+                )
+                self._last_phase_effect_ratio = (
+                    self._last_phase_effect_rms
+                    / (self._last_output_rms_before_gauge + self.epsilon)
+                )
+                self._last_pred_residual_rms_after_phase = float(
+                    torch.sqrt(y_phase.detach().pow(2).mean() + self.epsilon).item()
+                )
+
+                # Restore mean
+                y_out = (y_phase + mu_fut.unsqueeze(2)).reshape(B, self.pred_len, C)
+                return y_out.contiguous()
+
+            # ----------------------------------------------------------
+            # Pure SAN (use_phase=False): original std-based denorm.
+            # SSC / B2SC only apply to the std-based path.
+            # ----------------------------------------------------------
             mu_fut_cal, std_fut_cal = self._apply_ssc_to_patch_stats(
                 self._base_mu_fut_hat, self._base_std_fut_hat
             )
@@ -1006,7 +1445,7 @@ class SANRouteNorm(nn.Module):
                 return (mu + (sig + self.epsilon) * y_norm).contiguous()
 
             B, _, C = y_norm.shape
-            P_fut = self.pred_stat_len
+            P_fut     = self.pred_stat_len
             y_patches = y_norm.reshape(B, P_fut, self.window_len, C)
             y_san = (
                 y_patches * (std_fut_cal.unsqueeze(2) + self.epsilon)
@@ -1077,20 +1516,170 @@ class SANRouteNorm(nn.Module):
         oracle_mu, oracle_std = self._compute_window_stats(true_windows)
         return true_windows, oracle_mu, oracle_std
 
+    # ------------------------------------------------------------------
+    # Phase correction (pure baseline only)
+    # ------------------------------------------------------------------
+
+    def _apply_phase_correction(
+        self, y_patches: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply cached phase rotation to future patches.
+
+        Phase prediction is completed in normalize() and stored in
+        ``self._phase_rot_fut_hat``.  This method only reads from that cache
+        and applies the rotation — no re-forward of the phase predictor.
+
+        Args:
+            y_patches: (B, P_fut, W, C) — mean-normalized backbone output
+                       reshaped into future patches.
+        Returns:
+            y_patches_phase: same shape (B, P_fut, W, C).
+        """
+        if self._phase_rot_fut_hat is None:
+            return y_patches
+
+        B, P_fut, W, C = y_patches.shape
+        K      = self._phase_k
+        BP     = B * P_fut
+        y_flat = y_patches.reshape(BP, W, C)
+        Y_flat = torch.fft.rfft(y_flat, dim=1)          # (BP, W//2+1, C)
+
+        K_eff    = min(K, Y_flat.shape[1] - 1)
+        phase_bp = self._phase_rot_fut_hat.reshape(BP, K, C, 2)
+        a = phase_bp[:, :K_eff, :, 0]
+        b = phase_bp[:, :K_eff, :, 1]
+        r_re   = 1.0 + a
+        r_im   = b
+        norm_r = torch.sqrt(r_re.pow(2) + r_im.pow(2) + self.epsilon)
+        r      = torch.complex(r_re / norm_r, r_im / norm_r)   # (BP, K_eff, C)
+
+        Y_tilde = Y_flat.clone()
+        Y_tilde[:, 1:K_eff + 1, :] = Y_flat[:, 1:K_eff + 1, :] * r
+        y_tilde = torch.fft.irfft(Y_tilde, n=W, dim=1)          # (BP, W, C)
+        return y_tilde.reshape(B, P_fut, W, C)
+
+    def _compute_phase_aux_loss(self, y_true: torch.Tensor) -> torch.Tensor:
+        """Pure-baseline phase supervision loss (mean + phase main chain).
+
+        Target: oracle phase drift from the last historical mean-normalized
+        patch to each oracle future mean-normalized patch, measured on
+        low-frequency bins 1..K.
+
+        Supervision is applied to the cached ``_phase_rot_fut_hat`` that was
+        already computed in ``normalize()``.  No re-forward of the phase
+        predictor here.
+
+        Returns 0 if any required precondition is unmet.
+        """
+        dev  = y_true.device
+        zero = torch.tensor(0.0, device=dev)
+        if (
+            not self.use_phase
+            or self.route_path != "none"
+            or self.route_state != "none"
+            or self._hist_last_patch_norm is None
+            or self._phase_rot_fut_hat is None
+        ):
+            return zero
+
+        B     = y_true.shape[0]
+        P_fut = self.pred_stat_len
+        W     = self.window_len
+        K     = self._phase_k
+        C     = y_true.shape[-1]
+
+        # --- oracle future mean-normalized patches (no std division) ---
+        y_patches  = y_true.reshape(B, P_fut, W, C)               # (B, P_fut, W, C)
+        oracle_mu  = y_patches.mean(dim=2)                         # (B, P_fut, C)
+        y_oracle_mn = y_patches - oracle_mu.unsqueeze(2)           # (B, P_fut, W, C)
+
+        # --- rfft of hist last mean-normalized patch and oracle future patches ---
+        Y_hist   = torch.fft.rfft(self._hist_last_patch_norm, dim=1)  # (B, W//2+1, C)
+        BP       = B * P_fut
+        Y_oracle = torch.fft.rfft(
+            y_oracle_mn.reshape(BP, W, C), dim=1
+        )  # (BP, W//2+1, C)
+
+        n_bins = Y_hist.shape[1]
+        K_eff  = min(K, n_bins - 1)   # exclude DC bin 0
+
+        Y_h = Y_hist[:, 1:K_eff + 1, :]                           # (B,  K_eff, C)
+        Y_o = Y_oracle[:, 1:K_eff + 1, :]                         # (BP, K_eff, C)
+
+        # Oracle phase drift = Y_oracle * conj(Y_hist), normalised to unit complex
+        Y_h_rep   = Y_h.unsqueeze(1).expand(-1, P_fut, -1, -1).reshape(BP, K_eff, C)
+        drift_raw = Y_o * Y_h_rep.conj()                           # (BP, K_eff, C)
+        drift_abs = drift_raw.abs().clamp(min=self.epsilon)
+        R_target  = drift_raw / drift_abs                          # unit complex
+
+        # --- predicted rotation: read from cache, do NOT re-run predictor ---
+        phase_bp = self._phase_rot_fut_hat.reshape(BP, K, C, 2)
+        a = phase_bp[:, :K_eff, :, 0]                             # (BP, K_eff, C)
+        b = phase_bp[:, :K_eff, :, 1]
+        r_re   = 1.0 + a
+        r_im   = b
+        norm_r = torch.sqrt(r_re.pow(2) + r_im.pow(2) + self.epsilon)
+        R_pred = torch.complex(r_re / norm_r, r_im / norm_r)      # (BP, K_eff, C)
+
+        # MSE on unit-complex plane (re and im separately)
+        loss_re = F.mse_loss(R_pred.real, R_target.real.detach())
+        loss_im = F.mse_loss(R_pred.imag, R_target.imag.detach())
+        return loss_re + loss_im
+
     def compute_base_aux_loss(self, y_true: torch.Tensor) -> torch.Tensor:
         """Base SAN stats loss (Stage 1).  Not used for timeapn pair."""
         if self.route_path == "timeapn_correction":
             return torch.tensor(0.0, device=y_true.device)
 
-        if self._base_mu_fut_hat is None or self._base_std_fut_hat is None:
+        if self._base_mu_fut_hat is None:
+            return torch.tensor(0.0, device=y_true.device)
+        if self.san_ablation_mode != "base_mean_only" and self._base_std_fut_hat is None:
             return torch.tensor(0.0, device=y_true.device)
 
-        _, oracle_mu, oracle_std = self._compute_oracle_stats(y_true)
+        true_windows, oracle_mu, oracle_std = self._compute_oracle_stats(y_true)
+        if self.san_ablation_mode in ("seq_std", "base_mean_only"):
+            B, _, C = y_true.shape
+            true_windows = y_true.reshape(B, self.pred_stat_len, self.window_len, C)
+            oracle_mu = true_windows.mean(dim=2)
+            oracle_std = true_windows.std(dim=2).clamp_min(self.sigma_min)
+            oracle_residual = true_windows - oracle_mu.unsqueeze(2)
+            oracle_rms = torch.sqrt(oracle_residual.pow(2).mean() + self.epsilon)
+            self._last_oracle_residual_rms = float(oracle_rms.detach().item())
+            if self._last_pred_residual_rms_after_phase > 0:
+                self._last_residual_rms_ratio = (
+                    self._last_pred_residual_rms_after_phase
+                    / (self._last_oracle_residual_rms + self.epsilon)
+                )
 
-        if self.route_path == "lp_state_correction":
+        if self.use_phase and self.route_path == "none":
+            oracle_residual = true_windows - oracle_mu.unsqueeze(2)
+            oracle_rms = torch.sqrt(oracle_residual.pow(2).mean() + self.epsilon)
+            self._last_oracle_residual_rms = float(oracle_rms.detach().item())
+            if self._last_pred_residual_rms_after_phase > 0:
+                self._last_residual_rms_ratio = (
+                    self._last_pred_residual_rms_after_phase
+                    / (self._last_oracle_residual_rms + self.epsilon)
+                )
+
+        if self.san_ablation_mode == "seq_std":
+            mu_loss  = F.mse_loss(self._base_mu_fut_hat, oracle_mu)
+            std_loss = F.mse_loss(self._base_std_fut_hat, oracle_std)
+            base_aux = self.w_mu * mu_loss + self.w_std * std_loss
+        elif self.san_ablation_mode == "base_mean_only":
+            mu_loss  = F.mse_loss(self._base_mu_fut_hat, oracle_mu)
+            std_loss = torch.tensor(0.0, device=y_true.device)
+            base_aux = self.w_mu * mu_loss
+        elif self.route_path == "lp_state_correction":
             mu_loss  = torch.tensor(0.0, device=y_true.device)
             std_loss = F.mse_loss(self._base_std_fut_hat, oracle_std)
             base_aux = self.w_std * std_loss
+        elif self.use_phase:
+            # Pure baseline + phase: main chain is mean + phase.
+            # std is not used for output recovery, so its loss is excluded
+            # from base_aux.  phase_loss is added separately below.
+            mu_loss  = F.mse_loss(self._base_mu_fut_hat, oracle_mu)
+            std_loss = torch.tensor(0.0, device=y_true.device)
+            base_aux = self.w_mu * mu_loss
         else:
             mu_loss  = F.mse_loss(self._base_mu_fut_hat, oracle_mu)
             std_loss = F.mse_loss(self._base_std_fut_hat, oracle_std)
@@ -1099,8 +1688,17 @@ class SANRouteNorm(nn.Module):
         self._last_mu_loss       = float(mu_loss.detach().item())
         self._last_std_loss      = float(std_loss.detach().item())
         self._last_base_aux_loss = float(base_aux.detach().item())
-        self._last_aux_total     = self._last_base_aux_loss
-        return base_aux
+
+        # Pure baseline phase aux (returns 0 when use_phase=False)
+        if self.san_ablation_mode != "none":
+            phase_loss = torch.tensor(0.0, device=y_true.device)
+        else:
+            phase_loss = self._compute_phase_aux_loss(y_true)
+        self._last_phase_loss = float(phase_loss.detach().item())
+        total = base_aux + self._phase_loss_weight * phase_loss
+
+        self._last_aux_total = float(total.detach().item())
+        return total
 
     def compute_route_state_loss(self, y_true: torch.Tensor) -> torch.Tensor:
         """Route state loss.
@@ -1138,9 +1736,23 @@ class SANRouteNorm(nn.Module):
             # station_ture for y_true: cat([true_m, true_phi]) → (B, pred_len, 2C)
             true_mean_flat  = true_m.transpose(-1, -2)   # (B, pred_len, C)
             true_phase_flat = true_phi.transpose(-1, -2)  # (B, pred_len, C)
+            oracle_residual = y_true - true_mean_flat
+            oracle_rms = torch.sqrt(oracle_residual.detach().pow(2).mean() + self.epsilon)
+            self._last_apn_oracle_residual_rms = float(oracle_rms.detach().item())
+            if self._last_apn_pred_residual_rms > 0:
+                self._last_apn_residual_rms_ratio = (
+                    self._last_apn_pred_residual_rms
+                    / (self._last_apn_oracle_residual_rms + self.epsilon)
+                )
 
             loss_mean  = F.mse_loss(pred_mean_flat,  true_mean_flat)
             loss_phase = F.mse_loss(combined_phase,  true_phase_flat)
+            phase_delta = torch.atan2(
+                torch.sin(combined_phase.detach() - true_phase_flat.detach()),
+                torch.cos(combined_phase.detach() - true_phase_flat.detach()),
+            )
+            self._last_apn_phase_abs_err = float(phase_delta.abs().mean().item())
+            self._last_apn_phase_cos = float(torch.cos(phase_delta).mean().item())
 
             # Reconstruction loss: y_out vs y_true
             if self._apn_y_out is not None:
@@ -1208,10 +1820,12 @@ class SANRouteNorm(nn.Module):
 
     def get_last_aux_stats(self) -> dict:
         return {
+            "san_ablation_mode": self.san_ablation_mode,
             "aux_total":         self._last_aux_total,
             "base_aux_loss":     self._last_base_aux_loss,
             "mu_loss":           self._last_mu_loss,
             "std_loss":          self._last_std_loss,
+            "phase_loss":        self._last_phase_loss,
             "route_state_loss":  self._last_route_state_loss,
             # TimeAPN decomposition
             "apn_loss_mean":     self._last_apn_loss_mean,
@@ -1250,6 +1864,70 @@ class SANRouteNorm(nn.Module):
                 if self._lp_mu_fut_hat is not None and self._oracle_lp_mu_fut is not None
                 else 0.0
             ),
+            # Phase energy gate stats (only meaningful when phase_energy_gate=True)
+            "phase_energy_gate_mean": (
+                float(self._phase_energy_gate.mean().item())
+                if self._phase_energy_gate is not None else 1.0
+            ),
+            "phase_energy_gate_min": (
+                float(self._phase_energy_gate.min().item())
+                if self._phase_energy_gate is not None else 1.0
+            ),
+            "phase_energy_gate_max": (
+                float(self._phase_energy_gate.max().item())
+                if self._phase_energy_gate is not None else 1.0
+            ),
+            "phase_energy_r_high_mean": (
+                float(self._phase_energy_r_high.mean().item())
+                if self._phase_energy_r_high is not None else 0.0
+            ),
+            "phase_energy_r_high_q75": (
+                float(torch.quantile(self._phase_energy_r_high.float(), 0.75).item())
+                if self._phase_energy_r_high is not None else 0.0
+            ),
+            "phase_energy_risk_mean": (
+                float(self._phase_energy_risk.mean().item())
+                if self._phase_energy_risk is not None else 0.0
+            ),
+            "phase_energy_active_ratio": (
+                float((self._phase_energy_risk > 0.05).float().mean().item())
+                if self._phase_energy_risk is not None else 0.0
+            ),
+            # Mean gate stats
+            "phase_energy_mean_gate_enabled": 1.0 if self.phase_energy_mean_gate else 0.0,
+            "phase_energy_mean_strength": self.phase_energy_mean_strength,
+            "phase_energy_mean_mix_mean": (
+                float((self.phase_energy_mean_strength * self._phase_energy_risk).mean().item())
+                if self.phase_energy_mean_gate and self._phase_energy_risk is not None else 0.0
+            ),
+            "phase_output_mean_abs":           self._last_phase_output_mean_abs,
+            "phase_output_zero_mean_applied":  1.0 if self._last_phase_output_zero_mean_applied else 0.0,
+            "input_residual_rms": self._last_input_residual_rms,
+            "val_pred_rms": self._last_pred_residual_rms_after_phase,
+            "val_oracle_rms": self._last_oracle_residual_rms,
+            "val_rms_ratio": self._last_residual_rms_ratio,
+            "output_patch_mean_abs_before_gauge": self._last_output_patch_mean_abs_before_gauge,
+            "output_rms_before_gauge": self._last_output_rms_before_gauge,
+            "output_rms_after_gauge": self._last_output_rms_after_gauge,
+            "phase_angle_abs_mean": self._last_phase_angle_abs_mean,
+            "phase_effect_rms": self._last_phase_effect_rms,
+            "phase_effect_ratio": self._last_phase_effect_ratio,
+            "dc_gauge_ratio": self._last_dc_gauge_ratio,
+            "pred_residual_rms_after_phase": self._last_pred_residual_rms_after_phase,
+            "oracle_residual_rms": self._last_oracle_residual_rms,
+            "residual_rms_ratio": self._last_residual_rms_ratio,
+            "apn_conv_effect_rms": self._last_apn_conv_effect_rms,
+            "apn_conv_effect_ratio": self._last_apn_conv_effect_ratio,
+            "apn_pred_residual_rms": self._last_apn_pred_residual_rms,
+            "apn_oracle_residual_rms": self._last_apn_oracle_residual_rms,
+            "apn_residual_rms_ratio": self._last_apn_residual_rms_ratio,
+            "apn_kernel_l1": self._last_apn_kernel_l1,
+            "apn_kernel_l2": self._last_apn_kernel_l2,
+            "apn_kernel_max_ratio": self._last_apn_kernel_max_ratio,
+            "apn_kernel_center_ratio": self._last_apn_kernel_center_ratio,
+            "apn_kernel_entropy": self._last_apn_kernel_entropy,
+            "apn_phase_abs_err": self._last_apn_phase_abs_err,
+            "apn_phase_cos": self._last_apn_phase_cos,
         }
 
     def get_route_diagnostics(self) -> dict:
@@ -1268,6 +1946,9 @@ class SANRouteNorm(nn.Module):
         }
         if self.route_path == "none":
             _ssc_fields: dict = {
+                "route_path":              self.route_path,
+                "route_state":             self.route_state,
+                "san_ablation_mode":       self.san_ablation_mode,
                 "ssc_enable":             self.ssc_enable,
                 "ssc_mode":               self._ssc_mode,
                 "ssc_decay_rho":          self.ssc_decay_rho,
@@ -1281,11 +1962,24 @@ class SANRouteNorm(nn.Module):
         diag: dict = {
             "route_path":  self._route_path_name,
             "route_state": self._route_state_name,
+            "san_ablation_mode": self.san_ablation_mode,
         }
         if self.route_path == "timeapn_correction":
             diag["apn_loss_mean"]  = self._last_apn_loss_mean
             diag["apn_loss_phase"] = self._last_apn_loss_phase
             diag["apn_loss_recon"] = self._last_apn_loss_recon
+            diag["apn_conv_effect_rms"] = self._last_apn_conv_effect_rms
+            diag["apn_conv_effect_ratio"] = self._last_apn_conv_effect_ratio
+            diag["apn_pred_residual_rms"] = self._last_apn_pred_residual_rms
+            diag["apn_oracle_residual_rms"] = self._last_apn_oracle_residual_rms
+            diag["apn_residual_rms_ratio"] = self._last_apn_residual_rms_ratio
+            diag["apn_kernel_l1"] = self._last_apn_kernel_l1
+            diag["apn_kernel_l2"] = self._last_apn_kernel_l2
+            diag["apn_kernel_max_ratio"] = self._last_apn_kernel_max_ratio
+            diag["apn_kernel_center_ratio"] = self._last_apn_kernel_center_ratio
+            diag["apn_kernel_entropy"] = self._last_apn_kernel_entropy
+            diag["apn_phase_abs_err"] = self._last_apn_phase_abs_err
+            diag["apn_phase_cos"] = self._last_apn_phase_cos
             if self._apn_pred_ms is not None:
                 pred_m, pred_s = self._apn_pred_ms
                 diag["apn_pred_m_mean"] = float(pred_m.mean().item())
@@ -1398,11 +2092,26 @@ class _PureSANSeqPredictor(nn.Module):
         enc_in: int,
         sigma_min: float = 1e-3,
         hidden_dim: int = 128,
+        use_phase: bool = False,
+        phase_k: int = 8,
+        phase_zero_init: bool = True,
+        state_residual_scale_init: float = 0.1,
+        use_amp: bool = False,
     ):
         super().__init__()
         self.pred_stat_len = pred_stat_len
+        self.hist_stat_len = hist_stat_len
         self.sigma_min     = sigma_min
         self.enc_in        = enc_in
+        self.phase_k       = phase_k
+        self.use_phase     = use_phase
+        self.use_amp       = use_amp and use_phase  # amp only valid with phase
+        self.state_residual_scale_init = float(state_residual_scale_init)
+
+        # phase_head is always None in the new implementation.
+        # Kept as an attribute so that any external code checking
+        # ``predictor.phase_head is not None`` safely returns False.
+        self.phase_head: Optional[nn.Linear] = None
 
         token_len = window_len + 1   # 1 stat token + window_len raw values
 
@@ -1413,16 +2122,101 @@ class _PureSANSeqPredictor(nn.Module):
         self.mean_out     = nn.Linear(hidden_dim, pred_stat_len)
         nn.init.zeros_(self.mean_out.weight)
         nn.init.zeros_(self.mean_out.bias)
-        self.gamma_mu = nn.Parameter(torch.zeros(enc_in))
+        self.gamma_mu = nn.Parameter(torch.full((enc_in,), float(state_residual_scale_init)))
 
-        # ---- std branch ----
+        # ---- std branch (only exercised when use_phase=False) ----
         self.std_in_proj = nn.Linear(token_len, hidden_dim)
         self.std_encoder = _PatchCausalEMAEncoder(hidden_dim)
         self.std_post    = nn.Linear(hidden_dim, hidden_dim)
         self.std_out     = nn.Linear(hidden_dim, pred_stat_len)
         nn.init.zeros_(self.std_out.weight)
         nn.init.zeros_(self.std_out.bias)
-        self.gamma_std = nn.Parameter(torch.zeros(enc_in))
+        self.gamma_std = nn.Parameter(torch.full((enc_in,), float(state_residual_scale_init)))
+
+        # ---- phase branch (only created when use_phase=True) ----
+        # Processes per-channel phase features extracted via rfft on
+        # mean-normalized patches.  Each patch token is the (re, im) pair
+        # of bins 1..K for one channel: token size = 2*K.
+        # Runs in (B*C, P_hist, 2K) space, parallel to mean branch.
+        if use_phase:
+            phase_token_len = 2 * phase_k   # per-channel phase token per patch
+            self.phase_in_proj  = nn.Linear(phase_token_len, hidden_dim)
+            self.phase_encoder  = _PatchCausalEMAEncoder(hidden_dim)
+            self.phase_post     = nn.Linear(hidden_dim, hidden_dim)
+            # Output: P_fut * K * 2 per channel, then reshaped to (B, P_fut, K, C, 2)
+            self.phase_out_proj = nn.Linear(hidden_dim, pred_stat_len * phase_k * 2)
+            if phase_zero_init:
+                nn.init.zeros_(self.phase_out_proj.weight)
+                nn.init.zeros_(self.phase_out_proj.bias)
+
+        # ---- amp branch (only created when use_phase=True and use_amp=True) ----
+        # Processes per-channel historical log residual RMS sequence.
+        # Each patch token is a scalar (log_amp for one channel): token size = 1.
+        # At init: amp_out zero-initialized → log_amp_fut = log_amp_anchor
+        # (mean of historical log amplitudes), i.e. constant-amplitude extrapolation.
+        if self.use_amp:
+            self.amp_in_proj = nn.Linear(1, hidden_dim)
+            self.amp_encoder = _PatchCausalEMAEncoder(hidden_dim)
+            self.amp_post    = nn.Linear(hidden_dim, hidden_dim)
+            self.amp_out     = nn.Linear(hidden_dim, pred_stat_len)
+            nn.init.zeros_(self.amp_out.weight)
+            nn.init.zeros_(self.amp_out.bias)
+            self.gamma_amp = nn.Parameter(torch.full((enc_in,), float(state_residual_scale_init)))
+
+    def predict_mean_std_seq(
+        self,
+        mu_hist:     torch.Tensor,   # (B, P_hist, C)
+        std_hist:    torch.Tensor,   # (B, P_hist, C)
+        anchor:      torch.Tensor,   # (B, 1, C)
+        raw_patches: torch.Tensor,   # (B, P_hist, W, C)
+        z_patches:   torch.Tensor,   # (B, P_hist, W, C)
+        eps: float = 1e-5,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Predict future mean/std using the causal sequence architecture.
+
+        This is the no-phase ablation entry point: it reuses the patch-sequence
+        mean encoder and causal EMA std branch, predicts future log-std, and
+        exponentiates back to positive std.  Zero-initialized output heads make
+        std start at the mean historical log-std.
+        """
+        B, P_hist, W, C = raw_patches.shape
+        BC = B * C
+
+        # Mean branch: identical tokenization to the phase predictor's mean head.
+        mu_center    = mu_hist - anchor
+        raw_center   = raw_patches - anchor.unsqueeze(2)
+        mu_center_t  = mu_center.permute(0, 2, 1).reshape(BC, P_hist, 1)
+        raw_center_t = raw_center.permute(0, 3, 1, 2).reshape(BC, P_hist, W)
+        mean_token   = torch.cat([mu_center_t, raw_center_t], dim=-1)
+
+        mean_h = self.mean_encoder(self.mean_in_proj(mean_token))
+        mean_h = mean_h + self.mean_post(F.gelu(mean_h))
+        mu_res = self.mean_out(mean_h)
+        mu_res = mu_res.reshape(B, C, self.pred_stat_len).permute(0, 2, 1)
+        mu_fut = (
+            anchor.expand(-1, self.pred_stat_len, -1)
+            + self.gamma_mu.view(1, 1, -1) * mu_res
+        )
+
+        # Std branch: causal EMA over historical log-std plus z-patch shape.
+        std_anchor    = std_hist.mean(dim=1, keepdim=True).clamp_min(self.sigma_min)
+        logstd_hist   = torch.log(std_hist.clamp(min=self.sigma_min))
+        logstd_anchor = torch.log(std_anchor)
+        logstd_center = logstd_hist - logstd_anchor
+        logstd_center_t = logstd_center.permute(0, 2, 1).reshape(BC, P_hist, 1)
+        z_patch_t = z_patches.permute(0, 3, 1, 2).reshape(BC, P_hist, W)
+        std_token = torch.cat([logstd_center_t, z_patch_t], dim=-1)
+
+        std_h = self.std_encoder(self.std_in_proj(std_token))
+        std_h = std_h + self.std_post(F.gelu(std_h))
+        logstd_res = self.std_out(std_h)
+        logstd_res = logstd_res.reshape(B, C, self.pred_stat_len).permute(0, 2, 1)
+        logstd_fut = (
+            logstd_anchor.expand(-1, self.pred_stat_len, -1)
+            + self.gamma_std.view(1, 1, -1) * logstd_res
+        )
+        std_fut = logstd_fut.exp().clamp(min=self.sigma_min)
+        return mu_fut, std_fut
 
     def predict(
         self,
@@ -1473,6 +2267,155 @@ class _PureSANSeqPredictor(nn.Module):
         std_fut    = logstd_fut.exp().clamp(min=self.sigma_min)
 
         return mu_fut, std_fut
+
+    def predict_mean_phase(
+        self,
+        mu_hist:     torch.Tensor,   # (B, P_hist, C)
+        anchor:      torch.Tensor,   # (B, 1, C)
+        raw_patches: torch.Tensor,   # (B, P_hist, W, C)  raw (un-normalized)
+        z_patches:   torch.Tensor,   # (B, P_hist, W, C)  mean-normalized patches
+        eps: float = 1e-5,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Predict future mean and future phase rotation.
+
+        Used exclusively by the pure-baseline + use_phase=True path.
+        ``predict()`` (mu/std) is NOT called in this mode.
+
+        Returns
+        -------
+        mu_fut_hat:        (B, P_fut, C)
+        phase_rot_fut_hat: (B, P_fut, K, C, 2)
+            Residual rotation parameters (a, b).  The actual unit-complex
+            rotation is normalize(1+a, b).  Zero-initialized → identity.
+        """
+        B, P_hist, W, C = raw_patches.shape
+        BC = B * C
+        K  = self.phase_k
+
+        # ----------------------------------------------------------------
+        # Mean branch — identical to predict()
+        # ----------------------------------------------------------------
+        mu_center    = mu_hist - anchor                                        # (B, P_hist, C)
+        raw_center   = raw_patches - anchor.unsqueeze(2)                       # (B, P_hist, W, C)
+
+        mu_center_t  = mu_center.permute(0, 2, 1).reshape(BC, P_hist, 1)      # (BC, P_hist, 1)
+        raw_center_t = raw_center.permute(0, 3, 1, 2).reshape(BC, P_hist, W)  # (BC, P_hist, W)
+        mean_token   = torch.cat([mu_center_t, raw_center_t], dim=-1)          # (BC, P_hist, W+1)
+
+        mean_h = self.mean_encoder(self.mean_in_proj(mean_token))              # (BC, hidden)
+        mean_h = mean_h + self.mean_post(F.gelu(mean_h))
+        mu_res = self.mean_out(mean_h)                                          # (BC, P_fut)
+        mu_res = mu_res.reshape(B, C, self.pred_stat_len).permute(0, 2, 1)     # (B, P_fut, C)
+        mu_fut = (
+            anchor.expand(-1, self.pred_stat_len, -1)
+            + self.gamma_mu.view(1, 1, -1) * mu_res
+        )
+
+        # ----------------------------------------------------------------
+        # Phase branch
+        # Compute rfft of mean-normalized patches along the window dim.
+        # Bins 1..K carry the low-frequency phase information; DC (bin 0)
+        # is skipped because it encodes mean (already handled above).
+        # ----------------------------------------------------------------
+        # z_patches: (B, P_hist, W, C) → rearrange to (BC, P_hist, W)
+        z_bc = z_patches.permute(0, 3, 1, 2).reshape(BC, P_hist, W)           # (BC, P_hist, W)
+        Z = torch.fft.rfft(z_bc, dim=-1)                                        # (BC, P_hist, W//2+1)
+
+        K_eff = min(K, Z.shape[-1] - 1)                                        # exclude DC bin 0
+        Z_bins = Z[:, :, 1:K_eff + 1]                                          # (BC, P_hist, K_eff) complex
+
+        # Amplitude-normalize → pure phase unit complex
+        Z_abs    = Z_bins.abs().clamp(min=1e-6)
+        Z_unit   = Z_bins / Z_abs                                               # (BC, P_hist, K_eff)
+
+        phase_re = Z_unit.real                                                  # (BC, P_hist, K_eff)
+        phase_im = Z_unit.imag
+
+        # Pad to K bins if K_eff < K (handles tiny window_len edge cases)
+        if K_eff < K:
+            pad = phase_re.new_zeros(BC, P_hist, K - K_eff)
+            phase_re = torch.cat([phase_re, pad], dim=-1)
+            phase_im = torch.cat([phase_im, pad], dim=-1)
+
+        # Per-patch token: interleave re/im → (BC, P_hist, 2K)
+        phase_token = torch.stack([phase_re, phase_im], dim=-1).reshape(BC, P_hist, K * 2)
+
+        phase_h = self.phase_encoder(self.phase_in_proj(phase_token))          # (BC, hidden)
+        phase_h = phase_h + self.phase_post(F.gelu(phase_h))
+        phase_res = self.phase_out_proj(phase_h)                               # (BC, P_fut*K*2)
+        # Reshape to (B, P_fut, K, C, 2)
+        phase_rot = (
+            phase_res
+            .reshape(B, C, self.pred_stat_len, K, 2)
+            .permute(0, 2, 3, 1, 4)                                            # (B, P_fut, K, C, 2)
+        )
+
+        return mu_fut, phase_rot
+
+    def predict_mean_phase_amp(
+        self,
+        mu_hist:     torch.Tensor,   # (B, P_hist, C)
+        amp_hist:    torch.Tensor,   # (B, P_hist, C) — sqrt(mean(z**2)+eps) per patch/channel
+        anchor:      torch.Tensor,   # (B, 1, C)
+        raw_patches: torch.Tensor,   # (B, P_hist, W, C)  raw (un-normalized)
+        z_patches:   torch.Tensor,   # (B, P_hist, W, C)  mean-normalized patches
+        eps: float = 1e-5,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Predict future mean, phase rotation, and log residual amplitude.
+
+        Extends ``predict_mean_phase`` with an additional amplitude branch that
+        predicts the future patch-level residual RMS from the historical
+        log-amplitude sequence.
+
+        Requires ``use_amp=True`` at construction time (enforced by caller).
+
+        Returns
+        -------
+        mu_fut_hat        : (B, P_fut, C)
+        phase_rot_fut_hat : (B, P_fut, K, C, 2)
+        log_amp_fut_hat   : (B, P_fut, C) — log of predicted future residual RMS
+        """
+        mu_fut, phase_rot = self.predict_mean_phase(
+            mu_hist=mu_hist,
+            anchor=anchor,
+            raw_patches=raw_patches,
+            z_patches=z_patches,
+            eps=eps,
+        )
+
+        if not self.use_amp:
+            # Fallback: return zeros as log_amp (gain=1 everywhere)
+            log_amp_zero = mu_fut.new_zeros(mu_fut.shape)
+            return mu_fut, phase_rot, log_amp_zero
+
+        B, P_hist, C = mu_hist.shape
+        BC = B * C
+
+        # ----------------------------------------------------------------
+        # Amp branch: causal EMA over log-amplitude sequence
+        # ----------------------------------------------------------------
+        log_amp_hist   = torch.log(amp_hist.clamp(min=eps))              # (B, P_hist, C)
+        log_amp_anchor = log_amp_hist.mean(dim=1, keepdim=True)          # (B, 1, C)
+        log_amp_center = log_amp_hist - log_amp_anchor                   # (B, P_hist, C)
+
+        # Rearrange to (BC, P_hist, 1) for EMA encoder
+        log_amp_center_t = (
+            log_amp_center.permute(0, 2, 1).reshape(BC, P_hist, 1)
+        )   # (BC, P_hist, 1)
+
+        amp_h    = self.amp_encoder(self.amp_in_proj(log_amp_center_t))  # (BC, hidden)
+        amp_h    = amp_h + self.amp_post(F.gelu(amp_h))
+        log_amp_res = self.amp_out(amp_h)                                 # (BC, P_fut)
+        log_amp_res = (
+            log_amp_res.reshape(B, C, self.pred_stat_len).permute(0, 2, 1)
+        )   # (B, P_fut, C)
+
+        log_amp_fut = (
+            log_amp_anchor.expand(-1, self.pred_stat_len, -1)
+            + self.gamma_amp.view(1, 1, -1) * log_amp_res
+        )   # (B, P_fut, C)
+
+        return mu_fut, phase_rot, log_amp_fut
 
 
 # ---------------------------------------------------------------------------
